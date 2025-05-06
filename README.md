@@ -1,31 +1,82 @@
+#!/bin/bash
 
-*** Test Cases ***
-Comparer les coordonnées dans Liste 1 et Liste 2
-    :FOR    ${index1}    IN RANGE    0    ${len(list1)}
-    \    ${name1}=    Get From List    ${list1}    ${index1}    0
-    \    ${coords1}=    Get From List    ${list1}    ${index1}    1
-    
-    # Chercher si le nom de Liste 1 existe dans Liste 2
-    ${found}=    Set Variable    False
-    :FOR    ${index2}    IN RANGE    0    ${len(list2)}
-    \    ${name2}=    Get From List    ${list2}    ${index2}    0
-    \    Run Keyword If    '${name1}' == '${name2}'    Set Variable    True
-    \    Run Keyword If    ${found}    Break
+# Définir le chemin du fichier .robot directement dans le script
+fichier="fichier.robot"
 
-    # Si le nom n'est pas trouvé, échouer le test
-    Run Keyword If    not ${found}    Fail    Le nom ${name1} n'a pas été trouvé dans Liste 2
+# Vérifier si le fichier existe
+if [[ ! -f "$fichier" ]]; then
+    echo "Le fichier $fichier n'existe pas."
+    exit 1
+fi
 
-    # Si le nom est trouvé, comparer les coordonnées
-    ${coords2}=    Get From List    ${list2}    ${index2}    1
-    ${x1}, ${y1}=    Split String    ${coords1}    *    # Séparer les coordonnées à partir de "*"
-    ${x2}, ${y2}=    Split String    ${coords2}    \n    # Séparer les coordonnées à partir de "\n"
-    
-    # Arrondir les coordonnées à 4 chiffres après la virgule
-    ${x1_rounded}=    Evaluate    round(${x1}, 4)
-    ${y1_rounded}=    Evaluate    round(${y1}, 4)
-    ${x2_rounded}=    Evaluate    round(${x2}, 4)
-    ${y2_rounded}=    Evaluate    round(${y2}, 4)
+# Extraire la liste des tests
+tests=$(awk '/\*\*\* Test Cases \*\*\*/ {flag=1; next} flag && /^[^ \t]+/ {print $1}' "$fichier")
 
-    # Comparer les coordonnées
-    Run Keyword If    '${x1_rounded}' == '${x2_rounded}' AND '${y1_rounded}' == '${y2_rounded}'    Log    Les coordonnées pour ${name1} sont égales
-    Run Keyword If    '${x1_rounded}' != '${x2_rounded}' OR '${y1_rounded}' != '${y2_rounded}'    Fail    Les coordonnées de ${name1} ne correspondent pas : ${x1_rounded}, ${y1_rounded} != ${x2_rounded}, ${y2_rounded}
+# Si aucun test n'a été trouvé
+if [ -z "$tests" ]; then
+    echo "Aucun test trouvé dans le fichier."
+    exit 1
+fi
+
+# Afficher les options disponibles
+echo "Que voulez-vous faire ?"
+echo "1. Exécuter tous les tests"
+echo "2. Sélectionner un test spécifique"
+echo "3. Sélectionner plusieurs tests spécifiques"
+read -p "Votre choix (1, 2 ou 3) : " choix
+
+# Fonction pour exécuter les tests sélectionnés
+run_tests() {
+    local tests_to_run="$1"
+    if [ -z "$tests_to_run" ]; then
+        echo "Aucun test sélectionné."
+        exit 1
+    fi
+
+    # Lancer les tests
+    python3.6 -m robot $tests_to_run "$fichier"
+}
+
+case $choix in
+    1)
+        # Exécuter tous les tests
+        echo "Exécution de tous les tests..."
+        run_tests ""
+        ;;
+    2)
+        # Sélectionner un test spécifique
+        echo "Voici la liste des tests disponibles :"
+        select test in $tests; do
+            if [ -n "$test" ]; then
+                echo "Vous avez sélectionné : $test"
+                run_tests "-i $test"
+                break
+            else
+                echo "Sélection invalide, veuillez essayer à nouveau."
+            fi
+        done
+        ;;
+    3)
+        # Sélectionner plusieurs tests spécifiques
+        echo "Voici la liste des tests disponibles :"
+        select test in $tests; do
+            if [ -n "$test" ]; then
+                selected_tests="$selected_tests -i $test"
+                echo "Test ajouté : $test"
+                echo "Voulez-vous ajouter un autre test ? (y/n)"
+                read response
+                if [[ "$response" != "y" ]]; then
+                    break
+                fi
+            else
+                echo "Sélection invalide, veuillez essayer à nouveau."
+            fi
+        done
+        echo "Exécution des tests sélectionnés..."
+        run_tests "$selected_tests"
+        ;;
+    *)
+        echo "Choix invalide. Veuillez entrer 1, 2 ou 3."
+        exit 1
+        ;;
+esac
