@@ -9,14 +9,20 @@ if [[ ! -f "$fichier" ]]; then
     exit 1
 fi
 
-# Extraire la liste des tests
-tests=$(awk '/\*\*\* Test Cases \*\*\*/ {flag=1; next} flag && /^[^ \t]+/ {print $1}' "$fichier")
+# Extraire la liste des tests (récupère toute la ligne après "*** Test Cases ***")
+tests=$(awk '/\*\*\* Test Cases \*\*\*/ {flag=1; next} flag && /^[^ \t]+/ {print $0}' "$fichier")
 
 # Si aucun test n'a été trouvé
 if [ -z "$tests" ]; then
     echo "Aucun test trouvé dans le fichier."
     exit 1
 fi
+
+# Formatage des tests pour les adapter au menu select (en les mettant entre guillemets)
+test_list=()
+while IFS= read -r line; do
+    test_list+=("\"$line\"")  # Entourer chaque ligne de guillemets
+done <<< "$tests"
 
 # Afficher les options disponibles
 echo "Que voulez-vous faire ?"
@@ -46,7 +52,8 @@ case $choix in
     2)
         # Sélectionner un test spécifique
         echo "Voici la liste des tests disponibles :"
-        select test in $tests; do
+        PS3="Sélectionnez un test: "
+        select test in "${test_list[@]}"; do
             if [ -n "$test" ]; then
                 echo "Vous avez sélectionné : $test"
                 run_tests "-i $test"
@@ -59,7 +66,9 @@ case $choix in
     3)
         # Sélectionner plusieurs tests spécifiques
         echo "Voici la liste des tests disponibles :"
-        select test in $tests; do
+        selected_tests=""
+        PS3="Sélectionnez un test: "
+        select test in "${test_list[@]}"; do
             if [ -n "$test" ]; then
                 selected_tests="$selected_tests -i $test"
                 echo "Test ajouté : $test"
