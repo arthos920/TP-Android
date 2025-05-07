@@ -9,26 +9,49 @@ if [[ ! -f "$fichier" ]]; then
     exit 1
 fi
 
-# Extraire les noms de tests
-tests=$(awk '/\*\*\* Test Cases \*\*\*/ {flag=1; next} flag && /^[^ \t]+/ {print $1}' "$fichier")
+# Extraire les noms de tests et leurs tags associés
+declare -A test_tags
 
-# Si aucun test n'a été trouvé
-if [ -z "$tests" ]; then
-    echo "Aucun test trouvé dans le fichier."
+# Variables pour gérer l'état
+inside_test_section=0  # Pour savoir si nous sommes dans une section "Test Cases"
+test_name=""
+tags=""
+
+# Lire le fichier ligne par ligne et traiter les tests et tags
+while IFS= read -r line; do
+    # Si on trouve une section de tests "Test Cases", on passe à l'état suivant
+    if [[ "$line" =~ \*\*\* Test Cases \*\*\* ]]; then
+        inside_test_section=1
+        continue
+    fi
+
+    # Si on est dans une section "Test Cases", récupérer le nom du test
+    if [[ "$inside_test_section" -eq 1 ]]; then
+        # Si la ligne contient un nom de test
+        if [[ "$line" =~ ^[[:space:]]*[a-zA-Z0-9_]+ ]]; then
+            test_name=$(echo "$line" | sed 's/^[[:space:]]*//')  # Enlever les espaces avant le nom du test
+            tags=""  # Réinitialiser les tags pour chaque test
+        fi
+
+        # Si la ligne contient des tags, mémoriser les tags
+        if [[ "$line" =~ ^[[:space:]]*\[Tags\] ]]; then
+            tags=$(echo "$line" | sed 's/^[[:space:]]*\[Tags\][[:space:]]*//')  # Enlever "[Tags]" et les espaces
+            test_tags["$test_name"]="$tags"  # Associer les tags au test
+            inside_test_section=0  # Sortir immédiatement de la section du test
+        fi
+    fi
+done < "$fichier"
+
+# Vérifier que des tests ont été trouvés
+if [ ${#test_tags[@]} -eq 0 ]; then
+    echo "Aucun test ou tag trouvé dans le fichier."
     exit 1
 fi
 
-# Extraire les tags et associer à chaque test
-declare -A test_tags
-
-# Parcours des tests et association des tags
-while IFS= read -r test; do
-    # Cherche les tags pour chaque test
-    tags=$(awk -v test="$test" '/\*\*\* Test Cases \*\*\*/ {flag=1} flag && $1 == test {getline; getline; print $0}' "$fichier")
-    
-    # Enregistrer les tags associés au test dans un tableau associatif
-    test_tags["$test"]="$tags"
-done <<< "$tests"
+# Afficher les tests et leurs tags associés
+for test in "${!test_tags[@]}"; do
+    echo "Test: $test, Tags: ${test_tags[$test]}"
+done
 
 # Afficher les options disponibles
 echo "Que voulez-vous faire ?"
