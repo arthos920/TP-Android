@@ -1,17 +1,28 @@
-# === 5. Leptonica ===
-echo "[?] Vérification de Leptonica..."
-LEPTONICA_VERSION=$(leptonica_version 2>/dev/null | grep -oP '(\d+\.\d+)' || echo "0")
+#!/bin/bash
+echo "== Vérification de la compatibilité GCC avec <filesystem> =="
 
-# Si version absente ou < 1.74, on installe celle du dossier
-VERSION_OK=$(awk 'BEGIN { print ('"$LEPTONICA_VERSION"' >= 1.74) ? "yes" : "no" }')
+GCC_VERSION=$(g++ -dumpversion 2>/dev/null)
+if [ -z "$GCC_VERSION" ]; then
+    echo "[!] g++ n'est pas installé."
+    exit 1
+fi
 
-if [ "$VERSION_OK" != "yes" ]; then
-    echo "[+] Installation de Leptonica (version >= 1.74 requise)..."
-    tar -xzf leptonica.tar.gz -C /tmp
-    cd /tmp/leptonica*
-    ./configure && make -j$(nproc) && make install
-    cd "$WORKDIR"
-    ldconfig
+echo "[✓] g++ détecté : version $GCC_VERSION"
+
+echo -n "[?] Test de compilation avec -std=c++17 et <filesystem>... "
+
+echo '#include <filesystem>
+int main() { std::filesystem::path p = "."; return 0; }' > test_fs.cpp
+
+g++ -std=c++17 test_fs.cpp -o test_fs.out 2>/dev/null
+
+if [ $? -eq 0 ]; then
+    echo "RÉUSSI : ton compilateur supporte <filesystem> avec C++17."
+    rm test_fs.cpp test_fs.out
+    exit 0
 else
-    echo "[=] Leptonica déjà installée (version $LEPTONICA_VERSION)"
+    echo "ÉCHEC : ton compilateur ne supporte pas <filesystem> ou -std=c++17."
+    echo "→ Essayez de mettre à jour g++ (>= 7.1 requis) ou installez une version de Tesseract sans <filesystem>."
+    rm -f test_fs.cpp test_fs.out
+    exit 2
 fi
