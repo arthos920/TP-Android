@@ -1,28 +1,19 @@
-#!/bin/bash
-echo "== Vérification de la compatibilité GCC avec <filesystem> =="
+ # === 6. Tesseract ===
+if ! command -v tesseract &>/dev/null; then
+    echo "[+] Compilation de Tesseract..."
 
-GCC_VERSION=$(g++ -dumpversion 2>/dev/null)
-if [ -z "$GCC_VERSION" ]; then
-    echo "[!] g++ n'est pas installé."
-    exit 1
-fi
+    tar -xzf tesseract.tar.gaz -C /tmp
+    cd /tmp/tesseract*
 
-echo "[✓] g++ détecté : version $GCC_VERSION"
+    echo "[?] Forçage du mode C++17 + ajout de -lstdc++fs pour <filesystem>..."
+    export CXXFLAGS="-std=c++17"
+    export LDFLAGS="-lstdc++fs"
 
-echo -n "[?] Test de compilation avec -std=c++17 et <filesystem>... "
-
-echo '#include <filesystem>
-int main() { std::filesystem::path p = "."; return 0; }' > test_fs.cpp
-
-g++ -std=c++17 test_fs.cpp -o test_fs.out 2>/dev/null
-
-if [ $? -eq 0 ]; then
-    echo "RÉUSSI : ton compilateur supporte <filesystem> avec C++17."
-    rm test_fs.cpp test_fs.out
-    exit 0
+    PKG_CONFIG_PATH=/usr/local/lib/pkgconfig ./configure
+    make -j$(nproc)
+    make install
+    cd "$WORKDIR"
+    ldconfig
 else
-    echo "ÉCHEC : ton compilateur ne supporte pas <filesystem> ou -std=c++17."
-    echo "→ Essayez de mettre à jour g++ (>= 7.1 requis) ou installez une version de Tesseract sans <filesystem>."
-    rm -f test_fs.cpp test_fs.out
-    exit 2
+    echo "[=] Tesseract déjà installé."
 fi
