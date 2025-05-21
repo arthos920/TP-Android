@@ -31,12 +31,12 @@ fi
 if ! command -v tesseract &>/dev/null; then
     echo "[+] Compilation de Tesseract avec $CXX..."
 
-    tar -xzf tesseract.tar.gaz -C /tmp
+    tar -xzf tesseract*.tar.gz -C /tmp
     cd /tmp/tesseract*
 
     export CXXFLAGS="-std=c++17"
     export LDFLAGS=""
-
+    ./autogen.sh	
     echo "[~] Configuration avec C++17 et compilation optimisée..."
     PKG_CONFIG_PATH=/usr/local/lib/pkgconfig ./configure CC="$CC" CXX="$CXX"
     make -j$(nproc)
