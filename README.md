@@ -1,50 +1,94 @@
-# === [INSTALLATION CONDITIONNELLE DE GCC/G++ 9 + COMPILATION DE TESSERACT] ===
+import threading
+import requests
+import time
+from queue import Queue
 
-# Vérification de la version actuelle de g++
-GPP_VERSION=$(g++ -dumpversion | cut -d. -f1)
+class TbWeb_Cookie:
+    """Récupère et renvoie le cookie pour accès"""
 
-if [ "$GPP_VERSION" -lt 8 ]; then
-    echo "[+] Installation locale de GCC/G++ 9 depuis deps-gcc9/..."
+    def __init__(self, ipserver):
+        self.cookies = None
+        self.ipserver = ipserver
 
-    # Installation hors-ligne depuis les .deb locaux (le dossier doit exister et être complet)
-    if [ -d "./deps-gcc9" ]; then
-        dpkg -i ./deps-gcc9/*.deb || {
-            echo "[!] Échec d'installation des paquets GCC 9. Vérifiez les dépendances manquantes."
-            exit 1
+    def run(self):
+        data = {
+            "J_username": "your_username",  # À remplacer
+            "J_password": "your_password"   # À remplacer
         }
-    else
-        echo "[!] Dossier ./deps-gcc9 introuvable. Impossible d'installer GCC 9."
-        exit 1
-    fi
 
-    export CC=/usr/bin/gcc-9
-    export CXX=/usr/bin/g++-9
+        try:
+            response = requests.post(
+                f"https://{self.ipserver}/login",
+                data=data,
+                verify=False
+            )
 
-    echo "[✓] GCC 9 installé et prêt pour une utilisation ciblée (sans impacter g++ système)."
-else
-    echo "[=] g++ >= 8 détecté, pas besoin d'installer g++-9."
-    export CC=$(which gcc)
-    export CXX=$(which g++)
-fi
+            cookies_value = response.cookies.get('tbw-server-credential')
+            if cookies_value:
+                self.cookies = f"tbw-server-credential={cookies_value}"
+                print(f"[Cookie] Cookie récupéré : {self.cookies}")
+            else:
+                print("[Cookie] Cookie introuvable dans la réponse.")
 
-# === Compilation de Tesseract OCR ===
-if ! command -v tesseract &>/dev/null; then
-    echo "[+] Compilation de Tesseract avec $CXX..."
+        except Exception as e:
+            print(f"[Cookie] Erreur lors de la récupération du cookie : {e}")
 
-    tar -xzf tesseract*.tar.gz -C /tmp
-    cd /tmp/tesseract*
 
-    export CXXFLAGS="-std=c++17"
-    export LDFLAGS=""
-    ./autogen.sh	
-    echo "[~] Configuration avec C++17 et compilation optimisée..."
-    PKG_CONFIG_PATH=/usr/local/lib/pkgconfig ./configure CC="$CC" CXX="$CXX"
-    make -j$(nproc)
-    make install
-    cd "$WORKDIR"
-    ldconfig
+class JWTFetcher(threading.Thread):
+    """Thread de récupération cyclique du Token JWT (Basé sur son délai d'expiration)"""
 
-    echo "[✓] Tesseract installé avec succès."
-else
-    echo "[=] Tesseract déjà présent sur le système."
-fi
+    def __init__(self, ipserver, cookies, token=None, interval=30, result_queue=None, stop_event=None):
+        super().__init__()
+        self.ipserver = ipserver
+        self.cookies = cookies
+        self.interval = interval
+        self.result_queue = result_queue or Queue()
+        self.stop_event = stop_event or threading.Event()
+        self.uuid = "your-uuid"  # À remplacer
+        self.jwt = None
+        self.expiry = 0
+
+    def run(self):
+        print(f"\033[32m[Thread JWT] Cookie récupéré : {self.cookies}\033[0m")
+        while not self.stop_event.is_set():
+            now = time.time()
+
+            if self.jwt is None or now >= self.expiry:
+                try:
+                    headers = {
+                        "Application-Uuid": self.uuid,
+                        "cookie": self.cookies,
+                        "Accept": "application/json, text/plain, */*"
+                    }
+
+                    response = requests.get(
+                        f"https://{self.ipserver}/api/auth/jwt",
+                        headers=headers,
+                        verify=False
+                    )
+
+                    self.jwt = response.json().get("jwt")
+                    periodSec = response.json().get("periodSec", 30)
+                    self.expiry = now + periodSec - 1
+                    self.result_queue.put(self.jwt)
+
+                    print(f"\033[32m[Thread JWT] Nouveau JWT récupéré : {self.jwt[:30]}...{self.jwt[-10:]} (expire dans {periodSec}s)\033[0m")
+
+                except Exception as e:
+                    print(f"[Thread JWT] Erreur récupération JWT : {e}")
+
+            if self.stop_event.wait(self.interval):
+                break
+
+
+if __name__ == "__main__":
+    ip = "monserveur.local"  # Remplace par l’adresse de ton serveur
+
+    cookie_getter = TbWeb_Cookie(ipserver=ip)
+    cookie_getter.run()
+
+    if cookie_getter.cookies:
+        fetcher = JWTFetcher(ipserver=ip, cookies=cookie_getter.cookies)
+        fetcher.start()
+    else:
+        print("Impossible de démarrer le fetcher sans cookie.")
