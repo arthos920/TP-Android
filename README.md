@@ -1,67 +1,106 @@
-import requests
+Dans le cadre de mon projet de fin d’études en tant qu’étudiant ingénieur, j’ai développé un script Bash destiné à automatiser la gestion des tests avec Robot Framework. Robot Framework est un framework de test d’acceptation populaire, principalement utilisé pour tester des applications d’interface utilisateur ou des APIs, souvent dans des environnements de développement agiles.
 
-class APIRequester:
-    """Classe générique pour effectuer des requêtes GET authentifiées"""
+L’objectif principal du script est de simplifier l’exécution des tests et de les rendre plus flexibles et interactifs. Ce script permet à un utilisateur de sélectionner des tests spécifiques ou d’exécuter tous les tests d’un projet en un seul processus automatisé, en fonction des besoins.
 
-    def __init__(self, ipserver, jwt_token, app_uuid):
-        self.ipserver = ipserver
-        self.jwt_token = jwt_token
-        self.app_uuid = app_uuid
+Problématique
 
-    def get(self, endpoint):
-        """Effectue une requête GET avec les headers requis"""
+Lors de l’utilisation de Robot Framework dans des projets avec une grande quantité de fichiers de tests répartis dans plusieurs sous-dossiers, la gestion et l’exécution manuelle des tests peuvent rapidement devenir laborieuses. L’idée de ce projet était de créer un utilitaire qui permettrait de :
+	•	Exécuter un ou plusieurs tests par sous-dossier.
+	•	Changer de fichier de tests facilement.
+	•	Sélectionner des tests spécifiques via un menu interactif.
+	•	Modifier dynamiquement les fichiers .robot en fonction des besoins de génération de tests.
 
-        headers = {
-            "Authorization": f"Bearer {self.jwt_token}",
-            "Application-Uuid": self.app_uuid,
-            "Accept": "application/json"
-        }
+Ce script Bash s’inscrit dans une démarche d’automatisation de la gestion des tests pour améliorer l’efficacité des processus de tests dans un projet logiciel.
 
-        try:
-            response = requests.get(
-                f"https://{self.ipserver}{endpoint}",
-                headers=headers,
-                verify=False
-            )
-            print(f"[APIRequester] Requête GET vers {endpoint} : statut {response.status_code}")
-            return response
-        except Exception as e:
-            print(f"[APIRequester] Erreur lors de la requête GET : {e}")
-            return None
+⸻
+
+2. Objectifs et Fonctionnalités du Script
+
+Objectif Principal
+
+Le script développé permet de gérer facilement l’exécution des tests dans un environnement de projet contenant de nombreux fichiers de test, répartis dans plusieurs sous-dossiers.
+
+Les fonctionnalités principales du script incluent :
+	1.	Exécution des tests dans tout le projet ou dans des sous-dossiers spécifiques.
+	2.	Sélection de tests individuels ou multiples pour une exécution ciblée.
+	3.	Modification des fichiers de test en fonction de critères spécifiques (par exemple, ajouter une ligne de code à un test).
+	4.	Affichage interactif des tests et gestion du projet via un menu.
+	5.	Capacité de changer de dossier de projet et de recharger la configuration des tests.
+
+Fonctionnalités Détaillées
+	1.	Affichage des Sous-dossiers Disponibles :
+L’option 1 permet de choisir et d’exécuter des tests dans un ou plusieurs sous-dossiers spécifiques, tels que authentication/, order/, etc. Cette option utilise la commande find pour lister les sous-dossiers du dossier tests/ et permet à l’utilisateur de sélectionner ceux qu’il souhaite exécuter.
+	2.	Exécution de Tests Sélectionnés ou Multiples :
+L’option 2 permet de choisir un fichier de test précis à exécuter, et l’option 3 permet de sélectionner plusieurs fichiers à la fois pour les exécuter ensemble.
+	3.	Modification Dynamique des Fichiers de Test :
+L’option 7 modifie chaque fichier .robot qui contient une ligne spécifique (“création mission custom”) en y insérant une nouvelle ligne générée dynamiquement via un script Python (gen_ligne_robot.py). Cette fonctionnalité permet d’adapter les tests sans avoir à les éditer manuellement.
+	4.	Changement Dynamique de Projet :
+L’option 4 permet à l’utilisateur de changer le dossier du projet à tout moment, en demandant le chemin d’un autre dossier my_project. Le script recharge alors les fichiers de test du nouveau projet.
+	5.	Affichage de Tous les Tests Disponibles :
+L’option 6 permet à l’utilisateur d’afficher tous les fichiers .robot disponibles dans le projet.
+
+⸻
+
+3. Développement et Structure du Script
+
+Structure du Dossier
+
+Le script suppose la structure suivante dans le projet :
+
+my_project/
+├── tests/
+│   ├── authentication/
+│   ├── master-data/
+│   ├── order/
+├── resources/
 
 
+	•	tests/ contient les sous-dossiers avec les fichiers .robot de tests.
+	•	resources/ contient les fichiers de ressources partagés entre les tests.
 
-if __name__ == "__main__":
-    ip = "monserveur.local"
-    uuid = "your-uuid"
+Fonctionnement Interactif
 
-    cookie_getter = TbWeb_Cookie(ipserver=ip)
-    cookie_getter.run()
+Le script présente un menu interactif permettant à l’utilisateur de sélectionner des actions :
+	•	Option 1 : Exécuter tous les tests dans tests/.
+	•	Option 2 : Exécuter un test spécifique parmi les fichiers disponibles.
+	•	Option 3 : Exécuter plusieurs tests sélectionnés par l’utilisateur.
+	•	Option 4 : Changer de projet en fournissant un nouveau chemin vers my_project.
+	•	Option 5 : Quitter le script.
+	•	Option 6 : Afficher tous les fichiers de tests disponibles.
+	•	Option 7 : Modifier les fichiers .robot contenant “création mission custom” en insérant une ligne générée dynamiquement.
 
-    if cookie_getter.cookies:
-        jwt_queue = Queue()
-        stop_event = threading.Event()
+Sélection de Tests
 
-        fetcher = JWTFetcher(
-            ipserver=ip,
-            cookies=cookie_getter.cookies,
-            interval=10,
-            result_queue=jwt_queue,
-            stop_event=stop_event
-        )
-        fetcher.uuid = uuid
-        fetcher.start()
+Les tests sont stockés dans un tableau associatif test_files qui contient les chemins des fichiers .robot détectés dans le dossier tests/. Le script parcourt ces fichiers et permet à l’utilisateur de les sélectionner via le menu.
 
-        # Attente que le JWT soit disponible
-        time.sleep(2)
-        if not jwt_queue.empty():
-            jwt_token = jwt_queue.get()
+Exécution des Tests
 
-            # Requête GET authentifiée
-            requester = APIRequester(ipserver=ip, jwt_token=jwt_token, app_uuid=uuid)
-            response = requester.get("/api/exemple/endpoint")
+Une fois que l’utilisateur a sélectionné les tests, les fichiers sont exécutés en utilisant la commande Robot Framework :
 
-            if response and response.ok:
-                print(response.json())
-        else:
-            print("JWT non disponible.")
+robot --pythonpath . "$file"
+
+
+4. Résultats et Performances
+
+Le script a permis d’atteindre les objectifs suivants :
+	•	Facilité d’exécution : Les utilisateurs peuvent facilement sélectionner un ou plusieurs tests à exécuter grâce à l’interface interactive.
+	•	Souplesse : Le script permet de choisir spécifiquement les tests ou les sous-dossiers à exécuter.
+	•	Gain de temps : L’automatisation du processus d’exécution et de modification des tests permet de gagner du temps, notamment pour des projets avec plusieurs centaines de tests.
+
+5. Limitations et Améliorations Possibles
+
+Limitations
+	•	Manipulation des tests par tags : Actuellement, le script ne prend pas en charge l’exécution des tests par tags comme dans les versions précédentes. Cependant, il pourrait être étendu pour réintégrer cette fonctionnalité.
+	•	Interface graphique : Le script utilise un menu interactif en ligne de commande. Une interface graphique pourrait rendre l’utilisation plus conviviale pour les utilisateurs moins expérimentés.
+
+Améliorations possibles
+	•	Tests parallèles : Le script pourrait être modifié pour exécuter plusieurs tests en parallèle afin de réduire le temps d’exécution global, en particulier dans les grands projets.
+	•	Gestion des résultats : Ajouter une fonctionnalité pour sauvegarder les résultats d’exécution dans des fichiers log ou dans une base de données pour un suivi et une analyse ultérieure.
+
+⸻
+
+6. Conclusion
+
+Le script développé dans ce projet de fin d’études permet de simplifier et automatiser la gestion des tests avec Robot Framework. Il offre une solution flexible et rapide pour exécuter des tests sur de grands projets, avec la possibilité de filtrer les tests par sous-dossier ou par fichier, de modifier les fichiers de test, et de gérer facilement les chemins de projet.
+
+Grâce à ce script, l’automatisation de l’exécution des tests devient plus accessible, ce qui est essentiel dans un environnement de développement moderne où les tests fréquents sont nécessaires pour garantir la qualité du code.
