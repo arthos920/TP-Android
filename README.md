@@ -1,9 +1,35 @@
-Remerciements
+from openpyxl import load_workbook
+from openpyxl.styles import PatternFill
 
-Je tiens à exprimer ma profonde gratitude à l’ensemble des équipes de entrerpsie pour leur accueil chaleureux, leur disponibilité et leur accompagnement tout au long de mon contrat de professionnalisation. Cette expérience a été particulièrement enrichissante, tant sur le plan humain que professionnel.
+def color_status(file_path, test_value, color):
+    # Chargement du fichier Excel
+    wb = load_workbook(file_path)
+    ws = wb.active
 
-Je remercie tout particulièrement mon tuteur, [Nom du tuteur], pour sa bienveillance, sa pédagogie et la confiance qu’il m’a accordée. Son encadrement m’a permis de progresser techniquement et de mieux comprendre les enjeux concrets de l’ingénierie dans un environnement industriel exigeant.
+    # Définir les couleurs vert et rouge
+    green_fill = PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid")
+    red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
 
-Je souhaite également remercier mes collègues de l’équipe [nom de l’équipe ou du service] pour leur esprit d’équipe, leurs conseils avisés et leur soutien au quotidien. Travailler à leurs côtés a été une source constante d’apprentissage.
+    # Parcourir les lignes (à partir de la ligne 2 pour éviter l'en-tête)
+    for row in ws.iter_rows(min_row=2):
+        test_cell = row[1]      # Colonne B : test
+        status_cell = row[2]    # Colonne C : status
 
-Enfin, je remercie l’ensemble du personnel de entreprise qui, à travers ses échanges et son professionnalisme, a contribué à faire de cette expérience une étape clé dans mon parcours.
+        if test_cell.value == test_value:
+            if color.lower() == "vert":
+                status_cell.fill = green_fill
+                status_cell.value = "PASS"
+            elif color.lower() == "rouge":
+                status_cell.fill = red_fill
+                status_cell.value = "FAIL"
+            else:
+                print("Erreur : couleur non reconnue (utilise 'vert' ou 'rouge').")
+            break
+    else:
+        print(f"Test '{test_value}' non trouvé.")
+
+    wb.save(file_path)
+    print("Fichier mis à jour avec succès.")
+
+# Exemple :
+# color_status("tests.xlsx", "Connexion utilisateur", "vert")
