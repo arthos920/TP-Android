@@ -1,35 +1,21 @@
-from openpyxl import load_workbook
-from openpyxl.styles import PatternFill
+2. Ajout d’une image à la banque d’images
 
-def color_status(file_path, test_value, color):
-    # Chargement du fichier Excel
-    wb = load_workbook(file_path)
-    ws = wb.active
+Toutes les images utilisées par Sikuli sont stockées dans un dossier dédié au projet, appelé sikuli-img.
+Ce dossier sert de banque d’images accessible à l’ensemble des scripts Robot Framework qui utilisent Sikuli.
 
-    # Définir les couleurs vert et rouge
-    green_fill = PatternFill(start_color="00FF00", end_color="00FF00", fill_type="solid")
-    red_fill = PatternFill(start_color="FF0000", end_color="FF0000", fill_type="solid")
+Pour ajouter une nouvelle image (par exemple un bouton sur lequel cliquer) :
+	1.	Préparer l’interface :
+Lancer l’application ou l’environnement dans l’état où le bouton est visible.
+	2.	Prendre la capture avec Sikuli IDE :
+	•	Ouvrir SikuliX IDE ou un utilitaire de capture d’écran.
+	•	Sélectionner uniquement la zone correspondant au bouton (éviter les zones inutiles pour réduire les faux positifs).
+	•	Enregistrer l’image en format .png dans le dossier sikuli-img du projet.
+Exemple : sikuli-img/btn_valider.png
+	3.	Nommer l’image clairement :
+Utiliser un nom qui reflète son usage (btn_valider, icn_parametres, etc.) pour faciliter la maintenance.
 
-    # Parcourir les lignes (à partir de la ligne 2 pour éviter l'en-tête)
-    for row in ws.iter_rows(min_row=2):
-        test_cell = row[1]      # Colonne B : test
-        status_cell = row[2]    # Colonne C : status
+⸻
 
-        if test_cell.value == test_value:
-            if color.lower() == "vert":
-                status_cell.fill = green_fill
-                status_cell.value = "PASS"
-            elif color.lower() == "rouge":
-                status_cell.fill = red_fill
-                status_cell.value = "FAIL"
-            else:
-                print("Erreur : couleur non reconnue (utilise 'vert' ou 'rouge').")
-            break
-    else:
-        print(f"Test '{test_value}' non trouvé.")
+3. Utilisation dans un script Robot Framework
 
-    wb.save(file_path)
-    print("Fichier mis à jour avec succès.")
-
-# Exemple :
-# color_status("tests.xlsx", "Connexion utilisateur", "vert")
+Une fois l’image ajoutée, elle peut être utilisée dans un script Robot Framework grâce aux keywords fournis par SikuliLibrary.
