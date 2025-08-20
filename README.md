@@ -1,21 +1,19 @@
-2. Ajout d’une image à la banque d’images
+*** Settings ***
+Library    SikuliLibrary
+Library    BuiltIn
 
-Toutes les images utilisées par Sikuli sont stockées dans un dossier dédié au projet, appelé sikuli-img.
-Ce dossier sert de banque d’images accessible à l’ensemble des scripts Robot Framework qui utilisent Sikuli.
+*** Keywords ***
+Find Image On Any Screen (Keep Found Id)
+    [Documentation]    Cherche ${image_path} sur tous les écrans. 
+    ...                Si trouvé: exécute `Setup Test` et laisse le Screen Id sur celui où l’image a été trouvée.
+    [Arguments]    ${image_path}    ${timeout}=2
+    ${screen_count}=    Get Number Of Screens
 
-Pour ajouter une nouvelle image (par exemple un bouton sur lequel cliquer) :
-	1.	Préparer l’interface :
-Lancer l’application ou l’environnement dans l’état où le bouton est visible.
-	2.	Prendre la capture avec Sikuli IDE :
-	•	Ouvrir SikuliX IDE ou un utilitaire de capture d’écran.
-	•	Sélectionner uniquement la zone correspondant au bouton (éviter les zones inutiles pour réduire les faux positifs).
-	•	Enregistrer l’image en format .png dans le dossier sikuli-img du projet.
-Exemple : sikuli-img/btn_valider.png
-	3.	Nommer l’image clairement :
-Utiliser un nom qui reflète son usage (btn_valider, icn_parametres, etc.) pour faciliter la maintenance.
+    :FOR    ${id}    IN RANGE    ${screen_count}
+    \    Change Screen Id    ${id}
+    \    ${found}=    Exists    ${image_path}    ${timeout}
+    \    Run Keyword If    ${found}    Run Keywords
+    \    ...    Setup Test
+    \    ...    AND    Return From Keyword    ${id}
 
-⸻
-
-3. Utilisation dans un script Robot Framework
-
-Une fois l’image ajoutée, elle peut être utilisée dans un script Robot Framework grâce aux keywords fournis par SikuliLibrary.
+    Fail    Image not found on any screen (scanned ${screen_count} screens)
