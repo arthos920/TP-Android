@@ -1,77 +1,32 @@
-# ScreenshotOnKeywordFail.py
+import signal
+import sys
+import os
+import subprocess
 from robot.api import logger
 from robot.libraries.BuiltIn import BuiltIn
-import os, re
-from datetime import datetime
 
-class ScreenshotOnKeywordFail:
-    ROBOT_LISTENER_API_VERSION = 2
+class GracefulStopListener:
+    ROBOT_LISTENER_API_VERSION = 3
 
-    def __init__(self, outdir=None, prefix='kwfail'):
-        # Ne PAS toucher à BuiltIn ici -> pas de contexte encore !
-        self._outdir_arg = outdir
-        self.prefix = prefix
-        self.outdir = None
-        self._bi = None  # BuiltIn lazy
+    def __init__(self):
+        signal.signal(signal.SIGINT, self._stop_handler)
+        signal.signal(signal.SIGTERM, self._stop_handler)
+        self.output_xml = os.getenv("ROBOT_OUTPUT", "output.xml")
 
-    # utilitaires
-    def _safe(self, s):
-        s = (s or '').strip()
-        s = re.sub(r'[\\/:"*?<>|]+', '_', s)
-        s = re.sub(r'\s+', ' ', s)
-        return s[:120]
-
-    def _ensure_bi_and_outdir(self):
-        # Obtenir BuiltIn uniquement quand le contexte existe
-        if self._bi is None:
-            try:
-                self._bi = BuiltIn()
-            except Exception:
-                self._bi = None
-        if self.outdir is None:
-            if self._outdir_arg:
-                self.outdir = self._outdir_arg
-            else:
-                try:
-                    if self._bi:
-                        self.outdir = self._bi.get_variable_value('${OUTPUT DIR}')
-                except Exception:
-                    self.outdir = None
-            if not self.outdir:
-                # dernier recours : cwd
-                self.outdir = os.getcwd()
-
-    # Hooks où le contexte est garanti
-    def start_suite(self, name, attrs):
-        self._ensure_bi_and_outdir()
-
-    def start_test(self, name, attrs):
-        self._ensure_bi_and_outdir()
-
-    def end_keyword(self, name, attrs):
-        if attrs.get('status') != 'FAIL':
-            return
-        self._ensure_bi_and_outdir()
-
-        suite = self._safe(self._bi.get_variable_value('${SUITE NAME}', default='suite') if self._bi else 'suite')
-        test  = self._safe(self._bi.get_variable_value('${TEST NAME}',  default='no-test') if self._bi else 'no-test')
-        kw    = self._safe(attrs.get('kwname') or name)
-        ts    = datetime.now().strftime('%Y%m%d-%H%M%S-%f')
-
-        folder = os.path.join(self.outdir, 'screenshots', suite, test)
-        os.makedirs(folder, exist_ok=True)
-        path = os.path.join(folder, f"{self.prefix}-{kw}-{ts}.png")
-
+    def _stop_handler(self, signum, frame):
+        logger.warn("⚠️ Arrêt détecté, génération du log.html…")
         try:
-            # tenter sans import, puis importer si besoin
-            try:
-                self._bi.run_keyword('Take Screenshot', path)
-            except Exception:
-                self._bi.run_keyword('Import Library', 'ScreenCapLibrary')
-                self._bi.run_keyword('Take Screenshot', path)
+            # on force Robot à arrêter proprement
+            BuiltIn().fatal_error("Test interrompu manuellement")
+        except Exception:
+            pass
 
-            rel = os.path.relpath(path, self.outdir).replace('\\', '/')
-            logger.info(f'Failure screenshot saved: {path}')
-            logger.info(f'<a href="{rel}">Open screenshot</a>', html=True)
-        except Exception as e:
-            logger.warn(f'Listener failed to take screenshot: {e}')
+        # Génération manuelle des logs à partir du output.xml courant
+        if os.path.exists(self.output_xml):
+            subprocess.call([
+                "rebot",
+                "--log", "log.html",
+                "--report", "report.html",
+                "--output", self.output_xml
+            ])
+        sys.exit(0)
