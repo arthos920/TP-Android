@@ -1,29 +1,26 @@
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.common.actions.pointer_input import PointerInput
-from selenium.webdriver.common.actions.action_builder import ActionBuilder
-
 def use_ptt_release(self, screenshots=True):
     try:
         ptt_button = self.driver.find_element(By.ID, PTT_BTN_ID)
 
-        # Création d'un pointeur tactile
-        touch = PointerInput(PointerInput.TOUCH, "finger")
-        actions = ActionBuilder(self.driver)
-        actions.add_action(touch)
+        # --- Récupérer les coordonnées du bouton ---
+        loc = ptt_button.location
+        size = ptt_button.size
 
-        # Déplacement vers l’élément et appui
-        actions.pointer_action.move_to(ptt_button)
-        actions.pointer_action.pointer_down()
-        actions.pointer_action.pause(1)
+        x = int(loc["x"] + size["width"] / 2)
+        y = int(loc["y"] + size["height"] / 2)
 
-        robot.api.logger.info("PTT Pressed")
+        robot.api.logger.info(f"PTT coords: {x},{y}")
 
-        # Relâchement
-        actions.pointer_action.pointer_up()
-        actions.perform()
+        # --- Appuyer ---
+        self.driver.execute_script("mobile: touch:down", {"x": x, "y": y})
+        robot.api.logger.info("PTT pressed")
 
-        robot.api.logger.info("PTT Released OK")
+        time.sleep(1)   # durée d'appui → modifiable
+
+        # --- Relâcher ---
+        self.driver.execute_script("mobile: touch:up", {"x": x, "y": y})
+        robot.api.logger.info("PTT released")
 
     except Exception as e:
-        robot.api.logger.error("Does not manage to take the PTT – " + str(e))
-        raise Exception("Does not manage to take the PTT")
+        robot.api.logger.error("Does not manage to press/release PTT: " + str(e))
+        raise Exception("Does not manage to press/release PTT")
