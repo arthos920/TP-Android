@@ -1,35 +1,27 @@
-from selenium.webdriver.common.actions.action_builder import ActionBuilder
-from selenium.webdriver.common.actions.pointer_input import PointerInput
-from selenium.webdriver.common.by import By
-import time
-
 def use_ptt_release(self, screenshots=True):
     try:
         ptt_button = self.driver.find_element(By.ID, PTT_BTN_ID)
 
-        # Pointeur générique (équivalent souris)
-        finger = PointerInput(PointerInput.MOUSE, "finger")
-        actions = ActionBuilder(self.driver)
-        actions.add_action(finger)
+        # ---- 1) Appui long (tu gardes ton ActionChains de maintien) ----
+        ActionChains(self.driver).move_to_element(ptt_button).pause(1).click_and_hold().perform()
+        robot.api.logger.info("Press on PTT OK")
 
-        rect = ptt_button.rect
-        x = int(rect["x"] + rect["width"] / 2)
-        y = int(rect["y"] + rect["height"] / 2)
+        WebDriverWait(self.driver, 2).until(
+            EC.visibility_of_element_located((By.XPATH, "//*[contains(@text, 'Transm')]"))
+        )
+        robot.api.logger.info("PTT in progress")
 
-        # Pointer appui
-        actions.pointer_action.move_to_location(x, y)
-        actions.pointer_action.pointer_down()
+        # Maintien 5 secondes
+        time.sleep(5)
 
-        robot.api.logger.info("PTT pressed")
-
-        time.sleep(1)  # durée d'appui
-
-        # Pointer relâché
-        actions.pointer_action.pointer_up()
-        actions.perform()
-
+        # ---- 2) RELÂCHEMENT TACTILE ----
+        # → Click en dehors du bouton (ex : x=10, y=10)
+        self.driver.execute_script("mobile: clickGesture", {"x": 10, "y": 10})
         robot.api.logger.info("PTT released")
 
-    except Exception as e:
-        robot.api.logger.error("Error pressing/releasing PTT: " + str(e))
-        raise
+    except TimeoutException:
+        robot.api.logger.info("Does not manage to take the PTT")
+        raise Exception("Does not manage to take the PTT")
+
+    if screenshots:
+        log_screenshot(self.driver)
