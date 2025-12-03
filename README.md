@@ -1,27 +1,26 @@
-@echo off
-echo -------------------------------------------
-echo  Lancement du Jenkins Agent en mode GUI
-echo -------------------------------------------
-echo.
+if desired_capabilities is None:
+    desired_caps = {
+        "platformName": "Android",
 
-REM Aller dans le dossier de l’agent
-cd /d C:\jenkins-agent
+        # ✔ ton app garde ses données
+        "noReset": True,
+        "fullReset": False,
 
-REM Vérifier que agent.jar existe
-if not exist agent.jar (
-    echo ERREUR : agent.jar introuvable dans C:\jenkins-agent
-    pause
-    exit /b
-)
+        # ✔ Appium réinstalle ses serveurs UiAutomator2 → stabilité
+        "skipServerInstallation": False,
+        "skipDeviceInitialization": False,
 
-echo Démarrage de l’agent...
-echo.
+        # ✔ empêche les logs d'exploser → évite socket hang up
+        "clearDeviceLogsOnStart": True,
 
-REM Lancer l’agent Jenkins en mode interactif
-java -jar agent.jar -jnlpUrl "<URL_JNLP>" -secret "<SECRET>" -workDir "C:\jenkins-agent"
+        # ✔ délais pour éviter les timeouts UiAutomator2 / ADB
+        "uiautomator2ServerInstallTimeout": 30000,
+        "adbExecTimeout": 60000,
 
-echo.
-echo -------------------------------------------
-echo     Agent Jenkins arrêté (fenêtre fermée)
-echo -------------------------------------------
-pause
+        # ✔ langue & locale
+        "appium:language": "en",
+        "appium:locale": "en",
+
+        # ✔ pour éviter la déconnexion du driver en long test
+        "newCommandTimeout": 3000
+    }
