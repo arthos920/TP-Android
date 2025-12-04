@@ -1,3 +1,12 @@
+Nous avons activé deux options qui forcent Appium à repartir sur un environnement propre à chaque test.
+Cela évite que des fichiers internes se corrompent et bloquent les appareils.
+Résultat : plus de stabilité, plus besoin de redémarrer les téléphones, et moins d’échecs non pertinents.
+
+
+
+
+
+
 if desired_capabilities is None:
     desired_caps = {
         "platformName": "Android",
