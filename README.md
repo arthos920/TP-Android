@@ -1,9 +1,16 @@
-Nous avons activé deux options qui forcent Appium à repartir sur un environnement propre à chaque test.
-Cela évite que des fichiers internes se corrompent et bloquent les appareils.
-Résultat : plus de stabilité, plus besoin de redémarrer les téléphones, et moins d’échecs non pertinents.
 
+Gestion lancement dispatcher
+    [Arguments]    ${fonction}    @{terminals}
+    Log    Lancement du dispatcher avec la fonction : ${fonction}
 
+    # Appel de la fonction Python et récupération du statut
+    ${result}=    Run Keyword And Return Status    ${fonction}    @{terminals}
 
+    IF    ${result} == False
+        Fail    Échec lancement dispatcher avec la fonction : ${fonction}
+    END
+
+    Log    Dispatcher lancé avec succès
 
 
 
