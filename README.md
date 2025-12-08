@@ -1,71 +1,84 @@
-def close_call_if_needed(self):
+
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+
+def clear_close_call(self, timeout=5):
     """
-    Clôture proprement tout appel encore actif.
-    Fonction robuste utilisant self.driver.wait.
+    Ferme proprement un appel en cours si nécessaire.
+
+    Logique :
+    1. Si un bouton raccrocher est visible → on clique.
+    2. Sinon, on va sur la vue messages.
+    3. Si un bouton Join est visible → on clique, puis on raccroche.
+    4. Si un item avec texte 'Ongoing' est visible → on clique, puis on raccroche.
     """
 
     try:
-        # -------------------------
-        # 1. Si le bouton "hang up" (raccrocher) est présent
-        # -------------------------
-        hangup_btn = self.driver.wait(
-            timeout=2,
-            locator=('id', 'com.example.app:id/btn_hangup'),
-            raise_exception=False
-        )
-        if hangup_btn:
-            hangup_btn.click()
-            return True
+        wait = WebDriverWait(self.driver, timeout)
 
-        # -------------------------
-        # 2. Sinon on navigue vers la vue message
-        # -------------------------
-        if hasattr(self, "navigation_to_message_view"):
-            self.navigation_to_message_view()
+        # 1) Essayer de raccrocher directement si le bouton est déjà là
+        try:
+            element = wait.until(
+                EC.element_to_be_clickable((By.ID, HANGUP_BUTTON_ID))
+            )
+            element.click()
+            # Si tu as une fonction qui termine vraiment l'appel (PTT par ex.)
+            if hasattr(self, "stop_ptt_call"):
+                self.stop_ptt_call()
+            return
+        except Exception:
+            # Pas de bouton raccrocher visible tout de suite -> on continue
+            pass
 
-        # -------------------------
-        # 3. Si le bouton Join est présent → cliquer
-        # -------------------------
-        join_btn = self.driver.wait(
-            timeout=2,
-            locator=('id', 'com.example.app:id/btn_join'),
-            raise_exception=False
-        )
-        if join_btn:
+        # 2) Tenter d'aller vers la vue message (si tu as cette méthode)
+        try:
+            if hasattr(self, "navigation_to_message_view"):
+                self.navigation_to_message_view()
+        except Exception:
+            # Si ça plante, on ne bloque pas le nettoyage
+            pass
+
+        # 3) Si un bouton Join est présent, on rejoint l'appel puis on raccroche
+        try:
+            join_btn = WebDriverWait(self.driver, timeout).until(
+                EC.element_to_be_clickable((By.ID, JOIN_BUTTON_ID))
+            )
             join_btn.click()
 
-            # On tente de raccrocher juste après
-            hangup_btn = self.driver.wait(
-                timeout=4,
-                locator=('id', 'com.example.app:id/btn_hangup'),
-                raise_exception=False
+            hangup_btn = WebDriverWait(self.driver, timeout).until(
+                EC.element_to_be_clickable((By.ID, HANGUP_BUTTON_ID))
             )
-            if hangup_btn:
-                hangup_btn.click()
-            return True
+            hangup_btn.click()
 
-        # -------------------------
-        # 4. Si un texte "On going" apparaît → on clique puis raccrocher
-        # -------------------------
-        ongoing_cell = self.driver.wait(
-            timeout=2,
-            locator=('xpath', "//*[contains(@text, 'On going')]"),
-            raise_exception=False
-        )
-        if ongoing_cell:
-            ongoing_cell.click()
+            if hasattr(self, "stop_ptt_call"):
+                self.stop_ptt_call()
+            return
+        except Exception:
+            # Pas de Join visible -> on essaye la liste "Ongoing"
+            pass
 
-            hangup_btn = self.driver.wait(
-                timeout=4,
-                locator=('id', 'com.example.app:id/btn_hangup'),
-                raise_exception=False
+        # 4) Chercher un item "Ongoing" et le fermer
+        try:
+            ongoing_cell = WebDriverWait(self.driver, timeout).until(
+                EC.element_to_be_clickable((By.ID, PRIMARY_TEXT_ID))
             )
-            if hangup_btn:
-                hangup_btn.click()
-            return True
 
-        return False  # Aucun call détecté
+            if ongoing_cell.text == "Ongoing":
+                ongoing_cell.click()
+
+                hangup_btn = WebDriverWait(self.driver, timeout).until(
+                    EC.element_to_be_clickable((By.ID, HANGUP_BUTTON_ID))
+                )
+                hangup_btn.click()
+
+                if hasattr(self, "stop_ptt_call"):
+                    self.stop_ptt_call()
+                return
+        except Exception:
+            # Rien trouvé, on considère qu'il n'y a pas d'appel à fermer
+            pass
 
     except Exception as e:
-        print(f"[close_call_if_needed] WARNING: Exception: {e}")
-        return False
+        print(f"[clear_close_call] Error while cleaning call: {e}")
