@@ -1,42 +1,71 @@
+def close_call_if_needed(self):
+    """
+    Clôture proprement tout appel encore actif.
+    Fonction robuste utilisant self.driver.wait.
+    """
 
-Gestion lancement dispatcher
-    [Arguments]    ${fonction}    @{terminals}
-    Log    Lancement du dispatcher avec la fonction : ${fonction}
+    try:
+        # -------------------------
+        # 1. Si le bouton "hang up" (raccrocher) est présent
+        # -------------------------
+        hangup_btn = self.driver.wait(
+            timeout=2,
+            locator=('id', 'com.example.app:id/btn_hangup'),
+            raise_exception=False
+        )
+        if hangup_btn:
+            hangup_btn.click()
+            return True
 
-    # Appel de la fonction Python et récupération du statut
-    ${result}=    Run Keyword And Return Status    ${fonction}    @{terminals}
+        # -------------------------
+        # 2. Sinon on navigue vers la vue message
+        # -------------------------
+        if hasattr(self, "navigation_to_message_view"):
+            self.navigation_to_message_view()
 
-    IF    ${result} == False
-        Fail    Échec lancement dispatcher avec la fonction : ${fonction}
-    END
+        # -------------------------
+        # 3. Si le bouton Join est présent → cliquer
+        # -------------------------
+        join_btn = self.driver.wait(
+            timeout=2,
+            locator=('id', 'com.example.app:id/btn_join'),
+            raise_exception=False
+        )
+        if join_btn:
+            join_btn.click()
 
-    Log    Dispatcher lancé avec succès
+            # On tente de raccrocher juste après
+            hangup_btn = self.driver.wait(
+                timeout=4,
+                locator=('id', 'com.example.app:id/btn_hangup'),
+                raise_exception=False
+            )
+            if hangup_btn:
+                hangup_btn.click()
+            return True
 
+        # -------------------------
+        # 4. Si un texte "On going" apparaît → on clique puis raccrocher
+        # -------------------------
+        ongoing_cell = self.driver.wait(
+            timeout=2,
+            locator=('xpath', "//*[contains(@text, 'On going')]"),
+            raise_exception=False
+        )
+        if ongoing_cell:
+            ongoing_cell.click()
 
+            hangup_btn = self.driver.wait(
+                timeout=4,
+                locator=('id', 'com.example.app:id/btn_hangup'),
+                raise_exception=False
+            )
+            if hangup_btn:
+                hangup_btn.click()
+            return True
 
-if desired_capabilities is None:
-    desired_caps = {
-        "platformName": "Android",
+        return False  # Aucun call détecté
 
-        # ✔ ton app garde ses données
-        "noReset": True,
-        "fullReset": False,
-
-        # ✔ Appium réinstalle ses serveurs UiAutomator2 → stabilité
-        "skipServerInstallation": False,
-        "skipDeviceInitialization": False,
-
-        # ✔ empêche les logs d'exploser → évite socket hang up
-        "clearDeviceLogsOnStart": True,
-
-        # ✔ délais pour éviter les timeouts UiAutomator2 / ADB
-        "uiautomator2ServerInstallTimeout": 30000,
-        "adbExecTimeout": 60000,
-
-        # ✔ langue & locale
-        "appium:language": "en",
-        "appium:locale": "en",
-
-        # ✔ pour éviter la déconnexion du driver en long test
-        "newCommandTimeout": 3000
-    }
+    except Exception as e:
+        print(f"[close_call_if_needed] WARNING: Exception: {e}")
+        return False
