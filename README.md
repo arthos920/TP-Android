@@ -1,3 +1,26 @@
+"C:\Program Files\Java\jdk-20\bin\java.exe" ^
+  -Dhttp.nonProxyHosts="10.*|localhost|127.0.0.1" ^
+  -Dhttps.nonProxyHosts="10.*|localhost|127.0.0.1" ^
+  -jar agent.jar ^
+  -url "http://url:port" ^
+  <TON_TOKEN> ^
+  -name "SduLeL6nSY5O8" ^
+  -webSocket ^
+  -workDir "C:\Jenkins"
+
+set NO_PROXY=10.,localhost,127.0.0.1
+set no_proxy=10.,localhost,127.0.0.1
+
+
+
+
+
+
+
+
+
+
+
 def clean_appium_apks(self, device_id):
     """
     Désinstalle les APK internes Appium uniquement s'ils sont présents :
