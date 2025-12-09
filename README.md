@@ -1,4 +1,37 @@
 
+
+def clean_appium_apks(self, device_id):
+    """
+    Désinstalle les APK internes Appium :
+    - UiAutomator2 server
+    - UiAutomator2 server test
+    - Appium Settings
+
+    Cela permet d'éviter les blocages Appium (socket hang up, proxy errors).
+    Appium les réinstallera automatiquement au lancement de la session.
+    """
+
+    print(f"[CLEAN] Nettoyage des APK Appium sur le device {device_id}...")
+
+    packages = [
+        "io.appium.uiautomator2.server",
+        "io.appium.uiautomator2.server.test",
+        "io.appium.settings"
+    ]
+
+    for pkg in packages:
+        cmd = f"adb -s {device_id} uninstall {pkg}"
+        print(f"[CLEAN] → Uninstall {pkg}")
+        self.send_command_with_pipes(cmd)
+
+    print(f"[CLEAN] Nettoyage terminé, Appium réinstallera les APK automatiquement.")
+
+
+
+
+
+
+
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
