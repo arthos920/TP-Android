@@ -1,8 +1,6 @@
-
-
 def clean_appium_apks(self, device_id):
     """
-    Désinstalle les APK internes Appium :
+    Désinstalle les APK internes Appium uniquement s'ils sont présents :
     - UiAutomator2 server
     - UiAutomator2 server test
     - Appium Settings
@@ -20,14 +18,18 @@ def clean_appium_apks(self, device_id):
     ]
 
     for pkg in packages:
-        cmd = f"adb -s {device_id} uninstall {pkg}"
-        print(f"[CLEAN] → Uninstall {pkg}")
-        self.send_command_with_pipes(cmd)
+        # Vérifier si le package est installé
+        check_cmd = f"adb -s {device_id} shell pm list packages | grep {pkg}"
+        result = self.send_command_with_pipes(check_cmd)
 
-    print(f"[CLEAN] Nettoyage terminé, Appium réinstallera les APK automatiquement.")
+        if pkg in result:
+            print(f"[CLEAN] → {pkg} trouvé, désinstallation en cours...")
+            uninstall_cmd = f"adb -s {device_id} uninstall {pkg}"
+            self.send_command_with_pipes(uninstall_cmd)
+        else:
+            print(f"[CLEAN] → {pkg} absent, rien à désinstaller.")
 
-
-
+    print(f"[CLEAN] Fin du nettoyage Appium APKs.")
 
 
 
