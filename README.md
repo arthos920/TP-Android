@@ -1,3 +1,49 @@
+
+def clean_appium_apks(self, device_id):
+    """
+    Désinstalle les APK internes Appium uniquement s'ils sont présents.
+    - UiAutomator2 server
+    - UiAutomator2 server test
+    - Appium Settings
+    """
+
+    print(f"[CLEAN] Nettoyage des APK Appium sur le device {device_id}...")
+
+    packages = [
+        "io.appium.uiautomator2.server",
+        "io.appium.uiautomator2.server.test",
+        "io.appium.settings"
+    ]
+
+    # 1️⃣ On récupère la liste des packages installés sur le téléphone
+    list_cmd = f"adb -s {device_id} shell pm list packages"
+    installed_packages = self.send_command_with_pipes(list_cmd)
+
+    # 2️⃣ Vérification + désinstallation
+    for pkg in packages:
+        if pkg in installed_packages:
+            print(f"[CLEAN] → {pkg} trouvé, désinstallation en cours...")
+            uninstall_cmd = f"adb -s {device_id} uninstall {pkg}"
+            self.send_command_with_pipes(uninstall_cmd)
+        else:
+            print(f"[CLEAN] → {pkg} absent, rien à désinstaller.")
+
+    print("[CLEAN] Fin du nettoyage Appium APKs.")
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 "C:\Program Files\Java\jdk-20\bin\java.exe" ^
   -Dhttp.nonProxyHosts="10.*|localhost|127.0.0.1" ^
   -Dhttps.nonProxyHosts="10.*|localhost|127.0.0.1" ^
