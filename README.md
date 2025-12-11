@@ -1,31 +1,49 @@
-import subprocess
-import psutil
+from selenium.common.exceptions import WebDriverException, SessionNotCreatedException
 
-def free_port(port):
-    """Force free a TCP port on Windows by killing all related processes."""
-    port = str(port)
-    print(f"[INFO] Trying to free port {port}...")
+...
 
-    # Get all processes listening on the port
-    cmd = ["netstat", "-ano"]
-    output = subprocess.check_output(cmd, text=True)
+    try:
+        self.driver = webdriver.Remote(
+            appium_server_address,
+            options=option,
+            keep_alive=True
+        )
 
-    for line in output.splitlines():
-        if port in line and "LISTENING" in line:
-            pid = int(line.split()[-1])
-            print(f"[INFO] Killing PID {pid} using port {port}")
+        print(f"Successfully connected to device on attempt {attempt + 1}")
+        break
 
-            try:
-                p = psutil.Process(pid)
-                for child in p.children(recursive=True):
-                    child.kill()
-                p.kill()
-                print(f"[INFO] PID {pid} killed successfully")
-            except Exception as e:
-                print(f"[ERROR] Could not kill PID {pid}: {e}")
+    except (SessionNotCreatedException, WebDriverException) as e:
 
-    return True
+        print(f"[ERROR] Setup failed on attempt {attempt + 1}: {e}")
 
+        # détecter l'erreur de port bloqué
+        if "8200..8299" in str(e) or "systemPort" in str(e) or "Address already in use" in str(e):
+            port = desired_caps.get("systemPort")
+            print(f"[WARN] Port {port} appears to be blocked. Attempting to free it...")
+
+            free_port(port)
+
+            print(f"[INFO] Port {port} freed. Retrying setup_device()...")
+
+            return self.setup_device(
+                appium_server_address,
+                desired_capabilities,
+                recording,
+                window_name_to_capture,
+                cache,
+                system_port=port
+            )
+
+        # si dernier retry → erreur fatale
+        if attempt == max_retries - 1:
+            raise Exception(
+                f"Failed to start Agent driver after {max_retries} attempts.\n"
+                f"Last error: {str(e)}"
+            )
+
+        # retry normal
+        print(f"[INFO] Retry in {2 ** attempt} seconds...")
+        time.sleep(2 ** attempt)
 
 
 
