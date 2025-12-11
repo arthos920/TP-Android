@@ -1,61 +1,36 @@
+# Check for blocked systemPort and try to free it
+if "free port in range" in str(e) or "systemPort" in str(e):
+    print(f"[WARN] Port {desired_caps.get('systemPort')} appears to be blocked. Attempting to free it...")
 
-def clean_appium_apks(self, device_id):
-    """
-    Désinstalle les APK internes Appium uniquement s'ils sont présents.
-    - UiAutomator2 server
-    - UiAutomator2 server test
-    - Appium Settings
-    """
+    def free_port(port):
+        cmd = f'netstat -ano | findstr {port}'
+        result = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE).communicate()[0].decode()
 
-    print(f"[CLEAN] Nettoyage des APK Appium sur le device {device_id}...")
+        if result.strip() == "":
+            print(f"[INFO] No process found on port {port}")
+            return False
 
-    packages = [
-        "io.appium.uiautomator2.server",
-        "io.appium.uiautomator2.server.test",
-        "io.appium.settings"
-    ]
+        for line in result.splitlines():
+            parts = line.split()
+            pid = parts[-1]  # PID is last column
+            print(f"[INFO] Killing PID {pid} using port {port}")
+            os.system(f"taskkill /PID {pid} /F")
 
-    # 1️⃣ On récupère la liste des packages installés sur le téléphone
-    list_cmd = f"adb -s {device_id} shell pm list packages"
-    installed_packages = self.send_command_with_pipes(list_cmd)
+        return True
 
-    # 2️⃣ Vérification + désinstallation
-    for pkg in packages:
-        if pkg in installed_packages:
-            print(f"[CLEAN] → {pkg} trouvé, désinstallation en cours...")
-            uninstall_cmd = f"adb -s {device_id} uninstall {pkg}"
-            self.send_command_with_pipes(uninstall_cmd)
-        else:
-            print(f"[CLEAN] → {pkg} absent, rien à désinstaller.")
-
-    print("[CLEAN] Fin du nettoyage Appium APKs.")
+    port = desired_caps.get("systemPort")
+    if port:
+        freed = free_port(port)
+        if freed:
+            print("[INFO] Port freed successfully. Retrying setup_device...")
+            # Retry immediately after freeing the port
+            return self.setup_device(appium_server_address, desired_capabilities,
+                                     recording, window_name_to_capture, cache,
+                                     system_port=port)
 
 
 
 
-
-
-
-
-
-
-
-
-
-
-
-"C:\Program Files\Java\jdk-20\bin\java.exe" ^
-  -Dhttp.nonProxyHosts="10.*|localhost|127.0.0.1" ^
-  -Dhttps.nonProxyHosts="10.*|localhost|127.0.0.1" ^
-  -jar agent.jar ^
-  -url "http://url:port" ^
-  <TON_TOKEN> ^
-  -name "SduLeL6nSY5O8" ^
-  -webSocket ^
-  -workDir "C:\Jenkins"
-
-set NO_PROXY=10.,localhost,127.0.0.1
-set no_proxy=10.,localhost,127.0.0.1
 
 
 
