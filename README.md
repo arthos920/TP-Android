@@ -1,35 +1,30 @@
-# Check for blocked systemPort and try to free it
-if "free port in range" in str(e) or "systemPort" in str(e):
-    print(f"[WARN] Port {desired_caps.get('systemPort')} appears to be blocked. Attempting to free it...")
+import subprocess
+import psutil
 
-    def free_port(port):
-        cmd = f'netstat -ano | findstr {port}'
-        result = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE).communicate()[0].decode()
+def free_port(port):
+    """Force free a TCP port on Windows by killing all related processes."""
+    port = str(port)
+    print(f"[INFO] Trying to free port {port}...")
 
-        if result.strip() == "":
-            print(f"[INFO] No process found on port {port}")
-            return False
+    # Get all processes listening on the port
+    cmd = ["netstat", "-ano"]
+    output = subprocess.check_output(cmd, text=True)
 
-        for line in result.splitlines():
-            parts = line.split()
-            pid = parts[-1]  # PID is last column
+    for line in output.splitlines():
+        if port in line and "LISTENING" in line:
+            pid = int(line.split()[-1])
             print(f"[INFO] Killing PID {pid} using port {port}")
-            os.system(f"taskkill /PID {pid} /F")
 
-        return True
+            try:
+                p = psutil.Process(pid)
+                for child in p.children(recursive=True):
+                    child.kill()
+                p.kill()
+                print(f"[INFO] PID {pid} killed successfully")
+            except Exception as e:
+                print(f"[ERROR] Could not kill PID {pid}: {e}")
 
-    port = desired_caps.get("systemPort")
-    if port:
-        freed = free_port(port)
-        if freed:
-            print("[INFO] Port freed successfully. Retrying setup_device...")
-            # Retry immediately after freeing the port
-            return self.setup_device(appium_server_address, desired_capabilities,
-                                     recording, window_name_to_capture, cache,
-                                     system_port=port)
-
-
-
+    return True
 
 
 
