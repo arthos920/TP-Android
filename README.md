@@ -1,102 +1,81 @@
-param(
-    [Parameter(Mandatory = $true)]
-    [string]$ISSUE_KEY,
+variables:
+  # Proxy obligatoire pour Git / GitLab
+  HTTP_PROXY: ""
+  HTTPS_PROXY: ""
 
-    [Parameter(Mandatory = $true)]
-    [string]$LAB,
+  # Bypass proxy pour Appium / localhost
+  NO_PROXY: "localhost,127.0.0.1"
+  no_proxy: "localhost,127.0.0.1"
 
-    [Parameter(Mandatory = $true)]
-    [string]$URL,
+  # SSL Git (environnement corporate)
+  GIT_SSL_NO_VERIFY: "true"
 
-    [Parameter(Mandatory = $true)]
-    [string]$EMAIL
-)
+  SHELL: powershell
 
-Write-Output "===== CHECK ACTORS LAUNCH ====="
-Write-Output "LAB        : $LAB"
-Write-Output "ISSUE_KEY  : $ISSUE_KEY"
-Write-Output "PIPELINE   : $URL"
-Write-Output "EMAIL      : $EMAIL"
+# ============================================================
+# TEMPLATE : CHECK ACTORS
+# ============================================================
+.check_actors_template:
+  before_script:
+    - git config --global http.sslVerify false
 
-# ------------------------------------------------------------
-# Récupérer le répertoire du script
-# ------------------------------------------------------------
-$scriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
-Write-Output "Script directory: $scriptDirectory"
+  script:
+    - pwd
+    - ls ./scripts
+    - powershell -ExecutionPolicy Bypass -File "./scripts/check_actors_launch.ps1" `
+        -LAB $env:LAB `
+        -URL $CI_PIPELINE_URL `
+        -EMAIL $env:EMAIL `
+        -ISSUE_KEY $env:ISSUE_KEY
 
-# ------------------------------------------------------------
-# Charger la configuration JSON
-# ------------------------------------------------------------
-$configFilePath = Join-Path -Path $scriptDirectory -ChildPath "lab_config.json"
+  artifacts:
+    when: always
+    paths:
+      - output.txt
+      - log_actors.html
+      - report_actors.html
+      - check_actors.xml
 
-if (-Not (Test-Path $configFilePath)) {
-    Write-Error "Configuration file not found: $configFilePath"
-    exit 1
-}
+  allow_failure: false
 
-$config = Get-Content -Path $configFilePath | ConvertFrom-Json
+# ============================================================
+# TEMPLATE : FETCH TEST CASES
+# ============================================================
+.fetch_tests_cases_template:
+  before_script:
+    - git config --global http.sslVerify false
 
-# ------------------------------------------------------------
-# Vérifier que le LAB existe dans la config
-# ------------------------------------------------------------
-if (-not ($config.PSObject.Properties.Name -contains $LAB)) {
-    Write-Error "Configuration for lab '$LAB' not found in lab_config.json"
-    exit 1
-}
+  script:
+    - ls ./scripts
+    - echo "The CI URL is $CI_PIPELINE_URL"
+    - powershell -ExecutionPolicy Bypass -File "./scripts/fetch_tests.ps1" `
+        -ISSUE_KEY $env:ISSUE_KEY `
+        -LAB $env:LAB `
+        -URL $CI_PIPELINE_URL `
+        -EMAIL $env:EMAIL
 
-$labConfig = $config.$LAB
+  artifacts:
+    when: always
+    paths:
+      - output.txt
+      - log.html
+      - report.html
+      - check.xml
 
-$robotCampaignDirectory = $labConfig.robotCampaignDirectory
-$checkActorFile         = $labConfig.checkActorFile
-$robotPath              = $labConfig.robotPath
-$listenerPath           = $labConfig.listenerPath
-$pythonPath             = $labConfig.pythonPath
+# ============================================================
+# JOBS PAR LAB
+# ============================================================
 
-Write-Output "Robot path              : $robotPath"
-Write-Output "Robot campaign directory: $robotCampaignDirectory"
-Write-Output "Check actor file        : $checkActorFile"
+check_actors_SolutionSYS03:
+  extends: .check_actors_template
+  tags:
+    - PC-VIRT804
+  rules:
+    - if: '$LAB == "SolutionSYS03"'
 
-# ------------------------------------------------------------
-# Se placer dans le bon dossier
-# ------------------------------------------------------------
-if (-Not (Test-Path $robotCampaignDirectory)) {
-    Write-Error "Robot campaign directory not found: $robotCampaignDirectory"
-    exit 1
-}
-
-Set-Location $robotCampaignDirectory
-
-# ------------------------------------------------------------
-# Fichiers de sortie Robot
-# ------------------------------------------------------------
-$outputFile = "check_actors.xml"
-$logFile    = "log_actors.html"
-$reportFile = "report_actors.html"
-
-# ------------------------------------------------------------
-# Lancer Robot Framework
-# ------------------------------------------------------------
-Write-Output "Launching Robot Framework..."
-
-& $robotPath `
-    -L debug `
-    --output $outputFile `
-    --log $logFile `
-    --report $reportFile `
-    $checkActorFile
-
-$robotExitCode = $LASTEXITCODE
-
-Write-Output "Robot exit code: $robotExitCode"
-
-# ------------------------------------------------------------
-# Propager le résultat vers GitLab
-# ------------------------------------------------------------
-if ($robotExitCode -ne 0) {
-    Write-Error "❌ Robot tests FAILED"
-    exit $robotExitCode
-}
-
-Write-Output "✅ Robot tests PASSED"
-exit 0
-            
+fetch_tests_SolutionSYS03:
+  extends: .fetch_tests_cases_template
+  tags:
+    - PC-VIRT804
+  rules:
+    - if: '$LAB == "SolutionSYS03"'
