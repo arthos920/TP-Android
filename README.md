@@ -1,84 +1,101 @@
-Write-Output "======================================"
-Write-Output "START JIRA UPLOAD TESTS"
-Write-Output "======================================"
+Write-Output "==============================="
+Write-Output "START JIRA UPLOAD"
+Write-Output "==============================="
 
-$zipPath = "$PWD\results.zip"
-$jiraAttachmentUrl = "$JIRA_URL/rest/api/2/issue/$ISSUE_KEY/attachments"
+$resultsZip = Join-Path $env:CI_PROJECT_DIR "results.zip"
+$jiraIssueKey = $ISSUE_KEY
 
-if (!(Test-Path $zipPath)) {
-    Write-Error "results.zip not found"
-    exit 1
-}
+# -------------------------
+# OPTION 1 : XRAY IMPORT
+# -------------------------
+Write-Output ">>> OPTION 1 : XRAY import"
 
-# -------------------------------------------------
-# OPTION 1 – XRAY IMPORT (robot output.xml)
-# -------------------------------------------------
-Write-Output ">>> OPTION 1: XRAY import"
-
+$option1Ok = $false
 try {
-    $xrayUrl = "$JIRA_URL/rest/raven/1.0/import/execution/robot?testExecKey=$ISSUE_KEY"
+    $cmd = @"
+$CURL_PATH -k -X POST `
+  -u $JIRA_USERNAME`:$JIRA_PASSWORD `
+  -H "X-Atlassian-Token: no-check" `
+  -F "file=@$resultsZip" `
+  "$JIRA_URL_TEST_EXEC$jiraIssueKey"
+"@
 
-    curl.exe -k `
-        -u "$JIRA_USERNAME:$JIRA_PASSWORD" `
-        -F "file=@results\output.xml" `
-        $xrayUrl
+    Write-Output $cmd
+    $res = Invoke-Expression $cmd
+    Write-Output $res
 
-    Write-Output "⚠️ OPTION 1 executed (check Xray UI)"
+    if ($LASTEXITCODE -eq 0) {
+        Write-Output "OPTION 1 SUCCESS"
+        $option1Ok = $true
+    } else {
+        Write-Warning "OPTION 1 FAILED"
+    }
 }
 catch {
-    Write-Warning "OPTION 1 FAILED"
+    Write-Warning "OPTION 1 EXCEPTION"
+    Write-Warning $_
 }
 
-# -------------------------------------------------
-# OPTION 2 – CURL ZIP ATTACHMENT
-# -------------------------------------------------
-Write-Output ">>> OPTION 2: ZIP upload via curl"
+if ($option1Ok) {
+    exit 0
+}
 
+# -------------------------
+# OPTION 3 : JIRA COMMENT
+# -------------------------
+Write-Output ">>> OPTION 3 : JIRA comment (fallback)"
+
+$option3Ok = $false
 try {
-    curl.exe -k `
-        -u "$JIRA_USERNAME:$JIRA_PASSWORD" `
-        -H "X-Atlassian-Token: no-check" `
-        -F "file=@$zipPath" `
-        "$jiraAttachmentUrl"
+    $commentBody = @{
+        body = @"
+🧪 Robot Framework results available
 
-    Write-Output "⚠️ OPTION 2 executed (curl)"
-}
-catch {
-    Write-Warning "OPTION 2 FAILED"
-}
+Pipeline:
+$CI_PIPELINE_URL
 
-# -------------------------------------------------
-# OPTION 3 – POWERSHELL INVOKE-RESTMETHOD (RECOMMANDÉ)
-# -------------------------------------------------
-Write-Output ">>> OPTION 3: ZIP upload via Invoke-RestMethod"
+Artifacts:
+$CI_PIPELINE_URL/artifacts/browse/results/
 
-try {
+Main files:
+- report.html
+- log.html
+- output.xml
+- results.zip
+"@
+    } | ConvertTo-Json -Depth 5
+
+    $commentUrl = "$JIRA_URL/rest/api/2/issue/$jiraIssueKey/comment"
+
     $headers = @{
-        "X-Atlassian-Token" = "no-check"
+        "Content-Type" = "application/json"
     }
 
-    $cred = New-Object System.Management.Automation.PSCredential(
-        $JIRA_USERNAME,
-        (ConvertTo-SecureString $JIRA_PASSWORD -AsPlainText -Force)
-    )
-
-    Invoke-RestMethod `
-        -Uri $jiraAttachmentUrl `
-        -Method Post `
+    $res = Invoke-RestMethod `
+        -Uri $commentUrl `
+        -Method POST `
         -Headers $headers `
-        -Credential $cred `
-        -InFile $zipPath `
-        -ContentType "application/zip"
+        -Body $commentBody `
+        -Credential (New-Object System.Management.Automation.PSCredential(
+            $JIRA_USERNAME,
+            (ConvertTo-SecureString $JIRA_PASSWORD -AsPlainText -Force)
+        )) `
+        -Proxy $PROXY
 
-    Write-Output "✅ OPTION 3 SUCCESS"
-    Write-Output "======================================"
-    Write-Output "JIRA UPLOAD SUCCESSFUL"
-    Write-Output "======================================"
-    exit 0
+    Write-Output "OPTION 3 SUCCESS – Comment added to Jira"
+    $option3Ok = $true
 }
 catch {
     Write-Warning "OPTION 3 FAILED"
+    Write-Warning $_
 }
 
-Write-Error "❌ ALL JIRA UPLOAD METHODS FAILED"
+if ($option3Ok) {
+    exit 0
+}
+
+# -------------------------
+# ALL FAILED
+# -------------------------
+Write-Error "ALL JIRA METHODS FAILED (OPTION 1 + OPTION 3)"
 exit 1
