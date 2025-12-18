@@ -1,3 +1,58 @@
+# Définir le dossier de résultats
+$workspace   = Get-Location
+$RESULTS_DIR = Join-Path $workspace "results"
+
+if (!(Test-Path $RESULTS_DIR)) {
+    New-Item -ItemType Directory -Path $RESULTS_DIR | Out-Null
+}
+
+# Construire la commande pour lancer les tests Robot Framework
+$robotCommand = @"
+"$robotPath" `
+  -A "$OUTPUT_FILE" `
+  --nostatusrc `
+  -L debug `
+  --outputdir "$RESULTS_DIR" `
+  --output output.xml `
+  --log log.html `
+  --report report.html
+"@
+
+# Ajouter le paramètre listener si listenerPath n'est pas vide
+if (-not [string]::IsNullOrEmpty($listenerPath)) {
+    $robotCommand += " --listener $listenerPath"
+}
+
+# Ajouter le dossier de campagne Robot
+$robotCommand += " $robotCampaignDirectory"
+
+try {
+    Invoke-Expression $robotCommand
+} catch {
+    Write-Output "Erreur lors du lancement des tests Robot Framework : $_"
+    exit
+}
+
+Write-Output "Tests Robot Framework ont été lancés avec succès."
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 & $robotPath `
   -L debug `
   --outputdir $RESULTS_DIR `
