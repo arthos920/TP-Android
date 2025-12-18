@@ -1,26 +1,28 @@
-$RESULTS_DIR = "results"
+& $robotPath `
+  -L debug `
+  --outputdir $RESULTS_DIR `
+  --output check_actors.xml `
+  --log log_actors.html `
+  --report report_actors.html `
+  $checkActorFile
+
+
+
+
+# ------------------------------
+# Dossier de sortie Robot
+# ------------------------------
+$RESULTS_DIR = Join-Path $workspace "results"
 
 if (!(Test-Path $RESULTS_DIR)) {
     New-Item -ItemType Directory -Path $RESULTS_DIR | Out-Null
 }
 
-$robotCommand = @"
-robot `
-  --outputdir $RESULTS_DIR `
-  --output output.xml `
-  --log log.html `
-  --report report.html `
-  .
-"@
+Write-Output "Robot results directory: $RESULTS_DIR"
 
-Invoke-Expression $robotCommand
-
-
-
-
-script:
-  - set ROBOT_OUTPUT_DIR=results
-  - powershell -ExecutionPolicy Bypass -File ./scripts/check_actors_launch.ps1
+$outputFile = Join-Path $RESULTS_DIR "check_actors.xml"
+$logFile    = Join-Path $RESULTS_DIR "log_actors.html"
+$reportFile = Join-Path $RESULTS_DIR "report_actors.html"
 
 
 
