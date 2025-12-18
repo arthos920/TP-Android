@@ -1,21 +1,52 @@
-@echo off
-REM ==========================================
-REM Start GitLab Runner at VM boot
-REM ==========================================
+$RESULTS_DIR = "results"
 
-REM Chemin vers GitLab Runner
-set GITLAB_RUNNER_DIR=C:\gitlab-runner
-set GITLAB_RUNNER_EXE=%GITLAB_RUNNER_DIR%\gitlab-runner.exe
+if (!(Test-Path $RESULTS_DIR)) {
+    New-Item -ItemType Directory -Path $RESULTS_DIR | Out-Null
+}
 
-REM Log de démarrage
-set LOG_FILE=%GITLAB_RUNNER_DIR%\runner_startup.log
+$robotCommand = @"
+robot `
+  --outputdir $RESULTS_DIR `
+  --output output.xml `
+  --log log.html `
+  --report report.html `
+  .
+"@
 
-echo [%DATE% %TIME%] Starting GitLab Runner... >> %LOG_FILE%
+Invoke-Expression $robotCommand
 
-REM Se placer dans le bon dossier
-cd /d %GITLAB_RUNNER_DIR%
 
-REM Lancer le runner en mode console (non service)
-start "" "%GITLAB_RUNNER_EXE%" run
 
-echo [%DATE% %TIME%] GitLab Runner launched. >> %LOG_FILE%
+
+script:
+  - set ROBOT_OUTPUT_DIR=results
+  - powershell -ExecutionPolicy Bypass -File ./scripts/check_actors_launch.ps1
+
+
+
+
+
+
+
+
+def log_screenshot(driver):
+    import os, time
+    from robot.api import logger
+
+    base_dir = os.environ.get("ROBOT_OUTPUT_DIR", "results")
+    screenshots_dir = os.path.join(base_dir, "screenshots")
+
+    os.makedirs(screenshots_dir, exist_ok=True)
+
+    filename = f"screenshot_{int(time.time()*1000)}.png"
+    img_path = os.path.join(screenshots_dir, filename)
+
+    driver.get_screenshot_as_file(img_path)
+
+    # 🔥 CHEMIN RELATIF
+    rel_path = os.path.join("screenshots", filename)
+
+    logger.info(
+        f'<a href="{rel_path}"><img src="{rel_path}" width="400px"></a>',
+        html=True
+    )
