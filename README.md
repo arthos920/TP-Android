@@ -1,3 +1,9 @@
+$robotCommand = "`"$robotPath`" -A `"$OUTPUT_FILE`" --nostatusrc -L debug --outputdir `"$RESULTS_DIR`" --output output.xml --log log.html --report report.html"
+
+
+
+
+
 # Définir le dossier de résultats
 $workspace   = Get-Location
 $RESULTS_DIR = Join-Path $workspace "results"
