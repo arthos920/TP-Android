@@ -1,42 +1,33 @@
-Write-Output "Zipping Robot Framework results..."
+Write-Output "Uploading results.zip to Jira..."
 
-$resultsDir = Join-Path (Get-Location) "results"
+$jiraIssueKey = $ISSUE_KEY
 $zipPath = Join-Path (Get-Location) "results.zip"
 
-if (Test-Path $zipPath) {
-    Remove-Item $zipPath -Force
-}
-
-Compress-Archive -Path "$resultsDir\*" -DestinationPath $zipPath
-
 if (!(Test-Path $zipPath)) {
-    Write-Error "results.zip was not created"
+    Write-Error "results.zip not found at $zipPath"
     exit 1
 }
 
-Write-Output "Results successfully zipped: $zipPath"
-Write-Output "Uploading results.zip to Jira..."
+$jiraUrl = "https://slc-toolset.common.airbusds.corp/jira/rest/api/2/issue/$jiraIssueKey/attachments"
 
-$jiraUrl = "https://slc-toolset.common.airbusds.corp/jira/rest/api/2/issue/$ISSUE_KEY/attachments"
-$auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$JIRA_USERNAME:$JIRA_PASSWORD"))
-
-$headers = @{
-    "Authorization" = "Basic $auth"
-    "X-Atlassian-Token" = "no-check"
-}
+# Création du credential SANS encodage manuel
+$securePassword = ConvertTo-SecureString $JIRA_PASSWORD -AsPlainText -Force
+$credential = New-Object System.Management.Automation.PSCredential ($JIRA_USERNAME, $securePassword)
 
 try {
     Invoke-RestMethod `
         -Uri $jiraUrl `
         -Method Post `
-        -Headers $headers `
         -InFile $zipPath `
-        -ContentType "application/zip"
+        -ContentType "application/zip" `
+        -Headers @{ "X-Atlassian-Token" = "no-check" } `
+        -Credential $credential `
+        -Proxy $PROXY
 
-    Write-Output "✅ Results successfully uploaded to Jira issue $ISSUE_KEY"
+    Write-Output "results.zip successfully uploaded to Jira issue $jiraIssueKey"
 }
 catch {
-    Write-Error "❌ Failed to upload results.zip to Jira"
+    Write-Error "Failed to upload results.zip to Jira"
     Write-Error $_
     exit 1
 }
