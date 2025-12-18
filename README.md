@@ -1,72 +1,42 @@
-# ------------------------------------------------------------
-# Robot exit code
-# ------------------------------------------------------------
-$robotExitCode = $LASTEXITCODE
-Write-Output "Robot exit code: $robotExitCode"
-
-if ($robotExitCode -ne 0) {
-    Write-Error "Robot tests FAILED"
-}
-
-# ------------------------------------------------------------
-# Zip Robot Framework results
-# ------------------------------------------------------------
 Write-Output "Zipping Robot Framework results..."
 
-$Workspace  = Get-Location
-$ResultsDir = Join-Path $Workspace "results"
-$ZipPath    = Join-Path $Workspace "results.zip"
+$resultsDir = Join-Path (Get-Location) "results"
+$zipPath = Join-Path (Get-Location) "results.zip"
 
-if (!(Test-Path $ResultsDir)) {
-    Write-Error "Results directory not found: $ResultsDir"
+if (Test-Path $zipPath) {
+    Remove-Item $zipPath -Force
+}
+
+Compress-Archive -Path "$resultsDir\*" -DestinationPath $zipPath
+
+if (!(Test-Path $zipPath)) {
+    Write-Error "results.zip was not created"
     exit 1
 }
 
-if (Test-Path $ZipPath) {
-    Remove-Item $ZipPath -Force
-}
-
-Compress-Archive -Path "$ResultsDir\*" -DestinationPath $ZipPath
-
-Write-Output "Results successfully zipped: $ZipPath"
-
-# ------------------------------------------------------------
-# Upload ZIP to Jira (attachments)
-# ------------------------------------------------------------
+Write-Output "Results successfully zipped: $zipPath"
 Write-Output "Uploading results.zip to Jira..."
 
-$JiraBaseUrl = "https://slc-toolset.common.airbusds.corp"
-$IssueKey    = $ISSUE_KEY
-$UploadUrl   = "$JiraBaseUrl/jira/rest/api/2/issue/$IssueKey/attachments"
+$jiraUrl = "https://slc-toolset.common.airbusds.corp/jira/rest/api/2/issue/$ISSUE_KEY/attachments"
+$auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("$JIRA_USERNAME:$JIRA_PASSWORD"))
 
-$Headers = @{
+$headers = @{
+    "Authorization" = "Basic $auth"
     "X-Atlassian-Token" = "no-check"
 }
 
 try {
     Invoke-RestMethod `
-        -Uri $UploadUrl `
+        -Uri $jiraUrl `
         -Method Post `
-        -Headers $Headers `
-        -Credential (New-Object System.Management.Automation.PSCredential(
-            $JIRA_USERNAME,
-            (ConvertTo-SecureString $JIRA_PASSWORD -AsPlainText -Force)
-        )) `
-        -Form @{ file = Get-Item $ZipPath }
+        -Headers $headers `
+        -InFile $zipPath `
+        -ContentType "application/zip"
 
-    Write-Output "results.zip successfully attached to Jira issue $IssueKey"
+    Write-Output "✅ Results successfully uploaded to Jira issue $ISSUE_KEY"
 }
 catch {
-    Write-Error "Failed to upload results.zip to Jira: $_"
+    Write-Error "❌ Failed to upload results.zip to Jira"
+    Write-Error $_
     exit 1
 }
-
-# ------------------------------------------------------------
-# Propagate Robot status to GitLab
-# ------------------------------------------------------------
-if ($robotExitCode -ne 0) {
-    exit $robotExitCode
-}
-
-Write-Output "fetch_tests.ps1 finished successfully"
-exit 0
