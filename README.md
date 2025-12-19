@@ -1,49 +1,73 @@
-Write-Output "==============================="
-Write-Output "START JIRA UPLOAD (FULL CASCADE)"
-Write-Output "==============================="
+Write-Output "========================================"
+Write-Output " START JIRA UPLOAD (FULL CASCADE)"
+Write-Output "========================================"
 
-$resultsZip    = Join-Path $env:CI_PROJECT_DIR "results.zip"
-$jiraIssueKey  = $ISSUE_KEY
-$authString    = "${JIRA_USERNAME}:${JIRA_PASSWORD}"
+$success = $false
 
-# =========================
-# OPTION 1 : XRAY IMPORT
-# =========================
-Write-Output ">>> OPTION 1 : XRAY import"
-
-try {
-    $cmd = @"
-"$CURL_PATH" -k -X POST `
-  -u "$authString" `
-  -H "X-Atlassian-Token: no-check" `
-  -F "file=@$resultsZip" `
-  "$JIRA_URL_TEST_EXEC$jiraIssueKey"
-"@
-
-    Write-Output $cmd
-    Invoke-Expression $cmd
-
+function Test-Exit {
+    param ($label)
     if ($LASTEXITCODE -eq 0) {
-        Write-Output "OPTION 1 SUCCESS"
-        exit 0
-    } else {
-        Write-Warning "OPTION 1 FAILED (exit code $LASTEXITCODE)"
+        Write-Output "$label SUCCESS"
+        return $true
     }
-}
-catch {
-    Write-Warning "OPTION 1 EXCEPTION"
-    Write-Warning $_
+    Write-Warning "$label FAILED (exit=$LASTEXITCODE)"
+    return $false
 }
 
-# =========================
-# OPTION 4 : JIRA COMMENT (SAFE FALLBACK)
-# =========================
-Write-Output ">>> OPTION 4 : JIRA comment"
+# ------------------------------------------------
+# OPTION 1 — XRAY IMPORT (curl, no proxy)
+# ------------------------------------------------
+Write-Output ">>> OPTION 1 : XRAY import (NO PROXY)"
 
-try {
-    $commentBody = @{
-        body = @"
-🧪 Robot Framework results available
+$XRAY_URL = "$JIRA_BASE_URL/rest/raven/1.0/api/testexec/$ISSUE"
+
+& $CURL_PATH `
+    -k `
+    -u "$JIRA_USER`:$JIRA_PASS" `
+    -H "X-Atlassian-Token: no-check" `
+    -F "file=@$RESULTS_ZIP" `
+    "$XRAY_URL"
+
+if (Test-Exit "OPTION 1") { exit 0 }
+
+# ------------------------------------------------
+# OPTION 2 — XRAY IMPORT (curl + MAIN proxy)
+# ------------------------------------------------
+Write-Output ">>> OPTION 2 : XRAY import (MAIN PROXY)"
+
+& $CURL_PATH `
+    -k `
+    -u "$JIRA_USER`:$JIRA_PASS" `
+    -x "$PROXY_MAIN" `
+    -H "X-Atlassian-Token: no-check" `
+    -F "file=@$RESULTS_ZIP" `
+    "$XRAY_URL"
+
+if (Test-Exit "OPTION 2") { exit 0 }
+
+# ------------------------------------------------
+# OPTION 3 — ATTACH ZIP TO ISSUE (curl)
+# ------------------------------------------------
+Write-Output ">>> OPTION 3 : Attach ZIP to Jira issue"
+
+$ATTACH_URL = "$JIRA_BASE_URL/rest/api/2/issue/$ISSUE/attachments"
+
+& $CURL_PATH `
+    -k `
+    -u "$JIRA_USER`:$JIRA_PASS" `
+    -H "X-Atlassian-Token: no-check" `
+    -F "file=@$RESULTS_ZIP" `
+    "$ATTACH_URL"
+
+if (Test-Exit "OPTION 3") { exit 0 }
+
+# ------------------------------------------------
+# OPTION 4 — COMMENT JIRA (Invoke-RestMethod)
+# ------------------------------------------------
+Write-Output ">>> OPTION 4 : Jira comment fallback"
+
+$commentText = @"
+🤖 Robot Framework results available
 
 Pipeline:
 $CI_PIPELINE_URL
@@ -51,28 +75,30 @@ $CI_PIPELINE_URL
 Artifacts:
 $CI_PIPELINE_URL/artifacts/browse/results/
 
-Main files:
+Files:
 - report.html
 - log.html
 - output.xml
 - results.zip
 "@
-    } | ConvertTo-Json -Depth 5
 
-    $commentUrl = "$JIRA_BASE_URL/rest/api/2/issue/$jiraIssueKey/comment"
+$commentBody = @{
+    body = $commentText
+} | ConvertTo-Json -Depth 5
 
+try {
     Invoke-RestMethod `
-        -Uri $commentUrl `
+        -Uri "$JIRA_BASE_URL/rest/api/2/issue/$ISSUE/comment" `
         -Method POST `
-        -Body $commentBody `
         -ContentType "application/json" `
+        -Body $commentBody `
         -Credential (New-Object System.Management.Automation.PSCredential(
-            $JIRA_USERNAME,
-            (ConvertTo-SecureString $JIRA_PASSWORD -AsPlainText -Force)
+            $JIRA_USER,
+            (ConvertTo-SecureString $JIRA_PASS -AsPlainText -Force)
         )) `
-        -Proxy $PROXY
+        -Proxy $PROXY_MAIN
 
-    Write-Output "OPTION 4 SUCCESS – Comment added to Jira"
+    Write-Output "OPTION 4 SUCCESS"
     exit 0
 }
 catch {
@@ -80,5 +106,8 @@ catch {
     Write-Warning $_
 }
 
-Write-Error "ALL JIRA METHODS FAILED"
+# ------------------------------------------------
+# ALL FAILED
+# ------------------------------------------------
+Write-Error "ALL JIRA UPLOAD METHODS FAILED"
 exit 1
