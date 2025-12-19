@@ -1,48 +1,19 @@
-# =====================================================
-# OPTION A : XRAY OFFICIAL ROBOT FRAMEWORK IMPORT
-# (Equivalent Jenkins - THIS updates Jira status)
-# =====================================================
-Write-Output ">>> OPTION A : XRAY Robot Framework import (OFFICIAL)"
+def log_screenshot_web(driver):
+    from robot.libraries.BuiltIn import BuiltIn
+    import os, time, robot.api.logger
 
-$optA = $false
+    output_dir = BuiltIn().get_variable_value("${OUTPUT DIR}")
+    screenshots_dir = os.path.join(output_dir, "screenshots_secure_recorder")
+    os.makedirs(screenshots_dir, exist_ok=True)
 
-try {
-    $robotOutput = Join-Path $resultsDir "output.xml"
+    filename = f"screenshot_{int(time.time()*1000)}.png"
+    img_path = os.path.join(screenshots_dir, filename)
 
-    if (!(Test-Path $robotOutput)) {
-        throw "output.xml NOT FOUND: $robotOutput"
-    }
+    driver.get_screenshot_as_file(img_path)
 
-    $xrayUrl = "$JIRA_BASE_URL/rest/raven/1.0/import/execution/robot?testExecKey=$jiraIssueKey"
+    rel_path = os.path.join("screenshots_secure_recorder", filename)
 
-    Write-Output "XRAY URL : $xrayUrl"
-    Write-Output "Robot file : $robotOutput"
-
-    $curlArgs = @(
-        "-k"
-        "-v"
-        "-u", "$JIRA_USERNAME:$JIRA_PASSWORD"
-        "-X", "POST"
-        "-F", "file=@$robotOutput"
-        $xrayUrl
+    robot.api.logger.info(
+        f'<a href="{rel_path}"><img src="{rel_path}" width="400px"></a>',
+        html=True
     )
-
-    Write-Output "Executing curl (XRAY import):"
-    $curlArgs | ForEach-Object { Write-Output "  $_" }
-
-    & "$CURL_PATH" @curlArgs
-
-    if ($LASTEXITCODE -eq 0) {
-        Write-Output "OPTION A SUCCESS → XRAY import completed"
-        $optA = $true
-    }
-    else {
-        Write-Warning "XRAY import failed (exit code $LASTEXITCODE)"
-    }
-}
-catch {
-    Write-Warning "OPTION A FAILED"
-    Write-Warning $_
-}
-
-Exit-IfSuccess $optA "OPTION A (XRAY OFFICIAL)"
