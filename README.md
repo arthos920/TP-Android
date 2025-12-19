@@ -16,7 +16,7 @@ try {
     Write-Output "Computed status  : $testStatus"
 
     # ----------------------------------------
-    # Build JSON payload (same logic as Jenkins)
+    # JSON payload (same as Jenkins logic)
     # ----------------------------------------
     $jsonBody = @{
         issues = @($jiraIssueKey)
@@ -26,29 +26,28 @@ try {
         }
     } | ConvertTo-Json -Depth 5 -Compress
 
-    Write-Output "Payload JSON:"
+    Write-Output "JSON payload:"
     Write-Output $jsonBody
 
     # ----------------------------------------
-    # Jira automation / webhook endpoint
-    # (same as Jenkins)
+    # Webhook URL
     # ----------------------------------------
     $hookUrl = "$JIRA_BASE_URL/rest/cb-automation/latest/hooks/108930444f44d31d6664b391e30c2656c6103c"
 
     # ----------------------------------------
-    # Execute curl (Jenkins-style, FIXED)
+    # Build curl arguments SAFELY
     # ----------------------------------------
     $curlArgs = @(
         "-k"
         "-v"
-        "-u", "$JIRA_USERNAME:$JIRA_PASSWORD"
+        "-u", "${JIRA_USERNAME}:${JIRA_PASSWORD}"
         "-X", "POST"
         "-H", "Content-Type: application/json"
         "-d", $jsonBody
         $hookUrl
     )
 
-    Write-Output "Executing curl for PASS/FAIL update:"
+    Write-Output "Executing curl:"
     $curlArgs | ForEach-Object { Write-Output "  $_" }
 
     & "$CURL_PATH" @curlArgs
@@ -65,4 +64,4 @@ catch {
     Write-Warning $_
 }
 
-Exit-IfSuccess $opt6 "OPTION 6 (PASS/FAIL STATUS)"
+Exit-IfSuccess $opt6 "OPTION 6 (PASS / FAIL)"
