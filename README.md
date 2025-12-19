@@ -3,9 +3,7 @@ Write-Output ">>> OPTION 6 : JIRA PASS / FAIL status"
 $opt6 = $false
 
 try {
-    # ----------------------------------------
-    # Determine status from Robot exit code
-    # ----------------------------------------
+
     if ($robotExitCode -eq 0) {
         $testStatus = "PASS"
     } else {
@@ -15,32 +13,25 @@ try {
     Write-Output "Robot exit code : $robotExitCode"
     Write-Output "Computed status  : $testStatus"
 
-    # ----------------------------------------
-    # JSON payload (same as Jenkins logic)
-    # ----------------------------------------
-    $jsonBody = @{
+    $payload = @{
         issues = @($jiraIssueKey)
         data = @{
             status = $testStatus
-            robotReportUrl = "$CI_PIPELINE_URL/artifacts/browse/results/report.html"
+            robotReportUrl = ($CI_PIPELINE_URL + "/artifacts/browse/results/report.html")
         }
-    } | ConvertTo-Json -Depth 5 -Compress
+    }
+
+    $jsonBody = $payload | ConvertTo-Json -Depth 6 -Compress
 
     Write-Output "JSON payload:"
     Write-Output $jsonBody
 
-    # ----------------------------------------
-    # Webhook URL
-    # ----------------------------------------
     $hookUrl = "$JIRA_BASE_URL/rest/cb-automation/latest/hooks/108930444f44d31d6664b391e30c2656c6103c"
 
-    # ----------------------------------------
-    # Build curl arguments SAFELY
-    # ----------------------------------------
     $curlArgs = @(
         "-k"
         "-v"
-        "-u", "${JIRA_USERNAME}:${JIRA_PASSWORD}"
+        "-u", ("{0}:{1}" -f $JIRA_USERNAME, $JIRA_PASSWORD)
         "-X", "POST"
         "-H", "Content-Type: application/json"
         "-d", $jsonBody
@@ -58,6 +49,7 @@ try {
     } else {
         Write-Warning "curl exited with code $LASTEXITCODE"
     }
+
 }
 catch {
     Write-Warning "OPTION 6 FAILED"
