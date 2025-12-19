@@ -1,3 +1,12 @@
+
+
+$RESULTS_DIR = Join-Path $env:CI_PROJECT_DIR "results"
+$RESULTS_ZIP = Join-Path $env:CI_PROJECT_DIR "results.zip"
+
+$ISSUE = $ISSUE_KEY
+
+
+
 Write-Output "========================================"
 Write-Output " START JIRA UPLOAD (FULL CASCADE)"
 Write-Output "========================================"
