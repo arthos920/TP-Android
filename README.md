@@ -1,44 +1,49 @@
 Write-Output "==============================="
-Write-Output "START JIRA UPLOAD (STABLE MODE)"
+Write-Output "START JIRA UPLOAD (FULL CASCADE)"
 Write-Output "==============================="
 
-$jiraIssueKey = $ISSUE_KEY
-$resultsZip   = Join-Path $env:CI_PROJECT_DIR "results.zip"
+$resultsZip    = Join-Path $env:CI_PROJECT_DIR "results.zip"
+$jiraIssueKey  = $ISSUE_KEY
+$authString    = "${JIRA_USERNAME}:${JIRA_PASSWORD}"
 
-# BASE JIRA URL (OBLIGATOIRE)
-$JIRA_BASE_URL = "https://slc-toolset.common.airbusds.corp/jira"
-
-# =====================================================
-# OPTION 1 : XRAY IMPORT (curl DIRECT, sans Invoke-Expression)
-# =====================================================
+# =========================
+# OPTION 1 : XRAY IMPORT
+# =========================
 Write-Output ">>> OPTION 1 : XRAY import"
 
 try {
-    & $CURL_PATH `
-        -k `
-        -X POST `
-        -u "$JIRA_USERNAME:$JIRA_PASSWORD" `
-        -H "X-Atlassian-Token: no-check" `
-        -F "file=@$resultsZip" `
-        "$JIRA_URL_TEST_EXEC$jiraIssueKey"
+    $cmd = @"
+"$CURL_PATH" -k -X POST `
+  -u "$authString" `
+  -H "X-Atlassian-Token: no-check" `
+  -F "file=@$resultsZip" `
+  "$JIRA_URL_TEST_EXEC$jiraIssueKey"
+"@
+
+    Write-Output $cmd
+    Invoke-Expression $cmd
 
     if ($LASTEXITCODE -eq 0) {
         Write-Output "OPTION 1 SUCCESS"
         exit 0
+    } else {
+        Write-Warning "OPTION 1 FAILED (exit code $LASTEXITCODE)"
     }
 }
 catch {
-    Write-Warning "OPTION 1 FAILED"
+    Write-Warning "OPTION 1 EXCEPTION"
+    Write-Warning $_
 }
 
-# =====================================================
-# OPTION 4 : JIRA COMMENT (ULTRA SAFE – PROXY FRIENDLY)
-# =====================================================
-Write-Output ">>> OPTION 4 : JIRA comment (fallback)"
+# =========================
+# OPTION 4 : JIRA COMMENT (SAFE FALLBACK)
+# =========================
+Write-Output ">>> OPTION 4 : JIRA comment"
 
 try {
-    $commentText = @"
-📎 Robot Framework results available
+    $commentBody = @{
+        body = @"
+🧪 Robot Framework results available
 
 Pipeline:
 $CI_PIPELINE_URL
@@ -46,34 +51,34 @@ $CI_PIPELINE_URL
 Artifacts:
 $CI_PIPELINE_URL/artifacts/browse/results/
 
-Files:
+Main files:
 - report.html
 - log.html
 - output.xml
 - results.zip
 "@
-
-    $commentBody = @{
-        body = $commentText
     } | ConvertTo-Json -Depth 5
 
+    $commentUrl = "$JIRA_BASE_URL/rest/api/2/issue/$jiraIssueKey/comment"
+
     Invoke-RestMethod `
-        -Uri "$JIRA_BASE_URL/rest/api/2/issue/$jiraIssueKey/comment" `
+        -Uri $commentUrl `
         -Method POST `
-        -Headers @{ "Content-Type" = "application/json" } `
         -Body $commentBody `
-        -Credential (New-Object PSCredential(
+        -ContentType "application/json" `
+        -Credential (New-Object System.Management.Automation.PSCredential(
             $JIRA_USERNAME,
             (ConvertTo-SecureString $JIRA_PASSWORD -AsPlainText -Force)
         )) `
-        -Proxy $PROXY `
-        -ErrorAction Stop
+        -Proxy $PROXY
 
-    Write-Output "OPTION 4 SUCCESS – Jira comment added"
+    Write-Output "OPTION 4 SUCCESS – Comment added to Jira"
     exit 0
 }
 catch {
-    Write-Error "ALL JIRA METHODS FAILED"
-    Write-Error $_
-    exit 1
+    Write-Warning "OPTION 4 FAILED"
+    Write-Warning $_
 }
+
+Write-Error "ALL JIRA METHODS FAILED"
+exit 1
