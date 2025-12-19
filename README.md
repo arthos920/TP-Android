@@ -1,82 +1,126 @@
+Write-Output "==============================="
+Write-Output "START JIRA UPLOAD (FULL CASCADE)"
+Write-Output "==============================="
 
+$jiraIssueKey = $ISSUE_KEY
+$resultsDir  = Join-Path $env:CI_PROJECT_DIR "results"
+$resultsZip  = Join-Path $env:CI_PROJECT_DIR "results.zip"
+$robotXml    = Join-Path $resultsDir "output.xml"
 
-$RESULTS_DIR = Join-Path $env:CI_PROJECT_DIR "results"
-$RESULTS_ZIP = Join-Path $env:CI_PROJECT_DIR "results.zip"
-
-$ISSUE = $ISSUE_KEY
-
-
-
-Write-Output "========================================"
-Write-Output " START JIRA UPLOAD (FULL CASCADE)"
-Write-Output "========================================"
-
-$success = $false
-
-function Test-Exit {
-    param ($label)
-    if ($LASTEXITCODE -eq 0) {
-        Write-Output "$label SUCCESS"
-        return $true
+function Exit-IfSuccess($ok, $label) {
+    if ($ok) {
+        Write-Output "$label SUCCESS → STOP CASCADE"
+        exit 0
     }
-    Write-Warning "$label FAILED (exit=$LASTEXITCODE)"
-    return $false
 }
 
-# ------------------------------------------------
-# OPTION 1 — XRAY IMPORT (curl, no proxy)
-# ------------------------------------------------
-Write-Output ">>> OPTION 1 : XRAY import (NO PROXY)"
+function New-JiraCredential {
+    return New-Object PSCredential(
+        $JIRA_USERNAME,
+        (ConvertTo-SecureString $JIRA_PASSWORD -AsPlainText -Force)
+    )
+}
 
-$XRAY_URL = "$JIRA_BASE_URL/rest/raven/1.0/api/testexec/$ISSUE"
+# =====================================================
+# OPTION 1 : XRAY IMPORT (Robot Framework XML) – OFFICIEL
+# =====================================================
+Write-Output ">>> OPTION 1 : XRAY Robot Framework import"
 
-& $CURL_PATH `
-    -k `
-    -u "$JIRA_USER`:$JIRA_PASS" `
-    -H "X-Atlassian-Token: no-check" `
-    -F "file=@$RESULTS_ZIP" `
-    "$XRAY_URL"
+$opt1 = $false
+if (Test-Path $robotXml) {
+    try {
+        $xrayUrl = "$JIRA_BASE_URL/rest/raven/1.0/import/execution/robot?testExecKey=$jiraIssueKey"
 
-if (Test-Exit "OPTION 1") { exit 0 }
+        & "$CURL_PATH" `
+            -k `
+            -u "$JIRA_USERNAME:$JIRA_PASSWORD" `
+            -H "X-Atlassian-Token: no-check" `
+            -F "file=@$robotXml" `
+            "$xrayUrl"
 
-# ------------------------------------------------
-# OPTION 2 — XRAY IMPORT (curl + MAIN proxy)
-# ------------------------------------------------
-Write-Output ">>> OPTION 2 : XRAY import (MAIN PROXY)"
+        if ($LASTEXITCODE -eq 0) {
+            $opt1 = $true
+        }
+    }
+    catch {
+        Write-Warning $_
+    }
+} else {
+    Write-Warning "output.xml NOT FOUND → skip XRAY"
+}
+Exit-IfSuccess $opt1 "OPTION 1 (XRAY)"
 
-& $CURL_PATH `
-    -k `
-    -u "$JIRA_USER`:$JIRA_PASS" `
-    -x "$PROXY_MAIN" `
-    -H "X-Atlassian-Token: no-check" `
-    -F "file=@$RESULTS_ZIP" `
-    "$XRAY_URL"
+# =====================================================
+# OPTION 2 : JIRA ATTACHMENT (results.zip)
+# =====================================================
+Write-Output ">>> OPTION 2 : JIRA attachment (results.zip)"
 
-if (Test-Exit "OPTION 2") { exit 0 }
+$opt2 = $false
+if (Test-Path $resultsZip) {
+    try {
+        Invoke-RestMethod `
+            -Uri "$JIRA_BASE_URL/rest/api/2/issue/$jiraIssueKey/attachments" `
+            -Method POST `
+            -Headers @{ "X-Atlassian-Token" = "no-check" } `
+            -InFile $resultsZip `
+            -ContentType "application/zip" `
+            -Credential (New-JiraCredential) `
+            -Proxy $PROXY `
+            -ErrorAction Stop
 
-# ------------------------------------------------
-# OPTION 3 — ATTACH ZIP TO ISSUE (curl)
-# ------------------------------------------------
-Write-Output ">>> OPTION 3 : Attach ZIP to Jira issue"
+        $opt2 = $true
+    }
+    catch {
+        Write-Warning $_
+    }
+}
+Exit-IfSuccess $opt2 "OPTION 2 (ZIP ATTACHMENT)"
 
-$ATTACH_URL = "$JIRA_BASE_URL/rest/api/2/issue/$ISSUE/attachments"
+# =====================================================
+# OPTION 3 : JIRA ATTACHMENT (HTML / XML)
+# =====================================================
+Write-Output ">>> OPTION 3 : JIRA attachment (HTML/XML)"
 
-& $CURL_PATH `
-    -k `
-    -u "$JIRA_USER`:$JIRA_PASS" `
-    -H "X-Atlassian-Token: no-check" `
-    -F "file=@$RESULTS_ZIP" `
-    "$ATTACH_URL"
+$opt3 = $false
+try {
+    $files = @(
+        @{ Name = "report.html"; Type = "text/html" },
+        @{ Name = "log.html";    Type = "text/html" },
+        @{ Name = "output.xml"; Type = "application/xml" }
+    )
 
-if (Test-Exit "OPTION 3") { exit 0 }
+    foreach ($f in $files) {
+        $path = Join-Path $resultsDir $f.Name
+        if (Test-Path $path) {
+            Write-Output "Uploading $($f.Name)"
+            Invoke-RestMethod `
+                -Uri "$JIRA_BASE_URL/rest/api/2/issue/$jiraIssueKey/attachments" `
+                -Method POST `
+                -Headers @{ "X-Atlassian-Token" = "no-check" } `
+                -InFile $path `
+                -ContentType $f.Type `
+                -Credential (New-JiraCredential) `
+                -Proxy $PROXY `
+                -ErrorAction Stop
+        }
+    }
+    $opt3 = $true
+}
+catch {
+    Write-Warning $_
+}
+Exit-IfSuccess $opt3 "OPTION 3 (HTML/XML ATTACHMENTS)"
 
-# ------------------------------------------------
-# OPTION 4 — COMMENT JIRA (Invoke-RestMethod)
-# ------------------------------------------------
-Write-Output ">>> OPTION 4 : Jira comment fallback"
+# =====================================================
+# OPTION 4 : JIRA COMMENT (ULTIMATE FALLBACK)
+# =====================================================
+Write-Output ">>> OPTION 4 : JIRA comment (fallback)"
 
-$commentText = @"
-🤖 Robot Framework results available
+$opt4 = $false
+try {
+    $commentBody = @{
+        body = @"
+📎 Robot Framework results available
 
 Pipeline:
 $CI_PIPELINE_URL
@@ -90,33 +134,26 @@ Files:
 - output.xml
 - results.zip
 "@
+    } | ConvertTo-Json -Depth 5
 
-$commentBody = @{
-    body = $commentText
-} | ConvertTo-Json -Depth 5
-
-try {
     Invoke-RestMethod `
-        -Uri "$JIRA_BASE_URL/rest/api/2/issue/$ISSUE/comment" `
+        -Uri "$JIRA_BASE_URL/rest/api/2/issue/$jiraIssueKey/comment" `
         -Method POST `
-        -ContentType "application/json" `
+        -Headers @{ "Content-Type" = "application/json" } `
         -Body $commentBody `
-        -Credential (New-Object System.Management.Automation.PSCredential(
-            $JIRA_USER,
-            (ConvertTo-SecureString $JIRA_PASS -AsPlainText -Force)
-        )) `
-        -Proxy $PROXY_MAIN
+        -Credential (New-JiraCredential) `
+        -Proxy $PROXY `
+        -ErrorAction Stop
 
-    Write-Output "OPTION 4 SUCCESS"
-    exit 0
+    $opt4 = $true
 }
 catch {
-    Write-Warning "OPTION 4 FAILED"
     Write-Warning $_
 }
+Exit-IfSuccess $opt4 "OPTION 4 (COMMENT)"
 
-# ------------------------------------------------
+# =====================================================
 # ALL FAILED
-# ------------------------------------------------
+# =====================================================
 Write-Error "ALL JIRA UPLOAD METHODS FAILED"
 exit 1
