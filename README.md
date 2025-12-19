@@ -1,17 +1,43 @@
-Write-Output "===== JIRA CONFIG CHECK ====="
-Write-Output "JIRA_BASE_URL      = '$JIRA_BASE_URL'"
-Write-Output "JIRA_USERNAME      = '$JIRA_USERNAME'"
-Write-Output "ISSUE_KEY          = '$ISSUE_KEY'"
-Write-Output "PROXY              = '$PROXY'"
-Write-Output "CURL_PATH          = '$CURL_PATH'"
-Write-Output "============================="
+# =====================================================
+# OPTION 5 : JIRA ATTACHMENT (CURL – Jenkins proven)
+# =====================================================
+Write-Output ">>> OPTION 5 : JIRA attachment (curl Jenkins style)"
 
-if ([string]::IsNullOrWhiteSpace($JIRA_BASE_URL)) {
-    Write-Error "JIRA_BASE_URL IS EMPTY"
-    exit 1
+$opt5 = $false
+try {
+    $attachUrl = "$JIRA_BASE_URL/rest/api/2/issue/$jiraIssueKey/attachments"
+
+    Write-Output "Attach URL = $attachUrl"
+    Write-Output "File       = $resultsZip"
+
+    if (!(Test-Path $resultsZip)) {
+        throw "results.zip not found"
+    }
+
+    $cmd = @(
+        "`"$CURL_PATH`"",
+        "-k",
+        "-v",
+        "-D", "-",
+        "-u", "`"$JIRA_USERNAME`:$JIRA_PASSWORD`"",
+        "-X", "POST",
+        "-H", "`"X-Atlassian-Token: nocheck`"",
+        "-F", "`"file=@$resultsZip`"",
+        "`"$attachUrl`""
+    ) -join " "
+
+    Write-Output "Executing:"
+    Write-Output $cmd
+
+    Invoke-Expression $cmd
+
+    if ($LASTEXITCODE -eq 0) {
+        $opt5 = $true
+    }
+}
+catch {
+    Write-Warning "OPTION 5 FAILED"
+    Write-Warning $_
 }
 
-if ($JIRA_BASE_URL -notmatch '^https?://') {
-    Write-Error "JIRA_BASE_URL INVALID (must start with http/https)"
-    exit 1
-}
+Exit-IfSuccess $opt5 "OPTION 5 (CURL JENKINS ATTACHMENT)"
