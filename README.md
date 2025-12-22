@@ -1,23 +1,23 @@
-def mobile_activation_code_excel(self, alias, datafile="FROM_SETTINGS_FILE"):
-    excelDict = KeyCloackModule().initialize(alias, datafile)
-    username = excelDict["FirstName"]
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.webdriver.support import expected_conditions as EC
 
-    self.select_user(username)
+def safe_click(driver, by, locator, timeout=20):
+    wait = WebDriverWait(driver, timeout)
 
-    self.safe_click(By.XPATH, locators.ACTIVATION_NAVIGATION)
-    self.safe_click(By.XPATH, locators.MOBILE_ACTIVATION)
-    self.safe_click(By.XPATH, locators.SAVE_BUTTON)
-    self.safe_click(By.XPATH, locators.CONFIRM_MODAL_SAVE)
+    # attendre présence
+    wait.until(EC.presence_of_element_located((by, locator)))
 
-    elem = WebDriverWait(self.driver, 20).until(
-        EC.visibility_of_element_located(
-            (By.XPATH, locators.MOBILE_ACTIVATION_CODE)
-        )
-    )
+    # attendre visibilité
+    element = wait.until(EC.visibility_of_element_located((by, locator)))
 
-    result = elem.text
-    print(f"Activation code: {result}")
+    # attendre cliquable
+    element = wait.until(EC.element_to_be_clickable((by, locator)))
 
-    self.safe_click(By.XPATH, locators.CLOSE_ACTIVATION_CODE)
+    # scroll explicite
+    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
 
-    return result
+    # click JS fallback
+    try:
+        element.click()
+    except Exception:
+        driver.execute_script("arguments[0].click();", element)
