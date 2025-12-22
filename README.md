@@ -1,23 +1,24 @@
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.support import expected_conditions as EC
 
-def safe_click(driver, by, locator, timeout=20):
-    wait = WebDriverWait(driver, timeout)
 
-    # attendre présence
-    wait.until(EC.presence_of_element_located((by, locator)))
+result = wait_for_text(
+    self.driver,
+    By.XPATH,
+    locators.MOBILE_ACTIVATION_CODE,
+    timeout=40
+)
 
-    # attendre visibilité
-    element = wait.until(EC.visibility_of_element_located((by, locator)))
+print(f"Activation code: {result}")
 
-    # attendre cliquable
-    element = wait.until(EC.element_to_be_clickable((by, locator)))
 
-    # scroll explicite
-    driver.execute_script("arguments[0].scrollIntoView({block:'center'});", element)
 
-    # click JS fallback
-    try:
-        element.click()
-    except Exception:
-        driver.execute_script("arguments[0].click();", element)
+
+def wait_for_text(driver, by, locator, timeout=30):
+    def _text_present(d):
+        try:
+            el = d.find_element(by, locator)
+            return el.text.strip() != ""
+        except:
+            return False
+
+    WebDriverWait(driver, timeout).until(_text_present)
+    return driver.find_element(by, locator).text.strip()
