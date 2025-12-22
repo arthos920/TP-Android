@@ -1,26 +1,23 @@
-def safe_click(self, by, locator, timeout=30):
-    from selenium.webdriver.support.ui import WebDriverWait
-    from selenium.webdriver.support import expected_conditions as EC
+def mobile_activation_code_excel(self, alias, datafile="FROM_SETTINGS_FILE"):
+    excelDict = KeyCloackModule().initialize(alias, datafile)
+    username = excelDict["FirstName"]
 
-    wait = WebDriverWait(self.driver, timeout)
+    self.select_user(username)
 
-    element = wait.until(EC.presence_of_element_located((by, locator)))
-    wait.until(EC.visibility_of(element))
-    wait.until(EC.element_to_be_clickable((by, locator)))
+    self.safe_click(By.XPATH, locators.ACTIVATION_NAVIGATION)
+    self.safe_click(By.XPATH, locators.MOBILE_ACTIVATION)
+    self.safe_click(By.XPATH, locators.SAVE_BUTTON)
+    self.safe_click(By.XPATH, locators.CONFIRM_MODAL_SAVE)
 
-    # scroll obligatoire en CI
-    self.driver.execute_script(
-        "arguments[0].scrollIntoView({block:'center', inline:'center'});",
-        element
+    elem = WebDriverWait(self.driver, 20).until(
+        EC.visibility_of_element_located(
+            (By.XPATH, locators.MOBILE_ACTIVATION_CODE)
+        )
     )
 
-    # petit délai UI (stable)
-    WebDriverWait(self.driver, 5).until(
-        lambda d: element.is_displayed() and element.is_enabled()
-    )
+    result = elem.text
+    print(f"Activation code: {result}")
 
-    try:
-        element.click()
-    except Exception:
-        # fallback JS click (CI friendly)
-        self.driver.execute_script("arguments[0].click();", element)
+    self.safe_click(By.XPATH, locators.CLOSE_ACTIVATION_CODE)
+
+    return result
