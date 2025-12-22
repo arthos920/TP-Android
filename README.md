@@ -1,25 +1,26 @@
-def log_screenshot_web_global(driver, title="Web Screenshot"):
-    from robot.libraries.BuiltIn import BuiltIn
-    import os, time, robot.api.logger
+def safe_click(self, by, locator, timeout=30):
+    from selenium.webdriver.support.ui import WebDriverWait
+    from selenium.webdriver.support import expected_conditions as EC
 
-    output_dir = BuiltIn().get_variable_value("${OUTPUT DIR}")
-    screenshots_dir = os.path.join(output_dir, "screenshots_web")
-    os.makedirs(screenshots_dir, exist_ok=True)
+    wait = WebDriverWait(self.driver, timeout)
 
-    filename = f"web_{int(time.time()*1000)}.png"
-    img_path = os.path.join(screenshots_dir, filename)
+    element = wait.until(EC.presence_of_element_located((by, locator)))
+    wait.until(EC.visibility_of(element))
+    wait.until(EC.element_to_be_clickable((by, locator)))
 
-    driver.get_screenshot_as_file(img_path)
+    # scroll obligatoire en CI
+    self.driver.execute_script(
+        "arguments[0].scrollIntoView({block:'center', inline:'center'});",
+        element
+    )
 
-    rel_path = os.path.join("screenshots_web", filename)
+    # petit délai UI (stable)
+    WebDriverWait(self.driver, 5).until(
+        lambda d: element.is_displayed() and element.is_enabled()
+    )
 
-    html_block = f"""
-    <div style="border:2px solid #d9534f; padding:10px; margin:10px 0;">
-        <h3>📸 {title}</h3>
-        <a href="{rel_path}">
-            <img src="{rel_path}" style="max-width:600px; border:1px solid #333;">
-        </a>
-    </div>
-    """
-
-    BuiltIn().log(html_block, level="WARN", html=True)
+    try:
+        element.click()
+    except Exception:
+        # fallback JS click (CI friendly)
+        self.driver.execute_script("arguments[0].click();", element)
