@@ -1,92 +1,136 @@
-def wait_and_get_activation_code_js(self, timeout=15):
+from selenium.common.exceptions import (
+    ElementNotVisibleException,
+    ElementClickInterceptedException,
+    StaleElementReferenceException,
+    TimeoutException,
+)
+from selenium.webdriver.common.action_chains import ActionChains
+import time
+
+def click_component(self, *locator, **kwargs):
     """
-    Attend l'apparition d'un code d'activation dans une modale (ex : bloc .tokens-popup/.tokens-list)
-    et renvoie le code sous forme de texte. Si le code n'apparaît pas dans le délai `timeout`, 
-    une exception est levée.
+    CI-safe click_component
+    - attend stabilité DOM
+    - attend visible + enabled
+    - neutralise overlays
+    - scroll centre
+    - click normal -> ActionChains -> JS -> dispatchEvent -> form.submit
     """
-    # Prérequis d'import (à placer en haut du module utilisant cette fonction) :
-    # from selenium.webdriver.common.by import By
-    # from selenium.webdriver.support.ui import WebDriverWait
-    # from selenium.webdriver.support import expected_conditions as EC
-    # from selenium.common.exceptions import TimeoutException
-    
-    code_text = None
-    
-    # Étape 1 : Attendre la présence d'au moins un élément <strong> dans .tokens-list (visible ou non)
-    print("[Info] Tentative 1 : attente d'un élément <strong> dans .tokens-list ...")
-    log_screenshot_web_global(self.driver, title="Avant tentative 1 - attente .tokens-list")
-    try:
-        elements = WebDriverWait(self.driver, timeout).until(
-            EC.presence_of_all_elements_located((By.CSS_SELECTOR, ".tokens-list strong"))
+
+    driver = self.driver
+    max_attempts = 6
+
+    def shot(title):
+        try:
+            log_screenshot_web_global(driver, title)
+        except Exception:
+            pass
+
+    def kill_overlays():
+        driver.execute_script("""
+            const selectors = [
+                '#loading-mask', '.loading-mask',
+                '.ui-widget-overlay',
+                '.modal-backdrop',
+                '.overlay',
+                '.spinner', '.loader'
+            ];
+            selectors.forEach(sel => {
+                document.querySelectorAll(sel).forEach(el => {
+                    el.style.pointerEvents = 'none';
+                });
+            });
+        """)
+
+    def scroll_center(el):
+        driver.execute_script(
+            "arguments[0].scrollIntoView({block:'center', inline:'center'});", el
         )
-        # Récupérer le texte de chaque <strong> trouvé (même si l'élément est potentiellement caché)
-        codes = []
-        for el in elements:
-            text = el.get_attribute("textContent") or ""
-            text = text.strip()
-            if text:
-                codes.append(text)
-        if codes:
-            code_text = " ".join(codes)
-            print(f"[Info] Code d'activation trouvé via .tokens-list : {code_text}")
-    except Exception as e:
-        print(f"[Debug] Tentative 1 échouée : {e}")
-    finally:
-        log_screenshot_web_global(self.driver, title="Après tentative 1 - présence .tokens-list")
-    if code_text:
-        return code_text
-    
-    # Étape 2 : Si rien n'a été trouvé, tenter via un élément <strong> dans .tokens-popup (structure alternative)
-    print("[Info] Tentative 2 : attente d'un élément <strong> dans .tokens-popup ...")
-    log_screenshot_web_global(self.driver, title="Avant tentative 2 - attente .tokens-popup")
-    try:
-        elements = WebDriverWait(self.driver, timeout).until(
-            EC.presence_of_all_elements_located((By.CSS_SELECTOR, ".tokens-popup strong"))
-        )
-        # Récupérer le texte de chaque <strong> trouvé dans .tokens-popup
-        codes = []
-        for el in elements:
-            text = el.get_attribute("textContent") or ""
-            text = text.strip()
-            if text:
-                codes.append(text)
-        if codes:
-            code_text = " ".join(codes)
-            print(f"[Info] Code d'activation trouvé via .tokens-popup : {code_text}")
-    except Exception as e:
-        print(f"[Debug] Tentative 2 échouée : {e}")
-    finally:
-        log_screenshot_web_global(self.driver, title="Après tentative 2 - présence .tokens-popup")
-    if code_text:
-        return code_text
-    
-    # Étape 3 : En dernier recours, extraction via l'exécution d'un script JavaScript parcourant le DOM
-    print("[Info] Tentative 3 : recherche du code via exécution JavaScript...")
-    log_screenshot_web_global(self.driver, title="Avant tentative 3 - exécution JS")
-    try:
-        script = """
-            const listElems = document.querySelectorAll('.tokens-list strong');
-            const popupElems = document.querySelectorAll('.tokens-popup strong');
-            let texts = [];
-            listElems.forEach(el => texts.push(el.textContent.trim()));
-            if (texts.length === 0) {
-                popupElems.forEach(el => texts.push(el.textContent.trim()));
-            }
-            texts = texts.filter(t => t);  // supprimer les entrées vides
-            return texts.join(' ');
-        """
-        result = self.driver.execute_script(script)
-        if result:
-            code_text = str(result).strip()
-            print(f"[Info] Code d'activation obtenu via JS : {code_text}")
-    except Exception as e:
-        print(f"[Debug] Tentative 3 échouée (JS) : {e}")
-    finally:
-        log_screenshot_web_global(self.driver, title="Après tentative 3 - résultat JS")
-    if code_text:
-        return code_text
-    
-    # Si aucun code n'a été trouvé à ce stade, lever une exception explicite pour signaler l'échec
-    message = f"Code d'activation introuvable après {timeout} secondes d'attente"
-    print(f"[Erreur] {message}")
-    raise TimeoutException(message)
+        time.sleep(0.15)
+
+    def is_enabled(el):
+        try:
+            disabled = el.get_attribute("disabled")
+            aria_disabled = el.get_attribute("aria-disabled")
+            return el.is_enabled() and disabled in (None, "", "false") and aria_disabled in (None, "", "false")
+        except StaleElementReferenceException:
+            return False
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            component = self.get_component(*locator, **kwargs)
+
+            if component is None:
+                shot(f"click_component_attempt_{attempt}_NO_COMPONENT")
+                time.sleep(0.3)
+                continue
+
+            kill_overlays()
+            scroll_center(component)
+
+            # attendre que le bouton soit vraiment activable
+            t0 = time.time()
+            while time.time() - t0 < 5:
+                if is_enabled(component):
+                    break
+                time.sleep(0.2)
+            else:
+                shot(f"click_component_attempt_{attempt}_STILL_DISABLED")
+                continue
+
+            # 1️⃣ click normal
+            try:
+                component.click()
+                shot(f"click_component_attempt_{attempt}_CLICK_OK")
+                return
+            except ElementClickInterceptedException:
+                shot(f"click_component_attempt_{attempt}_CLICK_INTERCEPTED")
+
+            # 2️⃣ ActionChains
+            try:
+                ActionChains(driver).move_to_element(component).pause(0.1).click(component).perform()
+                shot(f"click_component_attempt_{attempt}_ACTIONCHAINS_OK")
+                return
+            except Exception:
+                shot(f"click_component_attempt_{attempt}_ACTIONCHAINS_FAILED")
+
+            # 3️⃣ JS click
+            try:
+                driver.execute_script("arguments[0].click();", component)
+                shot(f"click_component_attempt_{attempt}_JS_CLICK_OK")
+                return
+            except Exception:
+                shot(f"click_component_attempt_{attempt}_JS_CLICK_FAILED")
+
+            # 4️⃣ dispatchEvent (dernier clic JS)
+            try:
+                driver.execute_script("""
+                    const el = arguments[0];
+                    el.dispatchEvent(new MouseEvent('mousedown', {bubbles:true}));
+                    el.dispatchEvent(new MouseEvent('mouseup', {bubbles:true}));
+                    el.dispatchEvent(new MouseEvent('click', {bubbles:true}));
+                """, component)
+                shot(f"click_component_attempt_{attempt}_DISPATCH_EVENT_OK")
+                return
+            except Exception:
+                shot(f"click_component_attempt_{attempt}_DISPATCH_EVENT_FAILED")
+
+            # 5️⃣ submit du form (hyper efficace pour ton cas)
+            try:
+                submitted = driver.execute_script("""
+                    const btn = arguments[0];
+                    const form = btn.closest('form');
+                    if (form) { form.submit(); return true; }
+                    return false;
+                """, component)
+                if submitted:
+                    shot(f"click_component_attempt_{attempt}_FORM_SUBMIT_OK")
+                    return
+            except Exception:
+                shot(f"click_component_attempt_{attempt}_FORM_SUBMIT_FAILED")
+
+        except (StaleElementReferenceException, ElementNotVisibleException):
+            time.sleep(0.3)
+
+    shot("click_component_FINAL_FAILURE")
+    raise TimeoutException(f"click_component failed after {max_attempts} attempts for locator {locator}")
