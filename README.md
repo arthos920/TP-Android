@@ -11,10 +11,11 @@ html_block = f"""
     font-family:Arial, sans-serif;
 ">
 
+    <!-- Titre -->
     <h3 style="
         font-size:14px;
         margin:0 0 6px 0;
-        text-align:center;
+        text-align:left;
         color:#333;
     ">
         <span style="
@@ -24,7 +25,7 @@ html_block = f"""
             border-radius:4px;
             font-size:12px;
             font-weight:bold;
-            margin-right:4px;
+            margin-right:6px;
         ">
             ERROR
         </span>
@@ -33,7 +34,8 @@ html_block = f"""
         </span>
     </h3>
 
-    <div style="text-align:center; margin-bottom:6px;">
+    <!-- Test -->
+    <div style="text-align:left; margin-bottom:6px;">
         <span style="
             display:inline-block;
             background:#e9f2ff;
@@ -47,6 +49,7 @@ html_block = f"""
         </span>
     </div>
 
+    <!-- Image centrée -->
     <div style="text-align:center;">
         <a href="{rel_path}" style="text-decoration:none;">
             <img src="{rel_path}" style="
@@ -54,11 +57,7 @@ html_block = f"""
                 border:1px solid #ccc;
                 border-radius:4px;
                 box-shadow:0 1px 4px rgba(0,0,0,0.1);
-                transition:transform 0.2s ease;
-            " 
-            onmouseover="this.style.transform='scale(1.02)'" 
-            onmouseout="this.style.transform='scale(1)'" 
-            >
+            ">
         </a>
     </div>
 
