@@ -8,13 +8,14 @@ def verify_call(self, bool=False, timeout_minutes=15, poll_seconds=5):
 
     timeout = timeout_minutes * 60
     start_time = time.time()
+    found = False
 
     try:
         # Essai direct
         self.driver.find_element(By.XPATH, AUDITOR_TOGGLE_MENU_RESULT).click()
+        found = True
 
     except Exception:
-        log_screenshot(self.driver)
         robot.api.logger.info("There is no item for your research")
 
         # Retry jusqu'au timeout
@@ -24,7 +25,6 @@ def verify_call(self, bool=False, timeout_minutes=15, poll_seconds=5):
 
                 time.sleep(poll_seconds)
 
-                # (tu l'avais 2 fois) : si c'est volontaire, garde; sinon enlève un des deux
                 self.driver.find_element(By.XPATH, AUDITOR_BUTTON_SWAP_ORDER).click()
                 self.driver.find_element(By.XPATH, AUDITOR_BUTTON_SWAP_ORDER).click()
 
@@ -32,20 +32,22 @@ def verify_call(self, bool=False, timeout_minutes=15, poll_seconds=5):
                     EC.element_to_be_clickable((By.XPATH, AUDITOR_TOGGLE_MENU_RESULT))
                 ).click()
 
-                # OK -> on sort
+                found = True
                 break
 
             except Exception:
-                self.log.info("There is no item for your research")
-                log_screenshot_web_global(self.driver, title="No call (retrying)")
+                self.log.info("Still no item, retrying...")
                 time.sleep(poll_seconds)
 
-        else:
-            # Le while a expiré (timeout)
-            log_screenshot_web_global(self.driver, title="Timeout: No call after search")
-            raise Exception(f"Timeout: no call found after {timeout_minutes} minutes")
+    # ❌ Échec définitif → UN SEUL SCREENSHOT
+    if not found:
+        log_screenshot_web_global(
+            self.driver,
+            title=f"Timeout: No call after {timeout_minutes} minutes"
+        )
+        raise Exception(f"Timeout: no call found after {timeout_minutes} minutes")
 
-    # Ensuite: lecture du statut
+    # ✅ Lecture du résultat
     try:
         result = WebDriverWait(self.driver, 5).until(
             EC.element_to_be_clickable((By.XPATH, AUDITOR_CALL_RESULT))
@@ -59,5 +61,6 @@ def verify_call(self, bool=False, timeout_minutes=15, poll_seconds=5):
             print("The receiver did respond")
 
     except Exception:
+        # ❌ Un seul screenshot aussi ici
         log_screenshot_web_global(self.driver, title="Message not found")
         raise Exception("Message not found")
