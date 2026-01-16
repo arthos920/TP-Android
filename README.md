@@ -1,47 +1,63 @@
 import time
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.by import By
 
-def verify_attachment(self):
-    timeout = 15 * 60   # 15 minutes en secondes
+def verify_call(self, bool=False, timeout_minutes=15, poll_seconds=5):
+    """This function is used to the status of a call after research ..."""
+
+    timeout = timeout_minutes * 60
     start_time = time.time()
-    fail_attachment = True
 
     try:
-        WebDriverWait(self.driver, 5).until(
-            EC.element_to_be_clickable((By.XPATH, AUDITOR_TOGGLE_MENU_RESULT))
-        ).click()
-    except:
+        # Essai direct
+        self.driver.find_element(By.XPATH, AUDITOR_TOGGLE_MENU_RESULT).click()
+
+    except Exception:
+        log_screenshot(self.driver)
         robot.api.logger.info("There is no item for your research")
 
+        # Retry jusqu'au timeout
         while time.time() - start_time < timeout:
             try:
                 robot.api.logger.info("Attempt")
 
-                time.sleep(5)
+                time.sleep(poll_seconds)
+
+                # (tu l'avais 2 fois) : si c'est volontaire, garde; sinon enlève un des deux
                 self.driver.find_element(By.XPATH, AUDITOR_BUTTON_SWAP_ORDER).click()
+                self.driver.find_element(By.XPATH, AUDITOR_BUTTON_SWAP_ORDER).click()
+
                 WebDriverWait(self.driver, 5).until(
                     EC.element_to_be_clickable((By.XPATH, AUDITOR_TOGGLE_MENU_RESULT))
                 ).click()
 
-                fail_attachment = False
+                # OK -> on sort
                 break
 
-            except:
-                self.log.info("Still no item, retrying...")
-                time.sleep(5)
+            except Exception:
+                self.log.info("There is no item for your research")
+                log_screenshot_web_global(self.driver, title="No call (retrying)")
+                time.sleep(poll_seconds)
 
-        # Si le timeout est dépassé
-        if fail_attachment:
-            log_screenshot_web_global(
-                self.driver, title="Timeout: attachment not found after 15 minutes"
-            )
-            raise Exception("Timeout: attachment not found after 15 minutes")
+        else:
+            # Le while a expiré (timeout)
+            log_screenshot_web_global(self.driver, title="Timeout: No call after search")
+            raise Exception(f"Timeout: no call found after {timeout_minutes} minutes")
 
-    if not fail_attachment:
+    # Ensuite: lecture du statut
+    try:
         result = WebDriverWait(self.driver, 5).until(
-            EC.element_to_be_clickable((By.XPATH, AUDITOR_ATTACHMENT_RESULT))
+            EC.element_to_be_clickable((By.XPATH, AUDITOR_CALL_RESULT))
         )
-        if result.text != "image":
-            log_screenshot_web_global(
-                self.driver, title="The message text found doesn't match"
-            )
-            raise Exception("The message text found doesn't match")
+
+        if result.text == "compromised":
+            if bool is True:
+                print("The receiver did not respond")
+
+        if result.text == "verified":
+            print("The receiver did respond")
+
+    except Exception:
+        log_screenshot_web_global(self.driver, title="Message not found")
+        raise Exception("Message not found")
