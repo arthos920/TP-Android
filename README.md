@@ -2,20 +2,18 @@ import time
 from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
+from selenium.common.exceptions import TimeoutException
 
-NO_MSG_TEXT = "No messages or attachments"
 
+NO_RECORDS_XPATH = "//*[@data-role='no-records']"
 
 def retry(self, timeout=300, poll_interval=5):
     """
-    Rejoue les 2 clics (refresh) pendant max `timeout` secondes
-    tant que le message affiché est "No messages or attachments".
-
-    Retourne le texte final (quand il n'est plus NO_MSG_TEXT).
-    Si timeout atteint en restant sur NO_MSG_TEXT -> raise Exception.
+    Refresh via 2 clics tant que l'élément data-role='no-records' est présent (visible).
+    Sort dès qu'il est absent => on considère que les résultats sont affichés.
+    Timeout global -> FAIL.
     """
     end_time = time.monotonic() + timeout
-    last_text = None
     attempt = 0
 
     while time.monotonic() < end_time:
@@ -32,25 +30,26 @@ def retry(self, timeout=300, poll_interval=5):
             EC.element_to_be_clickable((By.XPATH, AUDIT_SERVER_SUBMIT_FILTER))
         ).click()
 
-        # 2) Lire le message
+        # 2) Condition de sortie basée sur présence/absence de no-records
         try:
-            el = WebDriverWait(self.driver, 10).until(
-                EC.visibility_of_element_located((By.XPATH, AUDIT_SERVER_RESULT_CONTENT_MESSAGE))
+            # On attend un court instant : si no-records apparaît => on continue
+            no_records_el = WebDriverWait(self.driver, 3).until(
+                EC.presence_of_element_located((By.XPATH, NO_RECORDS_XPATH))
             )
-            last_text = (el.text or "").strip()
-        except Exception:
-            # si on ne peut pas lire, on retente
+
+            # si présent mais pas affiché (rare), on considère absent => sortie
+            if not no_records_el.is_displayed():
+                return
+
+            # présent + affiché => on continue à boucler
+            robot.api.logger.info(f"[retry] attempt {attempt}: no-records visible, retrying...")
             time.sleep(poll_interval)
             continue
 
-        # 3) Condition d'arrêt
-        if last_text != NO_MSG_TEXT:
-            return last_text
+        except TimeoutException:
+            # no-records absent => sortie OK
+            robot.api.logger.info(f"[retry] attempt {attempt}: no-records absent -> exit retry")
+            return
 
-        time.sleep(poll_interval)
-
-    log_screenshot_web_global(
-        self.driver,
-        title=f"Retry timeout after {timeout}s (still '{NO_MSG_TEXT}')"
-    )
-    raise Exception(f"Timeout after {timeout}s: still '{NO_MSG_TEXT}'")
+    log_screenshot_web_global(self.driver, title=f"Retry timeout after {timeout}s (no-records still present)")
+    raise Exception(f"Timeout after {timeout}s: no-records still present")
