@@ -1,17 +1,26 @@
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.common.action_chains import ActionChains
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.by import By
+def _get_video_call_uuid_from_row(row):
+    # 1) tentative via td[data-role='CallUuid']
+    uuid_candidates = row.find_elements(By.XPATH, ".//td[@data-role='CallUuid' or @data-role='VideoCallID' or @data-role='VideoCallId']")
+    if uuid_candidates:
+        txt = (uuid_candidates[0].text or "").strip()
+        if txt:
+            return txt
 
-def close_time_popup(driver):
-    # ESC ferme souvent les popups Semantic UI
-    ActionChains(driver).send_keys(Keys.ESCAPE).perform()
+    # 2) fallback via attribut data-call-uuid sur le lien download
+    dl = row.find_elements(By.XPATH, ".//td[@data-role='SessionRecording']//span[contains(@class,'download-link') and @data-call-uuid]")
+    if dl:
+        attr = (dl[0].get_attribute("data-call-uuid") or "").strip()
+        if attr:
+            return attr
 
-    # Clique “dans le vide” pour perdre le focus (au cas où ESC ne suffit pas)
-    driver.find_element(By.TAG_NAME, "body").click()
+    return ""
 
-    # Attendre que le popup soit invisible (adapter le CSS si besoin)
-    WebDriverWait(driver, 10).until(
-        EC.invisibility_of_element_located((By.CSS_SELECTOR, ".sw-calendar-popup:not(.hidden)"))
-    )
+
+
+call_uuid = _get_video_call_uuid_from_row(row0)
+if not call_uuid:
+    # debug utile : on log ce qu'on voit dans la row
+    html = row0.get_attribute("outerHTML")
+    log_screenshot_web_global(self.driver, title="verify_video_call FAILED - empty uuid (row html logged)")
+    robot.api.logger.info(f"[verify_video_call] row outerHTML: {html}")
+    raise Exception("Empty CallUuid in first row (td and data-call-uuid both empty)")
