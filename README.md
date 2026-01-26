@@ -3,38 +3,36 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 
-PRIVATE_CALLS_TABLE_XPATH = "//table[contains(@class,'reports-table') and @data-report-type='audio-calls-call']"
-PRIVATE_ROWS_XPATH = PRIVATE_CALLS_TABLE_XPATH + "//tbody//tr[@data-role='row-template']"
+VIDEO_CALLS_TABLE_XPATH = "//table[contains(@class,'reports-table') and @data-report-type='video-calls-video-call']"
+VIDEO_ROWS_XPATH = VIDEO_CALLS_TABLE_XPATH + "//tbody//tr[@data-role='row-template']"
 
 
-def verify_private_call(
+def verify_video_call(
     self,
     initiator_name,
     participant_name,
     call_result="Success",
     timeout=300,
-    require_recording_controls=True,
+    require_download_link=True,
 ):
     """
-    Vérifie un private call.
-    Récupère la durée directement depuis l'UI et vérifie qu'elle != 00:00:00.
+    Vérifie un video call (table video-calls-video-call).
     Screenshot automatique en cas d'échec.
     """
-
     try:
         # 1) Attente résultats
         self.retry(timeout=timeout)
 
         # 2) Attente table
         WebDriverWait(self.driver, 20).until(
-            EC.presence_of_element_located((By.XPATH, PRIVATE_CALLS_TABLE_XPATH))
+            EC.presence_of_element_located((By.XPATH, VIDEO_CALLS_TABLE_XPATH))
         )
 
-        rows = self.driver.find_elements(By.XPATH, PRIVATE_ROWS_XPATH)
+        rows = self.driver.find_elements(By.XPATH, VIDEO_ROWS_XPATH)
         if not rows:
-            raise Exception("No rows found in private calls table")
+            raise Exception("No rows found in video calls table")
 
-        # 3) On prend la première ligne
+        # 3) Première ligne
         row0 = rows[0]
 
         call_uuid = (row0.find_element(By.XPATH, ".//td[@data-role='CallUuid']").text or "").strip()
@@ -42,10 +40,13 @@ def verify_private_call(
             raise Exception("Empty CallUuid in first row")
 
         found_initiator = (row0.find_element(By.XPATH, ".//td[@data-role='Initiator']").text or "").strip()
-        found_participant = (row0.find_element(By.XPATH, ".//td[@data-role='Participant']").text or "").strip()
+
+        # Sur ta capture c'est data-role="Participants"
+        found_participant = (row0.find_element(By.XPATH, ".//td[@data-role='Participants']").text or "").strip()
+
         found_result = (row0.find_element(By.XPATH, ".//td[@data-role='CallState']").text or "").strip()
 
-        # 4) Vérifications principales
+        # 4) Vérifs
         if found_initiator != initiator_name:
             raise Exception(f"Initiator mismatch: expected '{initiator_name}', got '{found_initiator}'")
 
@@ -55,39 +56,20 @@ def verify_private_call(
         if call_result is not None and found_result != call_result:
             raise Exception(f"Call result mismatch: expected '{call_result}', got '{found_result}'")
 
-        # 5) Vérification enregistrement audio
-        rec_td = row0.find_element(By.XPATH, ".//td[@data-role='SessionRecording']")
-
-        if require_recording_controls:
-            play = rec_td.find_elements(
-                By.XPATH, ".//*[@data-role='play' or contains(@class,'play-main') or contains(@class,'play')]"
-            )
-            dl = rec_td.find_elements(
-                By.XPATH, ".//span[contains(@class,'download-link')]"
-            )
-
-            if not play:
-                raise Exception("Recording play control not found")
+        # 5) Vérif download link vidéo
+        if require_download_link:
+            rec_td = row0.find_element(By.XPATH, ".//td[@data-role='SessionRecording']")
+            dl = rec_td.find_elements(By.XPATH, ".//span[contains(@class,'download-link')]")
             if not dl:
-                raise Exception("Recording download control not found")
+                raise Exception("Download video session link not found")
 
-        # 6) Vérification durée ≠ 00:00:00
-        dur_el = rec_td.find_element(By.XPATH, ".//*[@data-role='Duration']")
-        found_duration = (dur_el.text or "").strip()
+            # Optionnel: vérifier le texte "Download video session"
+            dl_text = (dl[0].text or "").strip()
+            if dl_text and "Download" not in dl_text:
+                raise Exception(f"Unexpected download link text: '{dl_text}'")
 
-        if not found_duration:
-            raise Exception("Recording duration is empty")
-
-        if found_duration == "00:00:00":
-            raise Exception("Recording duration is zero")
-
-        robot.api.logger.info(
-            f"verify_private_call OK for uuid={call_uuid} (duration={found_duration})"
-        )
+        robot.api.logger.info(f"verify_video_call OK for uuid={call_uuid}")
 
     except Exception as e:
-        log_screenshot_web_global(
-            self.driver,
-            title=f"verify_private_call FAILED - {str(e)}"
-        )
+        log_screenshot_web_global(self.driver, title=f"verify_video_call FAILED - {str(e)}")
         raise
