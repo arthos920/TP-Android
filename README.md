@@ -4,139 +4,179 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 
-VIDEO_CALLS_TABLE_XPATH = "//table[contains(@class,'reports-table') and @data-report-type='video-calls-video-call']"
-VIDEO_ROWS_XPATH = VIDEO_CALLS_TABLE_XPATH + "//tbody/tr"
+# =========================
+# LOCATORS
+# =========================
+
+VIDEO_STREAM_TABLE_XPATH = "//table[contains(@class,'reports-table') and @data-report-type='video-calls-video-streaming']"
+VIDEO_STREAM_ROWS_XPATH = VIDEO_STREAM_TABLE_XPATH + "//tbody/tr"
+
+STREAM_OWNER_XPATH = ".//td[@data-role='EventOwner']"
+STREAM_EVENT_TYPE_XPATH = ".//td[@data-role='EventType']"
+STREAM_CALL_UUID_XPATH = ".//td[@data-role='CallUuid']"
+STREAM_ADDITIONAL_INFO_XPATH = ".//td[@data-role='AdditionalInfo']"
+STREAM_DOWNLOAD_LINK_XPATH = ".//td[@data-role='SessionRecording']//span[contains(@class,'download-link')]"
 
 
-def verify_video_call(
+# =========================
+# FUNCTION
+# =========================
+
+def auditor_verify_streaming_video_strict_order(
     self,
-    initiator_name,
-    participant_name,
-    call_result="Success",
+    started_owner,
+    ended_owner,
+    joined_owners,
+    left_owners,
     timeout=120,
     poll_interval=2,
-    require_download_link=True,
+    require_download_link_on_end=True,
 ):
-    """
-    Vérifie un video call (table video-calls-video-call) avec XPaths corrigés.
-    - Attend qu'une ligne "valide" apparaisse (uuid dans td CallUuid OU data-call-uuid sur download-link)
-    - Vérifie Initiator, Participants, CallState
-    - Vérifie la présence du lien download (optionnel)
-    - Screenshot + HTML dump en cas d'échec
-    """
 
-    try:
-        # 1) Attendre la table
-        WebDriverWait(self.driver, 20).until(
-            EC.presence_of_element_located((By.XPATH, VIDEO_CALLS_TABLE_XPATH))
-        )
+    joined_owners = joined_owners or []
+    left_owners = left_owners or []
 
-        # 2) Attendre une ligne valide (UI async)
-        end_time = time.monotonic() + timeout
-        row0 = None
-        last_table_html = None
+    def _norm(s):
+        return (s or "").strip()
 
-        while time.monotonic() < end_time:
-            rows = self.driver.find_elements(By.XPATH, VIDEO_ROWS_XPATH)
+    def _etype_key(event_type):
+        t = _norm(event_type).lower()
+        if "started video streaming" in t:
+            return "started"
+        if "joined in video streaming" in t:
+            return "joined"
+        if "left video streaming" in t:
+            return "left"
+        if "ended video streaming" in t:
+            return "ended"
+        return "other"
 
-            valid_rows = []
-            for r in rows:
-                # uuid via td
-                try:
-                    td_uuid = (r.find_element(By.XPATH, ".//td[@data-role='CallUuid']").text or "").strip()
-                except Exception:
-                    td_uuid = ""
+    # =========================
+    # WAIT FOR TABLE
+    # =========================
+    WebDriverWait(self.driver, 20).until(
+        EC.presence_of_element_located((By.XPATH, VIDEO_STREAM_TABLE_XPATH))
+    )
 
-                # uuid via attribut sur download link
-                try:
-                    attr_uuid = (
-                        r.find_element(
-                            By.XPATH,
-                            ".//td[@data-role='SessionRecording']//span[contains(@class,'download-link')]"
-                        ).get_attribute("data-call-uuid") or ""
-                    ).strip()
-                except Exception:
-                    attr_uuid = ""
+    # =========================
+    # WAIT FOR POPULATED ROWS
+    # =========================
+    end_time = time.monotonic() + timeout
+    valid_rows = []
 
-                if td_uuid or attr_uuid:
+    while time.monotonic() < end_time:
+        rows = self.driver.find_elements(By.XPATH, VIDEO_STREAM_ROWS_XPATH)
+        valid_rows.clear()
+
+        for r in rows:
+            try:
+                uuid = _norm(r.find_element(By.XPATH, STREAM_CALL_UUID_XPATH).text)
+                if uuid:
                     valid_rows.append(r)
-
-            if valid_rows:
-                row0 = valid_rows[0]
-                break
-
-            # garder un HTML pour debug si timeout
-            try:
-                last_table_html = self.driver.find_element(By.XPATH, VIDEO_CALLS_TABLE_XPATH).get_attribute("outerHTML")
             except Exception:
-                last_table_html = None
+                continue
 
-            time.sleep(poll_interval)
+        if valid_rows:
+            break
 
-        if not row0:
-            if last_table_html:
-                robot.api.logger.info(f"[verify_video_call] table html: {last_table_html}")
-            log_screenshot_web_global(self.driver, title="verify_video_call FAILED - no populated rows")
-            raise Exception("No populated rows found (UI async not finished)")
+        time.sleep(poll_interval)
 
-        # 3) Récupérer le call_uuid (td d'abord, sinon attribut)
-        call_uuid = ""
+    if not valid_rows:
+        html = self.driver.find_element(By.XPATH, VIDEO_STREAM_TABLE_XPATH).get_attribute("outerHTML")
+        robot.api.logger.info(f"[auditor_verify_streaming_video_strict_order] table html:\n{html}")
+        log_screenshot_web_global(self.driver, title="auditor_verify_streaming_video_strict_order FAILED - no populated rows")
+        raise Exception("No populated rows found (UI async not finished)")
+
+    # =========================
+    # PARSE ROWS
+    # =========================
+    parsed = []
+    call_uuids = set()
+
+    for r in valid_rows:
+        owner = _norm(r.find_element(By.XPATH, STREAM_OWNER_XPATH).text)
+        etype = _norm(r.find_element(By.XPATH, STREAM_EVENT_TYPE_XPATH).text)
+        call_uuid = _norm(r.find_element(By.XPATH, STREAM_CALL_UUID_XPATH).text)
+
         try:
-            call_uuid = (row0.find_element(By.XPATH, ".//td[@data-role='CallUuid']").text or "").strip()
+            add_info = _norm(r.find_element(By.XPATH, STREAM_ADDITIONAL_INFO_XPATH).text)
         except Exception:
-            call_uuid = ""
+            add_info = ""
 
-        if not call_uuid:
-            try:
-                call_uuid = (
-                    row0.find_element(
-                        By.XPATH,
-                        ".//td[@data-role='SessionRecording']//span[contains(@class,'download-link')]"
-                    ).get_attribute("data-call-uuid") or ""
-                ).strip()
-            except Exception:
-                call_uuid = ""
-
-        if not call_uuid:
-            row_html = row0.get_attribute("outerHTML")
-            robot.api.logger.info(f"[verify_video_call] row outerHTML: {row_html}")
-            log_screenshot_web_global(self.driver, title="verify_video_call FAILED - empty uuid")
-            raise Exception("Empty CallUuid in first valid row")
-
-        robot.api.logger.info(f"verify_video_call - detected uuid={call_uuid}")
-
-        # 4) Lire les champs principaux
-        found_initiator = (row0.find_element(By.XPATH, ".//td[@data-role='Initiator']").text or "").strip()
-        found_participant = (row0.find_element(By.XPATH, ".//td[@data-role='Participants']").text or "").strip()
-        found_result = (row0.find_element(By.XPATH, ".//td[@data-role='CallState']").text or "").strip()
-
-        # 5) Vérifs
-        if found_initiator != initiator_name:
-            raise Exception(f"Initiator mismatch: expected '{initiator_name}', got '{found_initiator}'")
-
-        if found_participant != participant_name:
-            raise Exception(f"Participant mismatch: expected '{participant_name}', got '{found_participant}'")
-
-        if call_result is not None and found_result != call_result:
-            raise Exception(f"Call result mismatch: expected '{call_result}', got '{found_result}'")
-
-        # 6) Vérif lien download (optionnel)
-        if require_download_link:
-            rec_td = row0.find_element(By.XPATH, ".//td[@data-role='SessionRecording']")
-            dl = rec_td.find_elements(By.XPATH, ".//span[contains(@class,'download-link')]")
-            if not dl:
-                raise Exception("Download video session link not found")
-
-        robot.api.logger.info(f"verify_video_call OK for uuid={call_uuid}")
-        return call_uuid
-
-    except Exception as e:
-        # screenshot systématique
-        log_screenshot_web_global(self.driver, title=f"verify_video_call FAILED - {str(e)}")
-        # dump HTML table pour debug
         try:
-            html = self.driver.find_element(By.XPATH, VIDEO_CALLS_TABLE_XPATH).get_attribute("outerHTML")
-            robot.api.logger.info(f"[verify_video_call] table html: {html}")
+            dl = r.find_elements(By.XPATH, STREAM_DOWNLOAD_LINK_XPATH)
+            dl_uuid = _norm(dl[0].get_attribute("data-call-uuid")) if dl else ""
         except Exception:
-            pass
-        raise
+            dl_uuid = ""
+
+        call_uuids.add(call_uuid)
+
+        parsed.append({
+            "row": r,
+            "owner": owner,
+            "etype": etype,
+            "key": _etype_key(etype),
+            "call_uuid": call_uuid,
+            "download_uuid": dl_uuid,
+            "additional": add_info
+        })
+
+    if len(call_uuids) != 1:
+        raise Exception(f"Expected 1 CallUUID, got {len(call_uuids)} → {call_uuids}")
+
+    call_uuid = next(iter(call_uuids))
+    robot.api.logger.info(f"[auditor_verify_streaming_video_strict_order] call_uuid = {call_uuid}")
+
+    # =========================
+    # CHRONO ORDER (reverse)
+    # =========================
+    chrono = list(reversed(parsed))
+
+    # =========================
+    # EXPECTED SEQUENCE
+    # =========================
+    expected = []
+    expected.append(("started", started_owner))
+    expected.extend([("joined", o) for o in joined_owners])
+    expected.extend([("left", o) for o in left_owners])
+    expected.append(("ended", ended_owner))
+
+    # =========================
+    # OBSERVED SEQUENCE
+    # =========================
+    observed = [(e["key"], e["owner"]) for e in chrono if e["key"] in ("started", "joined", "left", "ended")]
+
+    robot.api.logger.info(f"[auditor_verify_streaming_video_strict_order] expected={expected}")
+    robot.api.logger.info(f"[auditor_verify_streaming_video_strict_order] observed={observed}")
+
+    # =========================
+    # STRICT ORDER CHECK
+    # =========================
+    errors = []
+
+    if len(observed) != len(expected):
+        errors.append(f"Sequence length mismatch: expected {len(expected)}, got {len(observed)}")
+
+    else:
+        for i, (exp, obs) in enumerate(zip(expected, observed), start=1):
+            if exp != obs:
+                errors.append(f"Mismatch at pos {i}: expected {exp}, got {obs}")
+
+    # =========================
+    # DOWNLOAD LINK CHECK
+    # =========================
+    if require_download_link_on_end:
+        ended_event = next((e for e in chrono if e["key"] == "ended"), None)
+        if not ended_event:
+            errors.append("Missing ended event")
+        elif not ended_event["download_uuid"]:
+            errors.append("Ended event has no download link uuid")
+
+    if errors:
+        html = self.driver.find_element(By.XPATH, VIDEO_STREAM_TABLE_XPATH).get_attribute("outerHTML")
+        robot.api.logger.info(f"[auditor_verify_streaming_video_strict_order] table html:\n{html}")
+        log_screenshot_web_global(self.driver, title="auditor_verify_streaming_video_strict_order FAILED")
+        raise Exception(" | ".join(errors))
+
+    robot.api.logger.info("[auditor_verify_streaming_video_strict_order] SUCCESS")
+    return call_uuid
