@@ -1,37 +1,69 @@
-NO_RECORDS_XPATH = "//*[@data-role='no-records']"
+import time
 
-def retry(self, timeout=300, poll_interval=5):
-    end_time = time.monotonic() + timeout
-    attempt = 0
+def start_logging(self, log_file_path: str, log_url: str = None):
+    """
+    Start client trace logging to file.
 
-    while time.monotonic() < end_time:
-        attempt += 1
+    :param log_file_path: file name and path to write logs to
+    :param log_url: for logging from websocket URL provided by appium server. Not in use for Agnet Dispatcher.
+    """
+    self.log_file_path = log_file_path
 
-        # refresh (tes 2 clicks)
-        WebDriverWait(self.driver, 20).until(
-            EC.element_to_be_clickable((By.XPATH, AUDIT_SERVER_OPEN_FILTER_BUTTON))
-        ).click()
+    # --- Inject JS to collect console logs safely ---
+    try:
+        self.driver.execute_script(r"""
+            (function() {
+                if (window.__loggingInitialized) return;
+                window.__loggingInitialized = true;
 
-        time.sleep(3)
+                window.__browser_logs = window.__browser_logs || [];
+                var originalConsole = {};
+                var logLevels = ['log', 'info', 'warn', 'error', 'debug'];
 
-        WebDriverWait(self.driver, 20).until(
-            EC.element_to_be_clickable((By.XPATH, AUDIT_SERVER_SUBMIT_FILTER))
-        ).click()
+                logLevels.forEach(function(level) {
+                    if (!console[level]) return;
+                    originalConsole[level] = console[level];
+                    console[level] = function() {
+                        try {
+                            var message = Array.from(arguments).join(' ');
+                            var timestamp = new Date().toISOString();
+                            window.__browser_logs.push({
+                                level: String(level).toUpperCase(),
+                                message: message,
+                                timestamp: timestamp
+                            });
+                        } catch (e) {}
+                        try {
+                            originalConsole[level].apply(console, arguments);
+                        } catch (e) {}
+                    };
+                });
+            })();
+        """)
+    except Exception:
+        # On ne bloque pas les tests si l'injection échoue
+        pass
 
-        # ✅ condition basée sur la VISIBILITÉ
-        try:
-            # si visible => on continue (pas de résultats)
-            WebDriverWait(self.driver, 2).until(
-                EC.visibility_of_element_located((By.XPATH, NO_RECORDS_XPATH))
-            )
-            robot.api.logger.info(f"[retry] attempt {attempt}: no-records visible -> retrying...")
-            time.sleep(poll_interval)
-            continue
+    # --- Best-effort: enable webchatSDK logging if present (CI-safe) ---
+    try:
+        enabled = self.driver.execute_script(r"""
+            try {
+                if (window.webchatSDK &&
+                    webchatSDK.STWLogManager &&
+                    typeof webchatSDK.STWLogManager.setActive === 'function') {
+                    webchatSDK.STWLogManager.setActive(true);
+                    return true;
+                }
+                return false;
+            } catch (e) {
+                return false;
+            }
+        """)
+    except Exception:
+        enabled = False
 
-        except TimeoutException:
-            # ✅ pas visible => soit display:none soit absent => OK
-            robot.api.logger.info(f"[retry] attempt {attempt}: no-records NOT visible -> exit retry")
-            return
-
-    log_screenshot_web_global(self.driver, title=f"Retry timeout after {timeout}s (no-records still visible)")
-    raise Exception(f"Timeout after {timeout}s: no-records still visible")
+    # Petit log côté Python (facultatif)
+    try:
+        print(f"webchatSDK enabled: {enabled}")
+    except Exception:
+        pass
