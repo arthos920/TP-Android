@@ -1,14 +1,17 @@
-if isinstance(joined_owners, str):
-    joined_owners = [x.strip() for x in joined_owners.split("|") if x.strip()]
+# Variables métier
+${STARTED_OWNER}=    Set Variable    Christ1 Christ1
+${JOINED_OWNERS}=    Set Variable    Dispatcher_Christ Dispatcher_Christ|Christ2 Christ2|Christ3 Christ3
+${LEFT_OWNERS}=      Set Variable    Christ3 Christ3|Christ2 Christ2
+${ENDED_OWNER}=      Set Variable    Christ1 Christ1
 
-if isinstance(left_owners, str):
-    left_owners = [x.strip() for x in left_owners.split("|") if x.strip()]
-
+# Paramètres techniques
+${TIMEOUT}=          Set Variable    120
+${POLL_INTERVAL}=   Set Variable    2
 
 auditor_verify_streaming_video_strict_order
-...    started_owner=Christ1 Christ1
-...    joined_owners=Dispatcher_Christ Dispatcher_Christ|Christ2 Christ2|Christ3 Christ3
-...    left_owners=Christ3 Christ3|Christ2 Christ2
-...    ended_owner=Christ1 Christ1
-...    timeout=120
-...    poll_interval=2
+...    started_owner=${STARTED_OWNER}
+...    joined_owners=${JOINED_OWNERS}
+...    left_owners=${LEFT_OWNERS}
+...    ended_owner=${ENDED_OWNER}
+...    timeout=${TIMEOUT}
+...    poll_interval=${POLL_INTERVAL}
