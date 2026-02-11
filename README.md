@@ -1,20 +1,22 @@
-# gitlab_mcp_access_check.py
-# Test ultra simple: connexion MCP GitLab + lecture de fichiers
+# ai_get_project_test.py
+# Test: OpenAI -> tool call -> GitLab MCP get_project(project_id="10")
 #
 # Env requis:
-#   GITLAB_MCP_URL      ex: http://localhost:9001/mcp
-#   GITLAB_PROJECT_ID   ex:    (ID numérique)
-#   GITLAB_REF          ex: main  (ou master)
-#
-# Run:
-#   python gitlab_mcp_access_check.py
+#   OPENAI_API_KEY
+#   GITLAB_MCP_URL   ex: http://localhost:9001/mcp
+# Optionnel:
+#   OPENAI_BASE_URL
+#   OPENAI_MODEL     ex: magistral-2509
 
 from __future__ import annotations
 
 import asyncio
-import os
 import inspect
-from typing import Any, Dict, Optional
+import json
+import os
+from typing import Any, Dict, List, Optional
+
+from openai import AsyncOpenAI
 
 # -----------------------------------------------------------------------------
 # MCP imports (adapte à ton install)
@@ -33,9 +35,13 @@ except Exception as e1:
         MCP_IMPORT_ERROR = e2
 
 
+OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
+OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "").strip() or None
+OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "magistral-2509").strip()
+
 GITLAB_MCP_URL = os.environ.get("GITLAB_MCP_URL", "").strip()
-GITLAB_PROJECT_ID = os.environ.get("GITLAB_PROJECT_ID", "").strip()
-GITLAB_REF = os.environ.get("GITLAB_REF", "main").strip()
+
+PROJECT_ID = "10"  # demandé
 
 
 def normalize_mcp_content(content: Any) -> Any:
@@ -54,46 +60,11 @@ def normalize_mcp_content(content: Any) -> Any:
     return str(content)
 
 
-def extract_text(res: Any) -> str:
-    """
-    Supporte retours courants MCP:
-    - list [{"type":"text","text":"..."}]
-    - dict {"content": "..."} etc.
-    - string
-    """
-    res = normalize_mcp_content(res)
-    if res is None:
-        return ""
-    if isinstance(res, str):
-        return res
-    if isinstance(res, list):
-        parts = []
-        for x in res:
-            if isinstance(x, dict) and "text" in x:
-                parts.append(str(x["text"]))
-            else:
-                parts.append(str(x))
-        return "\n".join(parts)
-    if isinstance(res, dict):
-        for k in ("content", "text", "file_content", "body", "data"):
-            v = res.get(k)
-            if isinstance(v, str):
-                return v
-        return str(res)
-    return str(res)
-
-
 async def open_streamable_http_cm(url: str):
-    """
-    Ouvre streamable_http_client en supportant les variations.
-    Retourne: (cm, read_stream, write_stream)
-    """
     if MCP_IMPORT_ERROR is not None:
         raise RuntimeError(f"Lib MCP python non importable: {MCP_IMPORT_ERROR}")
 
     cm = streamable_http_client(url)
-
-    # async context manager attendu
     if not hasattr(cm, "__aenter__"):
         raise RuntimeError(f"streamable_http_client inattendu: {cm}")
 
@@ -104,34 +75,45 @@ async def open_streamable_http_cm(url: str):
     return cm, entered[0], entered[1]
 
 
-async def get_file_contents(session: ClientSession, file_path: str) -> str:
-    args: Dict[str, Any] = {
-        "project_id": int(GITLAB_PROJECT_ID),
-        "file_path": file_path,
-        "ref": GITLAB_REF,
-    }
-    resp = await session.call_tool("get_file_contents", args)
-    content = getattr(resp, "content", resp)
-    return extract_text(content)
+def mcp_tools_to_openai(tools: List[Any]) -> List[Dict[str, Any]]:
+    out = []
+    for t in tools:
+        name = getattr(t, "name", None) or t.get("name")
+        desc = getattr(t, "description", None) or t.get("description", "") or ""
+        schema = getattr(t, "inputSchema", None) or t.get("inputSchema") or {}
+        if not schema:
+            schema = {"type": "object", "properties": {}, "additionalProperties": True}
+
+        out.append(
+            {
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "description": desc,
+                    "parameters": schema,
+                },
+            }
+        )
+    return out
 
 
 async def main():
+    if not OPENAI_API_KEY:
+        raise RuntimeError("OPENAI_API_KEY manquant.")
     if not GITLAB_MCP_URL:
         raise RuntimeError("GITLAB_MCP_URL manquant.")
-    if not GITLAB_PROJECT_ID:
-        raise RuntimeError("GITLAB_PROJECT_ID manquant (ID numérique).")
-    if not GITLAB_REF:
-        raise RuntimeError("GITLAB_REF manquant (main/master).")
     if MCP_IMPORT_ERROR is not None:
         raise RuntimeError(f"Lib MCP python non importable: {MCP_IMPORT_ERROR}")
 
-    print("== GitLab MCP Access Check ==")
-    print(f"- URL  : {GITLAB_MCP_URL}")
-    print(f"- PID  : {GITLAB_PROJECT_ID}")
-    print(f"- REF  : {GITLAB_REF}")
-    print("--------------------------------")
+    print("== Test OpenAI -> GitLab MCP get_project ==")
+    print(f"- MODEL: {OPENAI_MODEL}")
+    print(f"- MCP  : {GITLAB_MCP_URL}")
+    print(f"- project_id: {PROJECT_ID}")
+    print("--------------------------------------------------")
 
-    cm, read_stream, write_stream = await open_streamable_http_cm(GITLAB_MCP_URL)
+    openai_client = AsyncOpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
+
+    transport_cm, read_stream, write_stream = await open_streamable_http_cm(GITLAB_MCP_URL)
 
     try:
         session = ClientSession(read_stream, write_stream)
@@ -139,54 +121,93 @@ async def main():
         if hasattr(session, "initialize"):
             await session.initialize()
 
-        # 1) Vérifie tools
+        # Liste tools -> conversion OpenAI
         tools_resp = await session.list_tools()
         tools_list = getattr(tools_resp, "tools", tools_resp)
-        tool_names = []
-        for t in tools_list:
-            tool_names.append(getattr(t, "name", None) or t.get("name"))
+        tool_names = [(getattr(t, "name", None) or t.get("name")) for t in tools_list]
+        if "get_project" not in tool_names:
+            raise RuntimeError("Tool 'get_project' introuvable sur ton MCP GitLab.")
 
-        print(f"[OK] Tools dispo: {len(tool_names)}")
-        if "get_file_contents" not in tool_names:
-            raise RuntimeError("Tool 'get_file_contents' introuvable côté MCP GitLab.")
+        openai_tools = mcp_tools_to_openai(tools_list)
 
-        # 2) Test lecture README
-        for p in ["README.md", "readme.md", "Readme.md"]:
+        async def exec_tool(name: str, args: Dict[str, Any]) -> Any:
+            resp = await session.call_tool(name, args)
+            return normalize_mcp_content(getattr(resp, "content", resp))
+
+        # Prompt: on force l'appel
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Tu es un assistant technique. "
+                    "Tu dois appeler l'outil get_project avec project_id='10' puis résumer le résultat."
+                ),
+            },
+            {"role": "user", "content": "Appelle get_project avec project_id='10'."},
+        ]
+
+        stream = await openai_client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=messages,
+            tools=openai_tools,
+            tool_choice="auto",
+            stream=True,
+            temperature=0.0,
+        )
+
+        tool_calls_acc: Dict[int, Dict[str, Any]] = {}
+        assistant_text_parts: List[str] = []
+
+        async for chunk in stream:
+            delta = chunk.choices[0].delta
+
+            if getattr(delta, "content", None):
+                print(delta.content, end="", flush=True)
+                assistant_text_parts.append(delta.content)
+
+            if getattr(delta, "tool_calls", None):
+                for tc in delta.tool_calls:
+                    idx = tc.index
+                    tool_calls_acc.setdefault(idx, {"id": None, "name": None, "arguments": ""})
+                    if getattr(tc, "id", None):
+                        tool_calls_acc[idx]["id"] = tc.id
+                    fn = getattr(tc, "function", None)
+                    if fn is not None:
+                        if getattr(fn, "name", None):
+                            tool_calls_acc[idx]["name"] = fn.name
+                        if getattr(fn, "arguments", None):
+                            tool_calls_acc[idx]["arguments"] += fn.arguments
+
+        assistant_text = "".join(assistant_text_parts).strip()
+        if assistant_text:
+            print("\n\n--- Assistant said (pre-tool) ---")
+            print(assistant_text)
+
+        # Exécute les tool calls détectés
+        if not tool_calls_acc:
+            print("\n[WARN] Aucun tool call détecté. (Le modèle n'a pas appelé get_project.)")
+            return
+
+        for _, tc in sorted(tool_calls_acc.items(), key=lambda x: x[0]):
+            name = tc["name"]
+            args_str = tc["arguments"] or "{}"
             try:
-                txt = await get_file_contents(session, p)
-                if txt.strip():
-                    print(f"[OK] Lecture {p} : {len(txt)} chars")
-                    print("----- PREVIEW -----")
-                    print(txt[:800])
-                    print("-------------------")
-                    break
+                args = json.loads(args_str)
             except Exception:
-                continue
-        else:
-            print("[WARN] README.md non lu (peut ne pas exister).")
+                args = {"_raw": args_str}
 
-        # 3) Test lecture convention
-        for p in ["doc/convention.md", "docs/convention.md", "convention.md"]:
-            try:
-                txt = await get_file_contents(session, p)
-                if txt.strip():
-                    print(f"[OK] Lecture {p} : {len(txt)} chars")
-                    print("----- PREVIEW -----")
-                    print(txt[:800])
-                    print("-------------------")
-                    break
-            except Exception as e:
-                continue
-        else:
-            print("[WARN] convention.md non lu (peut ne pas exister ou path différent).")
-
-        print("\n✅ Accès MCP GitLab OK (connexion + lecture fichier).")
-
-        await session.__aexit__(None, None, None)
+            print(f"\n=== TOOL_CALL: {name} args={args} ===")
+            result = await exec_tool(name, args)
+            print("=== TOOL_RESULT (raw) ===")
+            print(json.dumps(result, ensure_ascii=False, indent=2))
 
     finally:
         try:
-            await cm.__aexit__(None, None, None)
+            await session.__aexit__(None, None, None)  # type: ignore
+        except Exception:
+            pass
+        try:
+            await transport_cm.__aexit__(None, None, None)
         except Exception:
             pass
 
