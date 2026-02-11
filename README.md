@@ -1,21 +1,18 @@
-# test_gitlab_ai_toolloop_proxy.py
-# Minimal AI -> MCP GitLab (streamable-http) with proxy + robust tool-loop
-# Runs: get_project -> get_repository_tree -> get_file_contents (doc/convention.md)
+# test_gitlab_ai_single_tool_steps_proxy.py
+# Même script minimal, mais tu choisis quel tool appeler (1/2/3) en modifiant STEP.
 
 from __future__ import annotations
 
 import asyncio
 import json
 import os
-import time
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Tuple
 
 import httpx
 from openai import AsyncOpenAI
-from openai import APIStatusError, APITimeoutError, APIConnectionError
 
 # -----------------------------------------------------------------------------
-# MCP imports (adapte à ton install)
+# MCP imports
 # -----------------------------------------------------------------------------
 try:
     from mcp.client.streamable_http import streamable_http_client  # type: ignore
@@ -31,20 +28,19 @@ LLM_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 LLM_BASE_URL = os.environ.get("OPENAI_BASE_URL", "").strip() or None
 LLM_MODEL = os.environ.get("OPENAI_MODEL", "magistral-2509").strip()
 
-# Proxy (comme ton exemple Jira)
 PROXY_URL = os.environ.get("PROXY_URL", "").strip() or None
 
 GITLAB_MCP_URL = os.environ.get("GITLAB_MCP_URL", "http://localhost:9001/mcp").strip()
-
-# IMPORTANT: project_id numérique (string OK)
 PROJECT_ID = os.environ.get("GITLAB_PROJECT_ID", "10").strip()
 GITLAB_REF = os.environ.get("GITLAB_REF", "main").strip()
 
-# Troncature des retours tools (évite 400/413 côté LLM)
-MAX_TOOL_CHARS = int(os.environ.get("MAX_TOOL_CHARS", "12000"))
+# Choisis l'étape: 1=get_project, 2=get_repository_tree, 3=get_file_contents
+STEP = int(os.environ.get("STEP", "1"))
 
-# -----------------------------------------------------------------------------
-# Helpers
+# Pour tree/file
+REPO_PATH = os.environ.get("REPO_PATH", "doc").strip()            # dossier dans le repo
+FILE_PATH = os.environ.get("FILE_PATH", "doc/convention.md").strip()  # fichier dans le repo
+
 # -----------------------------------------------------------------------------
 def normalize(x: Any) -> Any:
     if x is None:
@@ -61,14 +57,7 @@ def normalize(x: Any) -> Any:
         return normalize(x.__dict__)
     return str(x)
 
-def dumps_truncated(obj: Any, limit: int = MAX_TOOL_CHARS) -> str:
-    s = json.dumps(normalize(obj), ensure_ascii=False)
-    if len(s) <= limit:
-        return s
-    head = s[:limit]
-    return head + f"\n...[TRUNCATED {len(s)-limit} chars]..."
-
-async def open_mcp(url: str) -> Tuple[Any, ClientSession]:
+async def open_mcp(url: str):
     cm = streamable_http_client(url)
     entered = await cm.__aenter__()
     if not isinstance(entered, tuple) or len(entered) < 2:
@@ -83,7 +72,7 @@ async def open_mcp(url: str) -> Tuple[Any, ClientSession]:
 
 def mcp_tools_to_openai(tools_resp: Any) -> List[Dict[str, Any]]:
     tools_list = getattr(tools_resp, "tools", tools_resp)
-    out: List[Dict[str, Any]] = []
+    out = []
     for t in tools_list:
         out.append(
             {
@@ -98,111 +87,69 @@ def mcp_tools_to_openai(tools_resp: Any) -> List[Dict[str, Any]]:
         )
     return out
 
-def safe_json_loads(s: str) -> Dict[str, Any]:
-    try:
-        return json.loads(s) if s else {}
-    except Exception:
-        # si le modèle renvoie un truc pas JSON
-        return {"_raw": s}
-
-def inject_defaults(args: Dict[str, Any]) -> Dict[str, Any]:
-    # Ajoute project_id/ref si le modèle oublie
-    a = dict(args or {})
-    a.setdefault("project_id", PROJECT_ID)
-    if "ref" not in a and GITLAB_REF:
-        a["ref"] = GITLAB_REF
-    return a
-
-async def call_openai_with_retry(fn, *, retries: int = 4):
-    delay = 1.0
-    for attempt in range(1, retries + 1):
-        try:
-            return await fn()
-        except (APITimeoutError, APIConnectionError) as e:
-            if attempt == retries:
-                raise
-            print(f"[WARN] OpenAI network/timeout ({type(e).__name__}), retry in {delay:.1f}s")
-            await asyncio.sleep(delay)
-            delay *= 2
-        except APIStatusError as e:
-            # retry sur erreurs transitoires
-            if e.status_code in (429, 500, 502, 503, 504) and attempt < retries:
-                print(f"[WARN] OpenAI status={e.status_code}, retry in {delay:.1f}s")
-                await asyncio.sleep(delay)
-                delay *= 2
-                continue
-            raise
-
-async def run_tool_loop(
-    async_client: AsyncOpenAI,
-    mcp: ClientSession,
-    openai_tools: List[Dict[str, Any]],
-    messages: List[Dict[str, Any]],
-    max_steps: int = 8,
-) -> List[Dict[str, Any]]:
+# -----------------------------------------------------------------------------
+def build_messages_for_step(step: int) -> Tuple[str, List[Dict[str, str]]]:
     """
-    Tool loop simple (non-streaming) :
-    - appelle le LLM
-    - exécute tool_calls
-    - renvoie tool results
-    - stop quand plus de tool_calls
+    Retourne (expected_tool_name, messages)
     """
-    for step in range(1, max_steps + 1):
-        print(f"\n=== TOOL LOOP step {step}/{max_steps} ===")
+    if step == 1:
+        tool = "get_project"
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Tu dois appeler EXACTEMENT le tool get_project avec l'argument project_id (string). "
+                    "Ne fais rien d'autre."
+                ),
+            },
+            {"role": "user", "content": f"Appelle get_project avec project_id='{PROJECT_ID}'."},
+        ]
+        return tool, messages
 
-        async def _do():
-            return await async_client.chat.completions.create(
-                model=LLM_MODEL,
-                messages=messages,
-                tools=openai_tools,
-                tool_choice="auto",
-                temperature=0.0,
-            )
+    if step == 2:
+        tool = "get_repository_tree"
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Tu dois appeler EXACTEMENT le tool get_repository_tree avec les arguments: "
+                    "project_id (string), path (string dans le repo), ref (branche). "
+                    "Ne fais rien d'autre."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Appelle get_repository_tree avec project_id='{PROJECT_ID}', "
+                    f"path='{REPO_PATH}', ref='{GITLAB_REF}'."
+                ),
+            },
+        ]
+        return tool, messages
 
-        try:
-            resp = await call_openai_with_retry(_do, retries=4)
-        except APIStatusError as e:
-            print("\n[OPENAI APIStatusError]")
-            print("status_code:", e.status_code)
-            # e.response peut être None selon versions, mais souvent dispo:
-            try:
-                print("response_text:", e.response.text)  # type: ignore
-            except Exception:
-                print("error:", str(e))
-            raise
-        except Exception as e:
-            print("\n[OPENAI ERROR]", repr(e))
-            raise
+    if step == 3:
+        tool = "get_file_contents"
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Tu dois appeler EXACTEMENT le tool get_file_contents avec les arguments: "
+                    "project_id (string), file_path (string dans le repo), ref (branche). "
+                    "ATTENTION: l'argument s'appelle file_path (pas path). "
+                    "Ne fais rien d'autre."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Appelle get_file_contents avec project_id='{PROJECT_ID}', "
+                    f"file_path='{FILE_PATH}', ref='{GITLAB_REF}'."
+                ),
+            },
+        ]
+        return tool, messages
 
-        msg = resp.choices[0].message
-        messages.append({"role": "assistant", "content": msg.content or ""})
-
-        if not msg.tool_calls:
-            print("[OK] No more tool calls. Stop.")
-            return messages
-
-        for tc in msg.tool_calls:
-            name = tc.function.name
-            raw_args = tc.function.arguments or "{}"
-            args = inject_defaults(safe_json_loads(raw_args))
-
-            print(f"[TOOL_CALL] {name} args={args}")
-
-            tool_res = await mcp.call_tool(name, args)
-            tool_content = dumps_truncated(tool_res)
-
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "name": name,
-                    "content": tool_content,
-                }
-            )
-            print(f"[TOOL_RESULT] {name} chars={len(tool_content)}")
-
-    print("[WARN] max_steps reached.")
-    return messages
+    raise ValueError("STEP doit être 1, 2 ou 3.")
 
 # -----------------------------------------------------------------------------
 async def main():
@@ -211,10 +158,13 @@ async def main():
     if not GITLAB_MCP_URL:
         raise RuntimeError("GITLAB_MCP_URL manquant.")
 
-    print("=== TEST AI → MCP GitLab (proxy) tool-loop ===")
+    print("=== TEST AI → MCP GitLab (proxy) single-step ===")
+    print(f"- STEP          : {STEP}")
     print(f"- GITLAB_MCP_URL : {GITLAB_MCP_URL}")
     print(f"- PROJECT_ID     : {PROJECT_ID}")
     print(f"- REF            : {GITLAB_REF}")
+    print(f"- REPO_PATH      : {REPO_PATH}")
+    print(f"- FILE_PATH      : {FILE_PATH}")
     print(f"- MODEL          : {LLM_MODEL}")
     print(f"- PROXY_URL      : {PROXY_URL or '(none)'}")
     print("--------------------------------------------------")
@@ -223,7 +173,7 @@ async def main():
 
     async with httpx.AsyncClient(
         proxy=proxy,
-        verify=False,          # corporate MITM / SSL inspect
+        verify=False,
         follow_redirects=False,
         timeout=180.0,
     ) as http_client:
@@ -231,7 +181,7 @@ async def main():
         async_client = AsyncOpenAI(
             api_key=LLM_API_KEY,
             base_url=LLM_BASE_URL,
-            http_client=http_client,   # ✅ IMPORTANT (proxy)
+            http_client=http_client,
         )
 
         transport_cm, mcp = await open_mcp(GITLAB_MCP_URL)
@@ -241,57 +191,37 @@ async def main():
             openai_tools = mcp_tools_to_openai(tools_resp)
             tool_names = [t["function"]["name"] for t in openai_tools]
 
-            print(f"[OK] Tools exposés: {len(tool_names)}")
-            print(" - " + "\n - ".join(tool_names[:35]) + ("...\n" if len(tool_names) > 35 else "\n"))
+            expected_tool, messages = build_messages_for_step(STEP)
 
-            required = ["get_project", "get_repository_tree", "get_file_contents"]
-            missing = [x for x in required if x not in tool_names]
-            if missing:
-                print("[WARN] Tools manquants:", missing)
-                print("On peut quand même tester get_project si dispo.")
+            if expected_tool not in tool_names:
+                raise RuntimeError(f"Tool {expected_tool} introuvable côté MCP GitLab.")
 
-            system = (
-                "Tu es un agent qui pilote GitLab via MCP.\n"
-                "Objectif: vérifier l'accès au repo.\n"
-                "Tu dois exécuter EXACTEMENT ces actions, dans cet ordre:\n"
-                "1) get_project(project_id)\n"
-                "2) get_repository_tree(project_id, path='doc', ref)\n"
-                "   - si ça échoue ou vide: get_repository_tree(project_id, path='', ref)\n"
-                "3) get_file_contents(project_id, file_path='doc/convention.md', ref)\n"
-                "Puis tu termines par une réponse texte courte: "
-                "résumé du projet + est-ce qu'on a trouvé doc/convention.md.\n"
-                "Important:\n"
-                "- 'path' = chemin DANS le repo GitLab (pas local).\n"
-                "- Utilise project_id numérique.\n"
-            )
-
-            user = f"Fais le check d'accès pour project_id={PROJECT_ID} ref={GITLAB_REF}."
-
-            messages: List[Dict[str, Any]] = [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ]
-
-            messages = await run_tool_loop(
-                async_client=async_client,
-                mcp=mcp,
-                openai_tools=openai_tools,
+            resp = await async_client.chat.completions.create(
+                model=LLM_MODEL,
                 messages=messages,
-                max_steps=8,
+                tools=openai_tools,
+                tool_choice="auto",
+                temperature=0.0,
             )
 
-            # Affiche la dernière réponse assistant (résumé)
-            final_assistant = ""
-            for m in reversed(messages):
-                if m["role"] == "assistant" and (m.get("content") or "").strip():
-                    final_assistant = m["content"].strip()
-                    break
+            msg = resp.choices[0].message
+            if not msg.tool_calls:
+                print("❌ Aucun tool_call généré par le modèle.")
+                print("Assistant message:", msg)
+                return
 
-            print("\n=== FINAL ASSISTANT OUTPUT ===")
-            print(final_assistant or "(no final text)")
+            for tc in msg.tool_calls:
+                name = tc.function.name
+                args = json.loads(tc.function.arguments or "{}")
+
+                print(f"\n[TOOL_CALL] {name} args={args}")
+
+                result = await mcp.call_tool(name, args)
+
+                print("\n=== RESULT (raw) ===")
+                print(json.dumps(normalize(result), ensure_ascii=False, indent=2))
 
         finally:
-            # fermeture MCP propre
             try:
                 await mcp.__aexit__(None, None, None)
             except Exception:
@@ -302,7 +232,6 @@ async def main():
                 pass
 
     print("\n--- DONE ---")
-
 
 if __name__ == "__main__":
     asyncio.run(main())
