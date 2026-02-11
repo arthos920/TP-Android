@@ -41,13 +41,11 @@ from openai import AsyncOpenAI
 # -----------------------------------------------------------------------------
 MCP_IMPORT_ERROR = None
 try:
-    # Souvent: modelcontextprotocol/python mcp
     from mcp.client.streamable_http import streamable_http_client  # type: ignore
     from mcp.client.session import ClientSession  # type: ignore
 except Exception as e1:
     MCP_IMPORT_ERROR = e1
     try:
-        # Autres variantes possibles selon lib
         from mcpclient.streamable_http import streamable_http_client  # type: ignore
         from mcpclient.session import ClientSession  # type: ignore
         MCP_IMPORT_ERROR = None
@@ -58,13 +56,13 @@ except Exception as e1:
 # -----------------------------------------------------------------------------
 # Config
 # -----------------------------------------------------------------------------
-JIRA_KEY = ""
+JIRA_KEY = "6"
 CONFLUENCE_SEARCH_KEYWORD = "architecture"
 
 OPENAI_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
 OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "").strip() or None
-MODEL_PLANNER = os.environ.get("OPENAI_MODEL_PLANNER", "-").strip()
-MODEL_WRITER = os.environ.get("OPENAI_MODEL_WRITER", "-").strip()
+MODEL_PLANNER = os.environ.get("OPENAI_MODEL_PLANNER", "magistral-2509").strip()
+MODEL_WRITER = os.environ.get("OPENAI_MODEL_WRITER", "magistral-2509").strip()
 
 JIRA_MCP_URL = os.environ.get("JIRA_MCP_URL", "").strip()
 GITLAB_MCP_URL = os.environ.get("GITLAB_MCP_URL", "").strip()
@@ -72,23 +70,23 @@ GITLAB_MCP_URL = os.environ.get("GITLAB_MCP_URL", "").strip()
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "./generated")).resolve()
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+
 # -----------------------------------------------------------------------------
 # Helpers
 # -----------------------------------------------------------------------------
 def _print_stream(prefix: str, text: str) -> None:
-    # streaming console-friendly
     print(f"{prefix}{text}", end="", flush=True)
 
 
 def extract_json_object(text: str) -> Dict[str, Any]:
     """
-    Essaie de récupérer un JSON objet depuis une sortie modèle (qui peut contenir du bruit).
+    Récupère un JSON objet depuis une sortie modèle (peut contenir du bruit).
     """
     text = text.strip()
     if not text:
         raise ValueError("Réponse vide, impossible de parser le JSON.")
 
-    # 1) Si c'est déjà JSON
+    # 1) Déjà JSON
     try:
         obj = json.loads(text)
         if isinstance(obj, dict):
@@ -96,8 +94,7 @@ def extract_json_object(text: str) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # 2) Cherche le premier {...} équilibré
-    #    (simple mais efficace pour récupérer un JSON unique)
+    # 2) Premier {...} équilibré
     m = re.search(r"\{", text)
     if not m:
         raise ValueError("Aucun '{' trouvé, impossible de parser le JSON.")
@@ -124,81 +121,6 @@ def extract_json_object(text: str) -> Dict[str, Any]:
     return obj
 
 
-# -----------------------------------------------------------------------------
-# MCP Adapter
-# -----------------------------------------------------------------------------
-@dataclass
-class MCPTool:
-    name: str
-    description: str
-    input_schema: Dict[str, Any]
-
-
-class MCPClient:
-    """
-    Client MCP minimal:
-    - Connect streamable-http
-    - list_tools
-    - call_tool
-    """
-
-    def __init__(self, url: str):
-        if MCP_IMPORT_ERROR is not None:
-            raise RuntimeError(
-                f"Impossible d'importer le client MCP python. Erreur: {MCP_IMPORT_ERROR}"
-            )
-        if not url:
-            raise ValueError("URL MCP vide.")
-        self.url = url
-        self._session = None
-        self._cm = None  # async context manager (session)
-        self._transport_close = None
-
-    async def __aenter__(self) -> "MCPClient":
-        read_stream, write_stream, closer = await open_streamable_http(self.url)
-
-        # Session MCP
-        self._session = ClientSession(read_stream, write_stream)
-        self._cm = self._session
-        self._transport_close = closer
-
-        await self._session.__aenter__()
-        # Certaines implémentations nécessitent initialize()
-        if hasattr(self._session, "initialize"):
-            await self._session.initialize()
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb) -> None:
-        if self._session is not None:
-            await self._session.__aexit__(exc_type, exc, tb)
-        if callable(self._transport_close):
-            try:
-                await maybe_await(self._transport_close())
-            except Exception:
-                pass
-
-    async def list_tools(self) -> List[MCPTool]:
-        assert self._session is not None
-        resp = await self._session.list_tools()
-        tools: List[MCPTool] = []
-        for t in getattr(resp, "tools", resp):  # selon impl
-            name = getattr(t, "name", None) or t.get("name")
-            desc = getattr(t, "description", None) or t.get("description", "") or ""
-            schema = getattr(t, "inputSchema", None) or t.get("inputSchema") or {}
-            tools.append(MCPTool(name=name, description=desc, input_schema=schema))
-        return tools
-
-    async def call_tool(self, name: str, arguments: Dict[str, Any]) -> Any:
-        assert self._session is not None
-        # MCP call_tool signature: call_tool(name, arguments)
-        resp = await self._session.call_tool(name, arguments)
-        # resp.content peut être une liste d'objets TextContent, etc.
-        # On renvoie du "serializable" au mieux:
-        if hasattr(resp, "content"):
-            return normalize_mcp_content(resp.content)
-        return normalize_mcp_content(resp)
-
-
 async def maybe_await(x):
     if inspect.isawaitable(x):
         return await x
@@ -207,7 +129,7 @@ async def maybe_await(x):
 
 def normalize_mcp_content(content: Any) -> Any:
     """
-    Évite les erreurs du style "TextContent not JSON serializable".
+    Évite "TextContent is not JSON serializable".
     Transforme en dict/list/str.
     """
     if content is None:
@@ -219,28 +141,35 @@ def normalize_mcp_content(content: Any) -> Any:
     if isinstance(content, list):
         return [normalize_mcp_content(x) for x in content]
 
-    # Objets MCP typiques: TextContent avec .type et .text
+    # TextContent-like: .type / .text
     if hasattr(content, "type") and hasattr(content, "text"):
         return {"type": getattr(content, "type"), "text": getattr(content, "text")}
 
-    # Si c'est un objet composite (ex: list de TextContent)
     if hasattr(content, "__dict__"):
-        d = {}
-        for k, v in content.__dict__.items():
-            d[k] = normalize_mcp_content(v)
-        return d
+        return {k: normalize_mcp_content(v) for k, v in content.__dict__.items()}
 
     return str(content)
 
 
-async def open_streamable_http(url: str, headers: Optional[Dict[str, str]] = None):
-    """
-    Ouvre le transport streamable-http MCP en gérant les variations de signature/retour.
-    - Certaines versions: streamable_http_client(url) -> (read, write)
-    - D'autres: streamable_http_client(url) -> (read, write, close)
-    - Certaines acceptent headers, d'autres non.
+# -----------------------------------------------------------------------------
+# MCP Adapter (FIXED)
+# -----------------------------------------------------------------------------
+@dataclass
+class MCPTool:
+    name: str
+    description: str
+    input_schema: Dict[str, Any]
 
-    Retourne: (read_stream, write_stream, closer_fn_or_None)
+
+async def open_streamable_http_cm(
+    url: str,
+    headers: Optional[Dict[str, str]] = None,
+):
+    """
+    FIX IMPORTANT:
+    - On conserve le *context manager* streamable_http_client(...) vivant
+    - On appelle __aexit__(exc_type, exc, tb) plus tard, dans le même flow
+    => évite anyio cancel scope errors + "client closed".
     """
     sig = None
     try:
@@ -249,57 +178,101 @@ async def open_streamable_http(url: str, headers: Optional[Dict[str, str]] = Non
         sig = None
 
     kwargs = {}
-    if headers:
-        # n'injecte headers que si supporté
-        if sig and "headers" in sig.parameters:
-            kwargs["headers"] = headers
+    if headers and sig and "headers" in sig.parameters:
+        kwargs["headers"] = headers
 
-    # Appel
-    res = streamable_http_client(url, **kwargs) if kwargs else streamable_http_client(url)
+    cm = streamable_http_client(url, **kwargs) if kwargs else streamable_http_client(url)
 
-    # res est souvent un async context manager
-    # certaines libs: async with streamable_http_client(url) as (r,w): ...
-    # Ici on supporte les 2 patterns:
-    if hasattr(res, "__aenter__"):
-        cm = res
+    if not hasattr(cm, "__aenter__"):
+        # fallback rare: retour tuple direct
+        if isinstance(cm, tuple) and len(cm) >= 2:
+            read_stream, write_stream = cm[0], cm[1]
+            return None, read_stream, write_stream
+        raise RuntimeError(f"streamable_http_client inattendu: {cm}")
 
-        entered = await cm.__aenter__()
-        # entered peut être (read, write) ou (read, write, close) ou autre
-        if isinstance(entered, tuple):
-            if len(entered) == 2:
-                read_stream, write_stream = entered
-                return read_stream, write_stream, cm.__aexit__
-            if len(entered) >= 3:
-                read_stream, write_stream = entered[0], entered[1]
-                # si un closer est déjà fourni
-                closer = entered[2] if callable(entered[2]) else cm.__aexit__
-                return read_stream, write_stream, closer
-        # fallback: on suppose que cm fournit read/write ailleurs (rare)
-        raise RuntimeError(
-            f"Format de retour streamable_http_client inconnu: {type(entered)} / {entered}"
-        )
+    entered = await cm.__aenter__()
+    if not isinstance(entered, tuple) or len(entered) < 2:
+        # parfois le cm retourne un objet transport ; dans ce cas tu devras adapter
+        raise RuntimeError(f"Format retour streamable_http_client inconnu: {entered}")
 
-    # fallback: res direct tuple
-    if isinstance(res, tuple):
-        if len(res) == 2:
-            return res[0], res[1], None
-        if len(res) >= 3:
-            return res[0], res[1], res[2]
-    raise RuntimeError(f"Format streamable_http_client inattendu: {res}")
+    read_stream, write_stream = entered[0], entered[1]
+    return cm, read_stream, write_stream
+
+
+class MCPClient:
+    """
+    Client MCP minimal:
+    - Connect streamable-http
+    - list_tools
+    - call_tool
+    FIX: fermeture propre du context manager streamable_http_client (pas de closer bricolé)
+    """
+
+    def __init__(self, url: str):
+        if MCP_IMPORT_ERROR is not None:
+            raise RuntimeError(f"Impossible d'importer le client MCP python. Erreur: {MCP_IMPORT_ERROR}")
+        if not url:
+            raise ValueError("URL MCP vide.")
+        self.url = url
+        self._session: Optional[ClientSession] = None
+        self._transport_cm = None  # <= on garde le CM vivant
+
+    async def __aenter__(self) -> "MCPClient":
+        self._transport_cm, read_stream, write_stream = await open_streamable_http_cm(self.url)
+
+        self._session = ClientSession(read_stream, write_stream)
+        await self._session.__aenter__()
+
+        # Certaines implémentations nécessitent initialize()
+        if hasattr(self._session, "initialize"):
+            await self._session.initialize()
+
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb) -> None:
+        # 1) fermer la session MCP
+        if self._session is not None:
+            try:
+                await self._session.__aexit__(exc_type, exc, tb)
+            except Exception:
+                pass
+            self._session = None
+
+        # 2) fermer le transport CM streamable_http_client
+        if self._transport_cm is not None:
+            try:
+                await self._transport_cm.__aexit__(exc_type, exc, tb)
+            except Exception:
+                pass
+            self._transport_cm = None
+
+    async def list_tools(self) -> List[MCPTool]:
+        assert self._session is not None
+        resp = await self._session.list_tools()
+        tools: List[MCPTool] = []
+        for t in getattr(resp, "tools", resp):
+            name = getattr(t, "name", None) or t.get("name")
+            desc = getattr(t, "description", None) or t.get("description", "") or ""
+            schema = getattr(t, "inputSchema", None) or t.get("inputSchema") or {}
+            tools.append(MCPTool(name=name, description=desc, input_schema=schema))
+        return tools
+
+    async def call_tool(self, name: str, arguments: Dict[str, Any]) -> Any:
+        assert self._session is not None
+        resp = await self._session.call_tool(name, arguments)
+        if hasattr(resp, "content"):
+            return normalize_mcp_content(resp.content)
+        return normalize_mcp_content(resp)
 
 
 # -----------------------------------------------------------------------------
 # OpenAI Tool loop (async + streaming)
 # -----------------------------------------------------------------------------
 def mcp_tools_to_openai(tools: List[MCPTool]) -> List[Dict[str, Any]]:
-    """
-    Convert MCP tool schema to OpenAI 'tools' (functions).
-    """
     openai_tools = []
     for t in tools:
         schema = t.input_schema or {}
         if not schema:
-            # schema minimal
             schema = {"type": "object", "properties": {}, "additionalProperties": True}
 
         openai_tools.append(
@@ -326,7 +299,7 @@ async def chat_with_tools_streaming(
     temperature: float = 0.2,
 ) -> Tuple[str, List[Dict[str, Any]]]:
     """
-    Exécute un loop tool-calling avec streaming.
+    Loop tool-calling avec streaming.
     Retourne: (final_text, final_messages)
     """
     final_text = ""
@@ -334,7 +307,6 @@ async def chat_with_tools_streaming(
     for round_idx in range(1, max_rounds + 1):
         _print_stream(prefix, f"\n--- round {round_idx} ---\n")
 
-        # Stream call
         stream = await client.chat.completions.create(
             model=model,
             messages=messages,
@@ -345,20 +317,17 @@ async def chat_with_tools_streaming(
         )
 
         assistant_text_parts: List[str] = []
-        tool_calls_acc: Dict[int, Dict[str, Any]] = {}  # index -> {id,name,args_str}
+        tool_calls_acc: Dict[int, Dict[str, Any]] = {}
 
         async for chunk in stream:
             choice = chunk.choices[0]
             delta = choice.delta
 
-            # texte
             if delta and getattr(delta, "content", None):
                 txt = delta.content
                 assistant_text_parts.append(txt)
                 _print_stream(prefix, txt)
 
-            # tool calls (streaming)
-            # delta.tool_calls: list of {index, id, function:{name, arguments}}
             if delta and getattr(delta, "tool_calls", None):
                 for tc in delta.tool_calls:
                     idx = tc.index
@@ -376,22 +345,21 @@ async def chat_with_tools_streaming(
         if assistant_text:
             final_text = assistant_text
 
-        # Si tool calls détectés, on les exécute
         if tool_calls_acc:
             messages.append({"role": "assistant", "content": assistant_text or ""})
 
-            # exécute chaque tool call dans l'ordre
             for _, tc in sorted(tool_calls_acc.items(), key=lambda x: x[0]):
                 name = tc["name"]
                 args_str = tc["arguments"] or "{}"
+
                 try:
                     args = json.loads(args_str) if args_str.strip() else {}
                 except Exception:
                     args = {"_raw": args_str}
 
-                _print_stream(prefix, f"\n[{prefix.strip()} TOOL_CALL] {name} args={args}\n")
+                _print_stream(prefix, f"\n[TOOL_CALL] {name} args={args}\n")
                 result = await tool_executor(name, args)
-                # on renvoie au modèle un tool message
+
                 messages.append(
                     {
                         "role": "tool",
@@ -400,9 +368,8 @@ async def chat_with_tools_streaming(
                         "content": json.dumps(result, ensure_ascii=False),
                     }
                 )
-            continue  # prochain round
+            continue
 
-        # pas de tool calls => on considère terminé
         return final_text, messages
 
     return final_text, messages
@@ -493,7 +460,6 @@ async def writer_generate_robot(openai_client: AsyncOpenAI, spec: Dict[str, Any]
         async def exec_tool(name: str, args: Dict[str, Any]) -> Any:
             return await git_mcp.call_tool(name, args)
 
-        # instruction au writer + injection de la spec
         writer_user = (
             "Voici la SPEC JSON (Planner). Utilise-la pour générer le fichier Robot Framework.\n\n"
             f"SPEC_JSON:\n{json.dumps(spec, ensure_ascii=False, indent=2)}\n\n"
@@ -519,20 +485,15 @@ async def writer_generate_robot(openai_client: AsyncOpenAI, spec: Dict[str, Any]
             temperature=0.1,
         )
 
-        # On garde texte brut (robot)
-        robot_text = text.strip()
-        return robot_text
+        return text.strip()
 
 
 def choose_output_path(spec: Dict[str, Any]) -> Path:
-    # cible proposée par Planner, sinon fallback
     target = (
         spec.get("rf", {}).get("target_path")
         or spec.get("rf", {}).get("output_path")
         or f"tests/generated/{JIRA_KEY}.robot"
     )
-    # On force une écriture locale dans OUTPUT_DIR
-    # (on reproduit l'arbo relative)
     rel = Path(str(target)).as_posix().lstrip("/")
     return OUTPUT_DIR / rel
 
@@ -545,7 +506,6 @@ async def main() -> None:
     if not GITLAB_MCP_URL:
         raise RuntimeError("GITLAB_MCP_URL manquant.")
 
-    # Client OpenAI (async)
     client = AsyncOpenAI(api_key=OPENAI_API_KEY, base_url=OPENAI_BASE_URL)
 
     print(f"== Flow 2 IA :: Jira={JIRA_KEY} ==")
@@ -572,7 +532,6 @@ async def main() -> None:
     out_path.write_text(robot_text + "\n", encoding="utf-8")
     print(f"\n[OK] Robot généré en local: {out_path}")
 
-    # petit résumé console
     print("\n--- DONE ---")
     print(f"Spec : {spec_path}")
     print(f"Robot: {out_path}")
