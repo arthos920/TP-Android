@@ -4,10 +4,8 @@ import asyncio
 import inspect
 import json
 import os
-import re
 from dataclasses import dataclass
-from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
 from openai import AsyncOpenAI
 
@@ -35,8 +33,10 @@ OPENAI_BASE_URL = os.environ.get("OPENAI_BASE_URL", "").strip() or None
 OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "magistral-2509").strip()
 
 GITLAB_MCP_URL = os.environ.get("GITLAB_MCP_URL", "").strip()
-GITLAB_PROJECT_ID = os.environ.get("GITLAB_PROJECT_ID", "").strip()  # recommandé si ton MCP le demande
-GITLAB_REF = os.environ.get("GITLAB_REF", "").strip() or ""          # ex: main/master
+
+# ✅ ID NUMÉRIQUE (obligatoire pour ton cas)
+GITLAB_PROJECT_ID = os.environ.get("GITLAB_PROJECT_ID", "").strip()  # ex: "1234"
+GITLAB_REF = os.environ.get("GITLAB_REF", "").strip() or "main"      # défaut main
 
 # limites lecture
 MAX_FILE_CHARS = int(os.environ.get("MAX_FILE_CHARS", "14000"))
@@ -85,7 +85,6 @@ def extract_text_from_file_result(res: Any) -> str:
             v = res.get(k)
             if isinstance(v, str):
                 return v
-        # parfois payload nested
         if "result" in res and isinstance(res["result"], str):
             return res["result"]
         return json.dumps(res, ensure_ascii=False, indent=2)
@@ -191,19 +190,21 @@ def build_tool_param_index(tools: List[MCPTool]) -> Dict[str, set]:
     return idx
 
 def maybe_inject_common_args(tool_params: set, args: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    ✅ FIX: on force project_id (numérique) + ref si les paramètres existent.
+    """
     args = dict(args or {})
-    # project id
+
+    # project id (obligatoire)
     if GITLAB_PROJECT_ID:
-        for k in ("project_id", "projectId", "project", "id"):
-            if k in tool_params and k not in args:
-                args[k] = GITLAB_PROJECT_ID
-                break
+        if "project_id" in tool_params and "project_id" not in args:
+            args["project_id"] = GITLAB_PROJECT_ID
+
     # ref/branch
     if GITLAB_REF:
-        for k in ("ref", "branch", "branch_name"):
-            if k in tool_params and k not in args:
-                args[k] = GITLAB_REF
-                break
+        if "ref" in tool_params and "ref" not in args:
+            args["ref"] = GITLAB_REF
+
     return args
 
 async def call_gitlab(mcp: MCPClient, tool_params_index: Dict[str, set], name: str, args: Dict[str, Any]) -> Any:
@@ -215,31 +216,32 @@ async def call_gitlab(mcp: MCPClient, tool_params_index: Dict[str, set], name: s
 # Repo exploration (read-only)
 # -----------------------------------------------------------------------------
 async def try_read_file(mcp: MCPClient, idx: Dict[str, set], path: str) -> Optional[str]:
-    """
-    Essaie plusieurs schémas d'args fréquemment rencontrés.
-    """
-    # variantes
     variants = [
-        {"path": path},
         {"file_path": path},
+        {"path": path},
         {"filepath": path},
     ]
+    last_err = None
     for v in variants:
         try:
             res = await call_gitlab(mcp, idx, "get_file_contents", v)
             txt = extract_text_from_file_result(res)
             if txt:
                 return txt
-        except Exception:
+        except Exception as e:
+            last_err = e
             continue
     return None
 
 async def get_repo_tree(mcp: MCPClient, idx: Dict[str, set], path: str = "") -> Any:
+    """
+    ✅ FIX PRINCIPAL: get_repository_tree DOIT recevoir project_id + ref
+    et on passe path explicitement.
+    """
     variants = [
-        {"path": path, "recursive": True},
-        {"path": path},
-        {"recursive": True},
-        {},
+        {"project_id": GITLAB_PROJECT_ID, "ref": GITLAB_REF, "path": path, "recursive": True},
+        {"project_id": GITLAB_PROJECT_ID, "ref": GITLAB_REF, "path": path, "recursive": False},
+        {"project_id": GITLAB_PROJECT_ID, "ref": GITLAB_REF, "path": path},
     ]
     last_err = None
     for v in variants:
@@ -250,9 +252,6 @@ async def get_repo_tree(mcp: MCPClient, idx: Dict[str, set], path: str = "") -> 
     raise RuntimeError(f"get_repository_tree a échoué. Dernière erreur: {last_err}")
 
 def collect_paths_from_tree(tree: Any) -> List[str]:
-    """
-    Essaie d'extraire une liste de chemins depuis différentes structures de tree.
-    """
     tree = normalize_mcp_content(tree)
     paths: List[str] = []
 
@@ -263,7 +262,6 @@ def collect_paths_from_tree(tree: Any) -> List[str]:
                 if isinstance(p, str):
                     paths.append(p)
     elif isinstance(tree, dict):
-        # parfois sous "items", "tree", "result"
         for key in ("items", "tree", "result", "data"):
             v = tree.get(key)
             if isinstance(v, list):
@@ -317,13 +315,18 @@ async def main():
         raise RuntimeError("OPENAI_API_KEY manquant.")
     if not GITLAB_MCP_URL:
         raise RuntimeError("GITLAB_MCP_URL manquant.")
+    if not GITLAB_PROJECT_ID:
+        raise RuntimeError(
+            "GITLAB_PROJECT_ID manquant (ID numérique). "
+            "➡️ Exporte GITLAB_PROJECT_ID=1234"
+        )
     if MCP_IMPORT_ERROR is not None:
         raise RuntimeError(f"Lib MCP python non importable: {MCP_IMPORT_ERROR}")
 
     print("== GitLab MCP access test + synthèse ==")
     print(f"- GITLAB_MCP_URL    : {GITLAB_MCP_URL}")
-    print(f"- GITLAB_PROJECT_ID : {GITLAB_PROJECT_ID or '(non fourni)'}")
-    print(f"- GITLAB_REF        : {GITLAB_REF or '(non fourni)'}")
+    print(f"- GITLAB_PROJECT_ID : {GITLAB_PROJECT_ID}")
+    print(f"- GITLAB_REF        : {GITLAB_REF}")
     print(f"- MODEL             : {OPENAI_MODEL}")
     print("--------------------------------------------------")
 
@@ -368,7 +371,6 @@ async def main():
             tree = await get_repo_tree(mcp, tool_index, path="")
             tree_paths = collect_paths_from_tree(tree)
 
-            # filtre .robot (priorité tests/)
             robots = [p for p in tree_paths if isinstance(p, str) and p.lower().endswith(".robot")]
             robots_tests = [p for p in robots if p.startswith("tests/") or p.startswith("test/")]
             pick = robots_tests[:2] if robots_tests else robots[:2]
@@ -378,11 +380,10 @@ async def main():
                 if txt:
                     robot_samples.append({"path": rp, "content": truncate(txt, 9000)})
 
-        # 4) Construire payload pour synthèse
         payload = {
             "access_ok": True,
-            "project_id_used": GITLAB_PROJECT_ID or None,
-            "ref_used": GITLAB_REF or None,
+            "project_id_used": GITLAB_PROJECT_ID,
+            "ref_used": GITLAB_REF,
             "files_read": [],
             "convention_md": {"path": convention_path, "content": truncate(convention_text or "", 9000)},
             "readme": truncate(readme_text or "", 6000),
@@ -406,8 +407,7 @@ async def main():
         if not convention_text:
             print(
                 "\n[WARN] doc/convention.md n'a pas été trouvé/lu. "
-                "Si ton repo l'a bien, c'est probablement parce que ton MCP GitLab exige project_id/ref.\n"
-                "➡️ Mets GITLAB_PROJECT_ID et GITLAB_REF en variables d'environnement."
+                "Si ton repo l'a bien, c'est probablement un mauvais file_path, ref, ou droits.\n"
             )
 
     print("\n--- DONE ---")
