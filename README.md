@@ -1,12 +1,9 @@
-# test_gitlab_ai_single_tool_steps_proxy.py
-# Même script minimal, mais tu choisis quel tool appeler (1/2/3) en modifiant STEP.
-
 from __future__ import annotations
 
 import asyncio
 import json
 import os
-from typing import Any, Dict, List, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from openai import AsyncOpenAI
@@ -34,13 +31,11 @@ GITLAB_MCP_URL = os.environ.get("GITLAB_MCP_URL", "http://localhost:9001/mcp").s
 PROJECT_ID = os.environ.get("GITLAB_PROJECT_ID", "10").strip()
 GITLAB_REF = os.environ.get("GITLAB_REF", "main").strip()
 
-# Choisis l'étape: 1=get_project, 2=get_repository_tree, 3=get_file_contents
-STEP = int(os.environ.get("STEP", "1"))
+MAX_CHARS = int(os.environ.get("MAX_CHARS", "12000"))
+MAX_ROBOT_SAMPLES = int(os.environ.get("MAX_ROBOT_SAMPLES", "2"))
 
-# Pour tree/file
-REPO_PATH = os.environ.get("REPO_PATH", "doc").strip()            # dossier dans le repo
-FILE_PATH = os.environ.get("FILE_PATH", "doc/convention.md").strip()  # fichier dans le repo
-
+# -----------------------------------------------------------------------------
+# Helpers
 # -----------------------------------------------------------------------------
 def normalize(x: Any) -> Any:
     if x is None:
@@ -56,6 +51,38 @@ def normalize(x: Any) -> Any:
     if hasattr(x, "__dict__"):
         return normalize(x.__dict__)
     return str(x)
+
+def truncate(s: str, n: int = MAX_CHARS) -> str:
+    s = s or ""
+    if len(s) <= n:
+        return s
+    return s[:n] + "\n...[TRUNCATED]..."
+
+def extract_text(result: Any) -> str:
+    """
+    gitlab-mcp peut renvoyer list[TextContent] ou dict etc.
+    """
+    r = normalize(result)
+    if r is None:
+        return ""
+    if isinstance(r, str):
+        return r
+    if isinstance(r, list):
+        parts = []
+        for item in r:
+            if isinstance(item, dict) and "text" in item:
+                parts.append(str(item["text"]))
+            else:
+                parts.append(str(item))
+        return "\n".join(parts)
+    if isinstance(r, dict):
+        # selon impl
+        for k in ("content", "text", "file_content", "body", "data", "result"):
+            v = r.get(k)
+            if isinstance(v, str):
+                return v
+        return json.dumps(r, ensure_ascii=False, indent=2)
+    return str(r)
 
 async def open_mcp(url: str):
     cm = streamable_http_client(url)
@@ -87,69 +114,101 @@ def mcp_tools_to_openai(tools_resp: Any) -> List[Dict[str, Any]]:
         )
     return out
 
+async def llm_force_one_tool_call(
+    llm: AsyncOpenAI,
+    model: str,
+    tools: List[Dict[str, Any]],
+    tool_name: str,
+    user_instruction: str,
+) -> Dict[str, Any]:
+    """
+    Demande au modèle de générer UN tool_call (et seulement celui-là).
+    Retourne args dict.
+    """
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                f"Tu dois appeler EXACTEMENT le tool {tool_name}. "
+                "Ne réponds pas en texte normal. "
+                "Ne fais qu'un seul tool_call."
+            ),
+        },
+        {"role": "user", "content": user_instruction},
+    ]
+
+    resp = await llm.chat.completions.create(
+        model=model,
+        messages=messages,
+        tools=tools,
+        tool_choice="auto",
+        temperature=0.0,
+    )
+
+    msg = resp.choices[0].message
+    if not msg.tool_calls:
+        raise RuntimeError(f"Aucun tool_call généré pour {tool_name}")
+
+    tc = msg.tool_calls[0]
+    if tc.function.name != tool_name:
+        raise RuntimeError(f"Le modèle a appelé {tc.function.name} au lieu de {tool_name}")
+
+    args = json.loads(tc.function.arguments or "{}")
+    return args
+
+def collect_paths_from_tree(tree_res: Any) -> List[str]:
+    t = normalize(tree_res)
+    paths: List[str] = []
+
+    # souvent: list[{"path": "...", "type": "blob/tree"}]
+    if isinstance(t, list):
+        for it in t:
+            if isinstance(it, dict):
+                p = it.get("path") or it.get("name")
+                if isinstance(p, str):
+                    paths.append(p)
+        return paths
+
+    # parfois: dict avec "items"/"data"
+    if isinstance(t, dict):
+        for key in ("items", "tree", "data", "result"):
+            v = t.get(key)
+            if isinstance(v, list):
+                for it in v:
+                    if isinstance(it, dict):
+                        p = it.get("path") or it.get("name")
+                        if isinstance(p, str):
+                            paths.append(p)
+    return paths
+
 # -----------------------------------------------------------------------------
-def build_messages_for_step(step: int) -> Tuple[str, List[Dict[str, str]]]:
-    """
-    Retourne (expected_tool_name, messages)
-    """
-    if step == 1:
-        tool = "get_project"
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "Tu dois appeler EXACTEMENT le tool get_project avec l'argument project_id (string). "
-                    "Ne fais rien d'autre."
-                ),
-            },
-            {"role": "user", "content": f"Appelle get_project avec project_id='{PROJECT_ID}'."},
-        ]
-        return tool, messages
+# Synthesis (no tools)
+# -----------------------------------------------------------------------------
+async def synthesize(llm: AsyncOpenAI, payload: Dict[str, Any]) -> str:
+    system = (
+        "Tu es un expert QA Automation (Robot Framework). "
+        "On te donne des extraits d'un repo GitLab (conventions + structure + exemples). "
+        "Produis une synthèse actionnable pour générer de nouveaux tests.\n\n"
+        "Format attendu:\n"
+        "1) Accès repo (OK/KO) + infos projet\n"
+        "2) Architecture repo (dossiers clés)\n"
+        "3) Conventions Robot Framework (naming, tags, setup/teardown, resources)\n"
+        "4) Patterns repérés dans les suites (structure, variables, imports)\n"
+        "5) Liste des keywords/ressources importants (si visibles)\n"
+        "6) Checklist pour générer une nouvelle suite .robot conforme\n"
+        "Cite les fichiers utilisés."
+    )
 
-    if step == 2:
-        tool = "get_repository_tree"
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "Tu dois appeler EXACTEMENT le tool get_repository_tree avec les arguments: "
-                    "project_id (string), path (string dans le repo), ref (branche). "
-                    "Ne fais rien d'autre."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Appelle get_repository_tree avec project_id='{PROJECT_ID}', "
-                    f"path='{REPO_PATH}', ref='{GITLAB_REF}'."
-                ),
-            },
-        ]
-        return tool, messages
+    user = "PAYLOAD:\n" + json.dumps(payload, ensure_ascii=False, indent=2)
 
-    if step == 3:
-        tool = "get_file_contents"
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "Tu dois appeler EXACTEMENT le tool get_file_contents avec les arguments: "
-                    "project_id (string), file_path (string dans le repo), ref (branche). "
-                    "ATTENTION: l'argument s'appelle file_path (pas path). "
-                    "Ne fais rien d'autre."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Appelle get_file_contents avec project_id='{PROJECT_ID}', "
-                    f"file_path='{FILE_PATH}', ref='{GITLAB_REF}'."
-                ),
-            },
-        ]
-        return tool, messages
+    resp = await llm.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
+        temperature=0.2,
+        max_tokens=1400,
+    )
 
-    raise ValueError("STEP doit être 1, 2 ou 3.")
+    return (resp.choices[0].message.content or "").strip()
 
 # -----------------------------------------------------------------------------
 async def main():
@@ -158,15 +217,12 @@ async def main():
     if not GITLAB_MCP_URL:
         raise RuntimeError("GITLAB_MCP_URL manquant.")
 
-    print("=== TEST AI → MCP GitLab (proxy) single-step ===")
-    print(f"- STEP          : {STEP}")
-    print(f"- GITLAB_MCP_URL : {GITLAB_MCP_URL}")
-    print(f"- PROJECT_ID     : {PROJECT_ID}")
-    print(f"- REF            : {GITLAB_REF}")
-    print(f"- REPO_PATH      : {REPO_PATH}")
-    print(f"- FILE_PATH      : {FILE_PATH}")
-    print(f"- MODEL          : {LLM_MODEL}")
-    print(f"- PROXY_URL      : {PROXY_URL or '(none)'}")
+    print("=== GitLab MCP → collecte → synthèse ===")
+    print(f"- MCP URL   : {GITLAB_MCP_URL}")
+    print(f"- Project   : {PROJECT_ID}")
+    print(f"- Ref       : {GITLAB_REF}")
+    print(f"- Model     : {LLM_MODEL}")
+    print(f"- Proxy     : {PROXY_URL or '(none)'}")
     print("--------------------------------------------------")
 
     proxy = httpx.Proxy(url=PROXY_URL) if PROXY_URL else None
@@ -178,7 +234,7 @@ async def main():
         timeout=180.0,
     ) as http_client:
 
-        async_client = AsyncOpenAI(
+        llm = AsyncOpenAI(
             api_key=LLM_API_KEY,
             base_url=LLM_BASE_URL,
             http_client=http_client,
@@ -191,35 +247,140 @@ async def main():
             openai_tools = mcp_tools_to_openai(tools_resp)
             tool_names = [t["function"]["name"] for t in openai_tools]
 
-            expected_tool, messages = build_messages_for_step(STEP)
+            for needed in ("get_project", "get_repository_tree", "get_file_contents"):
+                if needed not in tool_names:
+                    print(f"[WARN] Tool manquant: {needed}")
 
-            if expected_tool not in tool_names:
-                raise RuntimeError(f"Tool {expected_tool} introuvable côté MCP GitLab.")
+            payload: Dict[str, Any] = {
+                "project_id": PROJECT_ID,
+                "ref": GITLAB_REF,
+                "files_used": [],
+                "project": None,
+                "tree_root_preview": [],
+                "tree_docs_preview": [],
+                "tree_tests_preview": [],
+                "convention": None,
+                "readme": None,
+                "robot_samples": [],
+            }
 
-            resp = await async_client.chat.completions.create(
-                model=LLM_MODEL,
-                messages=messages,
-                tools=openai_tools,
-                tool_choice="auto",
-                temperature=0.0,
-            )
+            # 1) get_project
+            if "get_project" in tool_names:
+                args = await llm_force_one_tool_call(
+                    llm,
+                    LLM_MODEL,
+                    openai_tools,
+                    "get_project",
+                    f"Appelle get_project avec project_id='{PROJECT_ID}'.",
+                )
+                project_res = await mcp.call_tool("get_project", args)
+                payload["project"] = normalize(project_res)
 
-            msg = resp.choices[0].message
-            if not msg.tool_calls:
-                print("❌ Aucun tool_call généré par le modèle.")
-                print("Assistant message:", msg)
-                return
+            # 2) repository tree (root + doc + tests) => ça aide à trouver les bons chemins
+            def tree_call(path: str) -> Any:
+                return mcp.call_tool(
+                    "get_repository_tree",
+                    {"project_id": PROJECT_ID, "path": path, "ref": GITLAB_REF, "recursive": True},
+                )
 
-            for tc in msg.tool_calls:
-                name = tc.function.name
-                args = json.loads(tc.function.arguments or "{}")
+            if "get_repository_tree" in tool_names:
+                root_tree = await tree_call("")
+                root_paths = collect_paths_from_tree(root_tree)
+                payload["tree_root_preview"] = root_paths[:120]
 
-                print(f"\n[TOOL_CALL] {name} args={args}")
+                docs_tree = await tree_call("doc")
+                docs_paths = collect_paths_from_tree(docs_tree)
+                payload["tree_docs_preview"] = docs_paths[:120]
 
-                result = await mcp.call_tool(name, args)
+                tests_tree = await tree_call("tests")
+                tests_paths = collect_paths_from_tree(tests_tree)
+                payload["tree_tests_preview"] = tests_paths[:120]
 
-                print("\n=== RESULT (raw) ===")
-                print(json.dumps(normalize(result), ensure_ascii=False, indent=2))
+                # 3) lire convention.md (trouver le bon chemin via previews)
+                convention_candidates = [
+                    "doc/convention.md",
+                    "docs/convention.md",
+                    "doc/conventions.md",
+                    "convention.md",
+                ]
+                # si le tree doc montre quelque chose proche, on pousse en tête
+                for p in docs_paths:
+                    if isinstance(p, str) and p.lower().endswith("convention.md"):
+                        convention_candidates.insert(0, p)
+
+                conv_text = None
+                conv_path = None
+                for p in convention_candidates:
+                    try:
+                        res = await mcp.call_tool(
+                            "get_file_contents",
+                            {"project_id": PROJECT_ID, "file_path": p, "ref": GITLAB_REF},
+                        )
+                        txt = extract_text(res).strip()
+                        if txt:
+                            conv_text = truncate(txt)
+                            conv_path = p
+                            break
+                    except Exception:
+                        continue
+
+                if conv_path:
+                    payload["files_used"].append(conv_path)
+                    payload["convention"] = {"path": conv_path, "content": conv_text}
+
+                # 4) README
+                for rp in ("README.md", "readme.md"):
+                    try:
+                        res = await mcp.call_tool(
+                            "get_file_contents",
+                            {"project_id": PROJECT_ID, "file_path": rp, "ref": GITLAB_REF},
+                        )
+                        txt = extract_text(res).strip()
+                        if txt:
+                            payload["files_used"].append(rp)
+                            payload["readme"] = {"path": rp, "content": truncate(txt, 8000)}
+                            break
+                    except Exception:
+                        pass
+
+                # 5) 1-2 exemples .robot
+                all_candidates = []
+                for p in tests_paths + root_paths:
+                    if isinstance(p, str) and p.lower().endswith(".robot"):
+                        all_candidates.append(p)
+                all_candidates = all_candidates[: max(20, MAX_ROBOT_SAMPLES * 10)]
+
+                picked: List[str] = []
+                for p in all_candidates:
+                    if len(picked) >= MAX_ROBOT_SAMPLES:
+                        break
+                    # préfère ceux dans tests/
+                    if p.startswith("tests/"):
+                        picked.append(p)
+                # fallback si pas assez
+                for p in all_candidates:
+                    if len(picked) >= MAX_ROBOT_SAMPLES:
+                        break
+                    if p not in picked:
+                        picked.append(p)
+
+                for p in picked:
+                    try:
+                        res = await mcp.call_tool(
+                            "get_file_contents",
+                            {"project_id": PROJECT_ID, "file_path": p, "ref": GITLAB_REF},
+                        )
+                        txt = extract_text(res).strip()
+                        if txt:
+                            payload["files_used"].append(p)
+                            payload["robot_samples"].append({"path": p, "content": truncate(txt, 9000)})
+                    except Exception:
+                        pass
+
+            # 6) Synthèse (sans tools)
+            print("\n=== SYNTHÈSE ===\n")
+            summary = await synthesize(llm, payload)
+            print(summary)
 
         finally:
             try:
