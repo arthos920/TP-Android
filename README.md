@@ -4,8 +4,10 @@ import asyncio
 import inspect
 import json
 import os
+import re
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from openai import AsyncOpenAI
 
@@ -34,9 +36,12 @@ OPENAI_MODEL = os.environ.get("OPENAI_MODEL", "magistral-2509").strip()
 
 GITLAB_MCP_URL = os.environ.get("GITLAB_MCP_URL", "").strip()
 
-# ✅ ID NUMÉRIQUE (obligatoire pour ton cas)
-GITLAB_PROJECT_ID = os.environ.get("GITLAB_PROJECT_ID", "").strip()  # ex: "1234"
-GITLAB_REF = os.environ.get("GITLAB_REF", "").strip() or "main"      # défaut main
+# >>> IMPORTANT: le tool get_repository_tree attend "project_id" (string) :
+#                on part sur ID numérique => ex: "123456"
+GITLAB_PROJECT_ID = os.environ.get("GITLAB_PROJECT_ID", "").strip()
+
+# branche/tag (optionnel)
+GITLAB_REF = os.environ.get("GITLAB_REF", "").strip() or ""  # ex: main/master
 
 # limites lecture
 MAX_FILE_CHARS = int(os.environ.get("MAX_FILE_CHARS", "14000"))
@@ -85,6 +90,7 @@ def extract_text_from_file_result(res: Any) -> str:
             v = res.get(k)
             if isinstance(v, str):
                 return v
+        # parfois payload nested
         if "result" in res and isinstance(res["result"], str):
             return res["result"]
         return json.dumps(res, ensure_ascii=False, indent=2)
@@ -190,20 +196,23 @@ def build_tool_param_index(tools: List[MCPTool]) -> Dict[str, set]:
     return idx
 
 def maybe_inject_common_args(tool_params: set, args: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    ✅ FIX: on force project_id (numérique) + ref si les paramètres existent.
-    """
     args = dict(args or {})
 
-    # project id (obligatoire)
-    if GITLAB_PROJECT_ID:
-        if "project_id" in tool_params and "project_id" not in args:
-            args["project_id"] = GITLAB_PROJECT_ID
+    # --- FIX: project_id numérique obligatoire quand le tool le supporte ---
+    # get_repository_tree (zereight/gitlab-mcp) attend "project_id" (string).
+    if "project_id" in tool_params and "project_id" not in args:
+        if not GITLAB_PROJECT_ID:
+            raise RuntimeError(
+                "GITLAB_PROJECT_ID manquant. "
+                "Le tool get_repository_tree attend project_id (ID numérique ou chemin encodé). "
+                "➡️ Exporte: GITLAB_PROJECT_ID=123456"
+            )
+        # on force string (même si numeric)
+        args["project_id"] = str(GITLAB_PROJECT_ID)
 
-    # ref/branch
-    if GITLAB_REF:
-        if "ref" in tool_params and "ref" not in args:
-            args["ref"] = GITLAB_REF
+    # ref/branch (optionnel)
+    if GITLAB_REF and "ref" in tool_params and "ref" not in args:
+        args["ref"] = GITLAB_REF
 
     return args
 
@@ -216,45 +225,111 @@ async def call_gitlab(mcp: MCPClient, tool_params_index: Dict[str, set], name: s
 # Repo exploration (read-only)
 # -----------------------------------------------------------------------------
 async def try_read_file(mcp: MCPClient, idx: Dict[str, set], path: str) -> Optional[str]:
+    """
+    Essaie plusieurs schémas d'args fréquemment rencontrés.
+    """
     variants = [
-        {"file_path": path},
         {"path": path},
+        {"file_path": path},
         {"filepath": path},
     ]
-    last_err = None
     for v in variants:
         try:
             res = await call_gitlab(mcp, idx, "get_file_contents", v)
             txt = extract_text_from_file_result(res)
             if txt:
                 return txt
-        except Exception as e:
-            last_err = e
+        except Exception:
             continue
     return None
 
+def _extract_next_page_token(payload: Any) -> Optional[str]:
+    payload = normalize_mcp_content(payload)
+    if isinstance(payload, dict):
+        for k in ("next_page_token", "nextPageToken", "page_token", "pageToken", "next", "next_page"):
+            v = payload.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+        # parfois nested
+        for k in ("pagination", "meta"):
+            v = payload.get(k)
+            if isinstance(v, dict):
+                t = _extract_next_page_token(v)
+                if t:
+                    return t
+    return None
+
+def _extract_items_list(payload: Any) -> List[Dict[str, Any]]:
+    payload = normalize_mcp_content(payload)
+    if isinstance(payload, list):
+        return [x for x in payload if isinstance(x, dict)]
+    if isinstance(payload, dict):
+        for k in ("items", "tree", "result", "data", "nodes"):
+            v = payload.get(k)
+            if isinstance(v, list):
+                return [x for x in v if isinstance(x, dict)]
+    return []
+
 async def get_repo_tree(mcp: MCPClient, idx: Dict[str, set], path: str = "") -> Any:
     """
-    ✅ FIX PRINCIPAL: get_repository_tree DOIT recevoir project_id + ref
-    et on passe path explicitement.
+    FIX zereight/gitlab-mcp:
+    - project_id requis
+    - path racine doit être "" (pas ".")
+    - pagination keyset possible via per_page/page_token/pagination
     """
-    variants = [
-        {"project_id": GITLAB_PROJECT_ID, "ref": GITLAB_REF, "path": path, "recursive": True},
-        {"project_id": GITLAB_PROJECT_ID, "ref": GITLAB_REF, "path": path, "recursive": False},
-        {"project_id": GITLAB_PROJECT_ID, "ref": GITLAB_REF, "path": path},
-    ]
-    last_err = None
-    for v in variants:
-        try:
-            return await call_gitlab(mcp, idx, "get_repository_tree", v)
-        except Exception as e:
-            last_err = e
-    raise RuntimeError(f"get_repository_tree a échoué. Dernière erreur: {last_err}")
+    # IMPORTANT: path racine => ""
+    path = path or ""
+
+    # args "safe defaults" pour ce MCP
+    base_args: Dict[str, Any] = {
+        "path": path,
+        "recursive": True,
+        "per_page": 100,
+        "pagination": "keyset",
+    }
+    # ref auto-injecté si supporté (via maybe_inject_common_args)
+
+    all_items: List[Dict[str, Any]] = []
+    page_token: Optional[str] = None
+    last_raw: Any = None
+
+    for _ in range(1, 50):  # garde-fou
+        args = dict(base_args)
+        if page_token:
+            args["page_token"] = page_token
+
+        last_raw = await call_gitlab(mcp, idx, "get_repository_tree", args)
+
+        items = _extract_items_list(last_raw)
+        if items:
+            all_items.extend(items)
+
+        next_tok = _extract_next_page_token(last_raw)
+        if not next_tok:
+            break
+        # évite boucle infinie si token identique
+        if next_tok == page_token:
+            break
+        page_token = next_tok
+
+    # si on a agrégé, on renvoie une structure simple
+    if all_items:
+        return {"items": all_items, "count": len(all_items)}
+    return last_raw
 
 def collect_paths_from_tree(tree: Any) -> List[str]:
     tree = normalize_mcp_content(tree)
     paths: List[str] = []
 
+    items = _extract_items_list(tree)
+    if items:
+        for item in items:
+            p = item.get("path") or item.get("name") or item.get("file_path")
+            if isinstance(p, str):
+                paths.append(p)
+        return paths
+
+    # fallback legacy
     if isinstance(tree, list):
         for item in tree:
             if isinstance(item, dict):
@@ -315,18 +390,13 @@ async def main():
         raise RuntimeError("OPENAI_API_KEY manquant.")
     if not GITLAB_MCP_URL:
         raise RuntimeError("GITLAB_MCP_URL manquant.")
-    if not GITLAB_PROJECT_ID:
-        raise RuntimeError(
-            "GITLAB_PROJECT_ID manquant (ID numérique). "
-            "➡️ Exporte GITLAB_PROJECT_ID=1234"
-        )
     if MCP_IMPORT_ERROR is not None:
         raise RuntimeError(f"Lib MCP python non importable: {MCP_IMPORT_ERROR}")
 
     print("== GitLab MCP access test + synthèse ==")
     print(f"- GITLAB_MCP_URL    : {GITLAB_MCP_URL}")
-    print(f"- GITLAB_PROJECT_ID : {GITLAB_PROJECT_ID}")
-    print(f"- GITLAB_REF        : {GITLAB_REF}")
+    print(f"- GITLAB_PROJECT_ID : {GITLAB_PROJECT_ID or '(non fourni)'}")
+    print(f"- GITLAB_REF        : {GITLAB_REF or '(non fourni)'}")
     print(f"- MODEL             : {OPENAI_MODEL}")
     print("--------------------------------------------------")
 
@@ -368,6 +438,7 @@ async def main():
         robot_samples: List[Dict[str, str]] = []
         tree_paths: List[str] = []
         if "get_repository_tree" in tool_names:
+            # >>> FIX: nécessite GITLAB_PROJECT_ID, et path="" racine
             tree = await get_repo_tree(mcp, tool_index, path="")
             tree_paths = collect_paths_from_tree(tree)
 
@@ -380,10 +451,11 @@ async def main():
                 if txt:
                     robot_samples.append({"path": rp, "content": truncate(txt, 9000)})
 
+        # 4) Construire payload pour synthèse
         payload = {
             "access_ok": True,
-            "project_id_used": GITLAB_PROJECT_ID,
-            "ref_used": GITLAB_REF,
+            "project_id_used": GITLAB_PROJECT_ID or None,
+            "ref_used": GITLAB_REF or None,
             "files_read": [],
             "convention_md": {"path": convention_path, "content": truncate(convention_text or "", 9000)},
             "readme": truncate(readme_text or "", 6000),
@@ -404,10 +476,10 @@ async def main():
         print("\n=== Synthèse (streaming) ===\n")
         await stream_synthesis(openai_client, payload)
 
-        if not convention_text:
+        if "get_repository_tree" in tool_names and not GITLAB_PROJECT_ID:
             print(
-                "\n[WARN] doc/convention.md n'a pas été trouvé/lu. "
-                "Si ton repo l'a bien, c'est probablement un mauvais file_path, ref, ou droits.\n"
+                "\n[WARN] Tu as get_repository_tree mais pas de GITLAB_PROJECT_ID.\n"
+                "➡️ Exporte un ID numérique:  set GITLAB_PROJECT_ID=123456\n"
             )
 
     print("\n--- DONE ---")
