@@ -1,272 +1,19 @@
-# jira_gitlab_summary_keywords.py
-# 1) Jira MCP: récupère ticket + résumé
-# 2) GitLab MCP: get_project + tree(doc) + doc/convention.md
-# 3) LLM: propose quelles fonctions/keywords du framework utiliser pour écrire la feuille Robot
+from typing import Tuple, List, Dict, Optional
 
-from __future__ import annotations
+def build_gitlab_messages_for_step(
+    step: int,
+    *,
+    project_id: str,
+    ref: str,
+    jira_summary: Optional[str] = None,
+    tree_preview: Optional[List[str]] = None,
+) -> Tuple[str, List[Dict[str, str]]]:
+    """
+    Retourne: (expected_tool_name OR "TOOL_LOOP", messages)
+    - step 1/2/3 => expected tool unique
+    - step 4     => "TOOL_LOOP" (le modèle peut appeler plusieurs tools autorisés)
+    """
 
-import asyncio
-import json
-import os
-from typing import Any, Dict, List, Tuple, Optional
-
-import httpx
-from openai import AsyncOpenAI
-
-# -----------------------------------------------------------------------------
-# MCP imports
-# -----------------------------------------------------------------------------
-try:
-    from mcp.client.streamable_http import streamable_http_client  # type: ignore
-    from mcp.client.session import ClientSession  # type: ignore
-except Exception:
-    from mcpclient.streamable_http import streamable_http_client  # type: ignore
-    from mcpclient.session import ClientSession  # type: ignore
-
-# -----------------------------------------------------------------------------
-# ENV
-# -----------------------------------------------------------------------------
-LLM_API_KEY = os.environ.get("OPENAI_API_KEY", "").strip()
-LLM_BASE_URL = os.environ.get("OPENAI_BASE_URL", "").strip() or None
-LLM_MODEL = os.environ.get("OPENAI_MODEL", "magistral-2509").strip()
-
-PROXY_URL = os.environ.get("PROXY_URL", "").strip() or None
-
-JIRA_MCP_URL = os.environ.get("JIRA_MCP_URL", "").strip()
-JIRA_KEY = os.environ.get("JIRA_KEY", "").strip()
-
-GITLAB_MCP_URL = os.environ.get("GITLAB_MCP_URL", "").strip()
-PROJECT_ID = os.environ.get("GITLAB_PROJECT_ID", "10").strip()
-GITLAB_REF = os.environ.get("GITLAB_REF", "main").strip()
-
-MAX_CHARS = int(os.environ.get("MAX_CHARS", "12000"))
-
-# -----------------------------------------------------------------------------
-# Helpers
-# -----------------------------------------------------------------------------
-def normalize(x: Any) -> Any:
-    if x is None:
-        return None
-    if isinstance(x, (str, int, float, bool)):
-        return x
-    if isinstance(x, dict):
-        return {k: normalize(v) for k, v in x.items()}
-    if isinstance(x, list):
-        return [normalize(v) for v in x]
-    if hasattr(x, "type") and hasattr(x, "text"):
-        return {"type": getattr(x, "type"), "text": getattr(x, "text")}
-    if hasattr(x, "__dict__"):
-        return normalize(x.__dict__)
-    return str(x)
-
-def truncate(s: str, n: int = MAX_CHARS) -> str:
-    s = s or ""
-    if len(s) <= n:
-        return s
-    return s[:n] + "\n...[TRUNCATED]..."
-
-def extract_text(result: Any) -> str:
-    r = normalize(result)
-    if r is None:
-        return ""
-    if isinstance(r, str):
-        return r
-    if isinstance(r, list):
-        parts = []
-        for it in r:
-            if isinstance(it, dict) and "text" in it:
-                parts.append(str(it["text"]))
-            else:
-                parts.append(str(it))
-        return "\n".join(parts)
-    if isinstance(r, dict):
-        for k in ("content", "text", "body", "description", "data", "result"):
-            v = r.get(k)
-            if isinstance(v, str):
-                return v
-        return json.dumps(r, ensure_ascii=False, indent=2)
-    return str(r)
-
-async def open_mcp(url: str):
-    cm = streamable_http_client(url)
-    entered = await cm.__aenter__()
-    if not isinstance(entered, tuple) or len(entered) < 2:
-        raise RuntimeError(f"streamable_http_client retour inattendu: {entered}")
-    read_stream, write_stream = entered[0], entered[1]
-
-    session = ClientSession(read_stream, write_stream)
-    await session.__aenter__()
-    if hasattr(session, "initialize"):
-        await session.initialize()
-    return cm, session
-
-def mcp_tools_to_openai(tools_resp: Any) -> List[Dict[str, Any]]:
-    tools_list = getattr(tools_resp, "tools", tools_resp)
-    out = []
-    for t in tools_list:
-        out.append(
-            {
-                "type": "function",
-                "function": {
-                    "name": t.name,
-                    "description": t.description or "",
-                    "parameters": t.inputSchema
-                    or {"type": "object", "properties": {}, "additionalProperties": True},
-                },
-            }
-        )
-    return out
-
-def find_tool_name(tool_names: List[str], preferred: List[str]) -> Optional[str]:
-    # match exact
-    for p in preferred:
-        if p in tool_names:
-            return p
-    # match fuzzy contains
-    lowered = [t.lower() for t in tool_names]
-    for p in preferred:
-        pl = p.lower()
-        for i, t in enumerate(lowered):
-            if pl in t:
-                return tool_names[i]
-    return None
-
-# -----------------------------------------------------------------------------
-# Run one forced tool call (like your STEP)
-# -----------------------------------------------------------------------------
-async def run_forced_tool_call(
-    llm: AsyncOpenAI,
-    mcp: ClientSession,
-    openai_tools: List[Dict[str, Any]],
-    expected_tool: str,
-    messages: List[Dict[str, str]],
-) -> Any:
-    resp = await llm.chat.completions.create(
-        model=LLM_MODEL,
-        messages=messages,
-        tools=openai_tools,
-        tool_choice="auto",
-        temperature=0.0,
-    )
-
-    msg = resp.choices[0].message
-    if not msg.tool_calls:
-        raise RuntimeError(f"Aucun tool_call généré. Message: {msg.content}")
-
-    tc = msg.tool_calls[0]
-    tool_name = tc.function.name
-    args = json.loads(tc.function.arguments or "{}")
-
-    if tool_name != expected_tool:
-        raise RuntimeError(f"Tool inattendu: {tool_name} (attendu: {expected_tool})")
-
-    print(f"\n[TOOL_CALL] {tool_name} args={args}")
-    return await mcp.call_tool(tool_name, args)
-
-# -----------------------------------------------------------------------------
-# JIRA: get issue (tool) then summarize (LLM)
-# -----------------------------------------------------------------------------
-async def jira_fetch_and_summarize(llm: AsyncOpenAI) -> Dict[str, Any]:
-    if not JIRA_MCP_URL or not JIRA_KEY:
-        raise RuntimeError("JIRA_MCP_URL et JIRA_KEY sont requis.")
-
-    transport_cm, jira = await open_mcp(JIRA_MCP_URL)
-    try:
-        tools_resp = await jira.list_tools()
-        openai_tools = mcp_tools_to_openai(tools_resp)
-        tool_names = [t["function"]["name"] for t in openai_tools]
-
-        # Tool Jira le plus probable pour lire un ticket
-        issue_tool = find_tool_name(
-            tool_names,
-            preferred=[
-                "get_issue",
-                "jira_get_issue",
-                "get_jira_issue",
-                "get_issue_by_key",
-                "issue_get",
-            ],
-        )
-        if not issue_tool:
-            raise RuntimeError(
-                "Impossible de trouver un tool Jira pour récupérer un ticket. "
-                f"Tools disponibles (extrait): {tool_names[:40]}"
-            )
-
-        # IMPORTANT: on met l'argument DANS le message pour que le modèle construise le bon JSON.
-        # Ici, selon l'implémentation, l'arg peut s'appeler key / issue_key / jira_key / ticket_key.
-        # Le modèle décidera en lisant le schema tool.
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    f"Tu dois appeler EXACTEMENT le tool {issue_tool} pour récupérer un ticket Jira.\n"
-                    "Ne fais rien d'autre."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Récupère le ticket Jira '{JIRA_KEY}'. "
-                    "Utilise l'argument attendu par le tool (ex: key/issue_key/jira_key)."
-                ),
-            },
-        ]
-
-        issue_raw = await run_forced_tool_call(
-            llm=llm,
-            mcp=jira,
-            openai_tools=openai_tools,
-            expected_tool=issue_tool,
-            messages=messages,
-        )
-
-        issue_text = truncate(extract_text(issue_raw), 14000)
-
-        # Résumé LLM (sans tools)
-        system = (
-            "Tu es QA Automation. Résume un ticket Jira de façon actionnable pour écrire un test Robot Framework.\n"
-            "Retourne STRICTEMENT ce format:\n"
-            "- Titre:\n"
-            "- Objectif:\n"
-            "- Préconditions:\n"
-            "- Étapes (Given/When/Then):\n"
-            "- Données (inputs/valeurs):\n"
-            "- Résultats attendus:\n"
-            "- Points d'attention:\n"
-        )
-        user = f"TICKET_KEY: {JIRA_KEY}\n\nCONTENU:\n{issue_text}"
-
-        resp = await llm.chat.completions.create(
-            model=LLM_MODEL,
-            messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-            temperature=0.2,
-            max_tokens=900,
-        )
-        summary = (resp.choices[0].message.content or "").strip()
-
-        return {
-            "jira_key": JIRA_KEY,
-            "issue_tool": issue_tool,
-            "issue_raw": normalize(issue_raw),
-            "issue_summary": summary,
-        }
-
-    finally:
-        try:
-            await jira.__aexit__(None, None, None)
-        except Exception:
-            pass
-        try:
-            await transport_cm.__aexit__(None, None, None)
-        except Exception:
-            pass
-
-# -----------------------------------------------------------------------------
-# GITLAB steps: get_project + get_repository_tree(doc) + get_file_contents(doc/convention.md)
-# PATH/FILE_PATH uniquement dans messages (comme tu veux)
-# -----------------------------------------------------------------------------
-def build_gitlab_messages_for_step(step: int) -> Tuple[str, List[Dict[str, str]]]:
     if step == 1:
         tool = "get_project"
         messages = [
@@ -277,7 +24,7 @@ def build_gitlab_messages_for_step(step: int) -> Tuple[str, List[Dict[str, str]]
                     "Ne fais rien d'autre."
                 ),
             },
-            {"role": "user", "content": f"Appelle get_project avec project_id='{PROJECT_ID}'."},
+            {"role": "user", "content": f"Appelle get_project avec project_id='{project_id}'."},
         ]
         return tool, messages
 
@@ -288,15 +35,19 @@ def build_gitlab_messages_for_step(step: int) -> Tuple[str, List[Dict[str, str]]
                 "role": "system",
                 "content": (
                     "Tu dois appeler EXACTEMENT le tool get_repository_tree.\n"
-                    "Utilise project_id, ref, recursive, path.\n"
+                    "Arguments requis:\n"
+                    "- project_id (string)\n"
+                    "- ref (string)\n"
+                    "- path (string) -> utilise ''\n"
+                    "- recursive (boolean) -> true\n"
                     "Ne fais rien d'autre."
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    f"Appelle get_repository_tree pour project_id='{PROJECT_ID}', ref='{GITLAB_REF}', "
-                    "recursive=true, path='doc'."
+                    f"Appelle get_repository_tree avec project_id='{project_id}', ref='{ref}', "
+                    "path='', recursive=true."
                 ),
             },
         ]
@@ -309,146 +60,201 @@ def build_gitlab_messages_for_step(step: int) -> Tuple[str, List[Dict[str, str]]
                 "role": "system",
                 "content": (
                     "Tu dois appeler EXACTEMENT le tool get_file_contents.\n"
-                    "Utilise project_id, ref, file_path.\n"
+                    "Arguments requis:\n"
+                    "- project_id (string)\n"
+                    "- ref (string)\n"
+                    "- file_path (string)\n"
+                    "Lis EN PRIORITÉ doc/convention.md. "
+                    "Si doc/convention.md n'existe pas, tente docs/convention.md puis convention.md.\n"
                     "Ne fais rien d'autre."
                 ),
             },
             {
                 "role": "user",
                 "content": (
-                    f"Appelle get_file_contents pour project_id='{PROJECT_ID}', ref='{GITLAB_REF}', "
-                    "file_path='doc/convention.md'."
+                    f"Lis le fichier des conventions. Appelle get_file_contents avec project_id='{project_id}', "
+                    f"ref='{ref}', file_path='doc/convention.md'. "
+                    "Si ça échoue, essaye docs/convention.md puis convention.md."
                 ),
             },
         ]
         return tool, messages
 
-    raise ValueError("step doit être 1,2,3")
+    if step == 4:
+        # step 4 = TOOL LOOP multi-tools, guidé par jira_summary + tree_preview
+        if not jira_summary:
+            jira_summary = "(résumé Jira manquant)"
 
-async def gitlab_run_step(
+        tree_hint_txt = ""
+        if tree_preview:
+            tree_hint_txt = (
+                "\nAperçu du tree (extrait):\n- " + "\n- ".join(tree_preview[:80]) + "\n"
+            )
+
+        tool = "TOOL_LOOP"
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Tu es un agent GitLab pour analyser un framework Robot Framework.\n"
+                    "Tu peux appeler plusieurs fois (autant que nécessaire) UNIQUEMENT ces tools:\n"
+                    "- get_project\n"
+                    "- get_repository_tree\n"
+                    "- get_file_contents\n\n"
+                    "Objectif:\n"
+                    "1) À partir du résumé Jira, déterminer quels fichiers du repo sont pertinents "
+                    "pour générer un nouveau test Robot (.robot).\n"
+                    "2) Explorer le repo (tree) et lire les fichiers clés (conventions, resources, exemples de tests).\n"
+                    "3) Sortir une synthèse finale (sans tool_call) avec:\n"
+                    "   - Fichiers lus (liste)\n"
+                    "   - Architecture (dossiers)\n"
+                    "   - Conventions (tags, naming, setup/teardown, resources/imports)\n"
+                    "   - Keywords/Librairies à réutiliser\n"
+                    "   - Fichiers “templates” (tests proches à copier)\n\n"
+                    "Contraintes importantes:\n"
+                    "- N'invente pas des paths: utilise d'abord get_repository_tree si besoin.\n"
+                    "- Pour lire un fichier: get_file_contents(project_id, ref, file_path='...') "
+                    "(ATTENTION: le paramètre s'appelle file_path, pas path).\n"
+                    "- Tu peux relancer get_repository_tree sur un sous-dossier (path='tests', 'resources', etc.) "
+                    "si tu as besoin de réduire le bruit.\n"
+                    "- À la fin, tu dois répondre avec une synthèse finale et ne plus appeler d'outil."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Résumé Jira:\n{jira_summary}\n\n"
+                    f"Repo:\n- project_id='{project_id}'\n- ref='{ref}'\n"
+                    f"{tree_hint_txt}\n"
+                    "Maintenant, analyse le repo en lisant les fichiers pertinents. "
+                    "Tu peux appeler get_repository_tree et get_file_contents autant que nécessaire. "
+                    "Termine par une synthèse finale exploitable pour générer une feuille Robot."
+                ),
+            },
+        ]
+        return tool, messages
+
+    raise ValueError("step doit être 1,2,3 ou 4.")
+
+
+
+
+async def gitlab_run_step4_tool_loop(
     llm: AsyncOpenAI,
-    mcp: ClientSession,
+    gitlab: ClientSession,
     openai_tools: List[Dict[str, Any]],
-    step: int,
-) -> Any:
-    expected_tool, messages = build_gitlab_messages_for_step(step)
-    return await run_forced_tool_call(llm, mcp, openai_tools, expected_tool, messages)
-
-# -----------------------------------------------------------------------------
-# Final: propose keywords/fonctions à utiliser (à partir Jira summary + convention + tree)
-# -----------------------------------------------------------------------------
-async def recommend_keywords_and_plan(llm: AsyncOpenAI, payload: Dict[str, Any]) -> str:
-    system = (
-        "Tu es un expert Robot Framework + framework existant.\n"
-        "On te donne:\n"
-        "- un résumé Jira (scénario attendu)\n"
-        "- la convention du framework (doc/convention.md)\n"
-        "- un tree du dossier doc (pour repérer ressources/structure)\n\n"
-        "Ta mission:\n"
-        "1) Déduire les imports/resources typiques à utiliser\n"
-        "2) Décrire les keywords/fonctions à rechercher/réutiliser dans le repo\n"
-        "3) Proposer un squelette de test Robot (Settings/Variables/Test Cases) basé sur le Jira\n\n"
-        "IMPORTANT:\n"
-        "- Si tu ne vois pas les keywords exacts, propose des 'keywords à rechercher' (patterns de noms)\n"
-        "- Donne une liste concrète de fichiers à lire ensuite (ex: resources/*.robot, keywords/*.robot)\n"
+    *,
+    project_id: str,
+    ref: str,
+    jira_summary: str,
+    tree_preview: Optional[List[str]] = None,
+    max_steps: int = 18,
+) -> Dict[str, Any]:
+    expected_tool, messages = build_gitlab_messages_for_step(
+        4,
+        project_id=project_id,
+        ref=ref,
+        jira_summary=jira_summary,
+        tree_preview=tree_preview,
     )
+    assert expected_tool == "TOOL_LOOP"
 
-    user = "PAYLOAD:\n" + json.dumps(payload, ensure_ascii=False, indent=2)
+    allowed_tools = {"get_project", "get_repository_tree", "get_file_contents"}
+    traces: List[Dict[str, Any]] = []
 
-    resp = await llm.chat.completions.create(
-        model=LLM_MODEL,
-        messages=[{"role": "system", "content": system}, {"role": "user", "content": user}],
-        temperature=0.2,
-        max_tokens=1200,
-    )
-    return (resp.choices[0].message.content or "").strip()
-
-# -----------------------------------------------------------------------------
-async def main():
-    if not LLM_API_KEY:
-        raise RuntimeError("OPENAI_API_KEY manquant.")
-    if not GITLAB_MCP_URL:
-        raise RuntimeError("GITLAB_MCP_URL manquant.")
-    if not JIRA_MCP_URL or not JIRA_KEY:
-        raise RuntimeError("JIRA_MCP_URL et JIRA_KEY manquants.")
-
-    print("=== Jira + GitLab MCP + recommandations keywords ===")
-    print(f"- JIRA_MCP_URL   : {JIRA_MCP_URL}")
-    print(f"- JIRA_KEY       : {JIRA_KEY}")
-    print(f"- GITLAB_MCP_URL : {GITLAB_MCP_URL}")
-    print(f"- PROJECT_ID     : {PROJECT_ID}")
-    print(f"- REF            : {GITLAB_REF}")
-    print(f"- MODEL          : {LLM_MODEL}")
-    print(f"- PROXY_URL      : {PROXY_URL or '(none)'}")
-    print("---------------------------------------------------")
-
-    proxy = httpx.Proxy(url=PROXY_URL) if PROXY_URL else None
-
-    async with httpx.AsyncClient(
-        proxy=proxy,
-        verify=False,
-        follow_redirects=False,
-        timeout=180.0,
-    ) as http_client:
-
-        llm = AsyncOpenAI(
-            api_key=LLM_API_KEY,
-            base_url=LLM_BASE_URL,
-            http_client=http_client,
+    for i in range(1, max_steps + 1):
+        resp = await llm.chat.completions.create(
+            model=LLM_MODEL,
+            messages=messages,
+            tools=openai_tools,
+            tool_choice="auto",
+            temperature=0.0,
         )
 
-        # 1) Jira summary
-        jira_part = await jira_fetch_and_summarize(llm)
-        print("\n=== JIRA SUMMARY ===\n")
-        print(jira_part["issue_summary"])
+        msg = resp.choices[0].message
 
-        # 2) GitLab
-        transport_cm, gitlab = await open_mcp(GITLAB_MCP_URL)
-        try:
-            tools_resp = await gitlab.list_tools()
-            openai_tools = mcp_tools_to_openai(tools_resp)
-            tool_names = [t["function"]["name"] for t in openai_tools]
-
-            for required in ("get_project", "get_repository_tree", "get_file_contents"):
-                if required not in tool_names:
-                    raise RuntimeError(f"Tool GitLab manquant: {required}")
-
-            project_res = await gitlab_run_step(llm, gitlab, openai_tools, step=1)
-            tree_res = await gitlab_run_step(llm, gitlab, openai_tools, step=2)
-            conv_res = await gitlab_run_step(llm, gitlab, openai_tools, step=3)
-
-            payload = {
-                "jira": {
-                    "key": jira_part["jira_key"],
-                    "summary": jira_part["issue_summary"],
-                },
-                "gitlab": {
-                    "project_id": PROJECT_ID,
-                    "ref": GITLAB_REF,
-                    "project": normalize(project_res),
-                    "tree_doc": normalize(tree_res),
-                    "convention_md": {
-                        "path": "doc/convention.md",
-                        "content": truncate(extract_text(conv_res), 12000),
-                    },
-                },
+        # Si réponse finale
+        if not msg.tool_calls:
+            final_text = msg.content or ""
+            messages.append({"role": "assistant", "content": final_text})
+            files_read = []
+            for t in traces:
+                if t["tool"] == "get_file_contents":
+                    fp = t["args"].get("file_path")
+                    if fp:
+                        files_read.append(fp)
+            return {
+                "final_synthesis": final_text,
+                "tool_traces": traces,
+                "files_read": files_read,
             }
 
-            print("\n=== RECOMMANDATIONS (keywords + squelette) ===\n")
-            reco = await recommend_keywords_and_plan(llm, payload)
-            print(reco)
+        # Ajoute assistant intermédiaire
+        messages.append({"role": "assistant", "content": msg.content or ""})
 
-        finally:
-            try:
-                await gitlab.__aexit__(None, None, None)
-            except Exception:
-                pass
-            try:
-                await transport_cm.__aexit__(None, None, None)
-            except Exception:
-                pass
+        # Exécute tous les tool_calls
+        for tc in msg.tool_calls:
+            name = tc.function.name
+            args = json.loads(tc.function.arguments or "{}")
 
-    print("\n--- DONE ---")
+            if name not in allowed_tools:
+                raise RuntimeError(f"[STEP4] Tool non autorisé: {name}")
 
-if __name__ == "__main__":
-    asyncio.run(main())
+            print(f"\n[STEP4] TOOL_CALL loop={i} -> {name} args={args}")
+            result = await gitlab.call_tool(name, args)
+            norm = normalize(result)
+            traces.append({"loop": i, "tool": name, "args": args, "result": norm})
+
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "name": name,
+                    "content": json.dumps(norm, ensure_ascii=False),
+                }
+            )
+
+    raise RuntimeError(f"[STEP4] max_steps atteint ({max_steps}).")
+
+
+# step1/2/3
+project_res = await gitlab_run_step_forced_one_tool(
+    llm, gitlab, openai_tools, step=1, project_id=PROJECT_ID, ref=GITLAB_REF
+)
+
+tree_res = await gitlab_run_step_forced_one_tool(
+    llm, gitlab, openai_tools, step=2, project_id=PROJECT_ID, ref=GITLAB_REF
+)
+
+conv_res = await gitlab_run_step_forced_one_tool(
+    llm, gitlab, openai_tools, step=3, project_id=PROJECT_ID, ref=GITLAB_REF
+)
+
+# petit preview pour aider step4 (optionnel)
+tree_norm = normalize(tree_res["result"])
+tree_preview = []
+if isinstance(tree_norm, list):
+    for it in tree_norm[:120]:
+        if isinstance(it, dict) and "path" in it:
+            tree_preview.append(it["path"])
+elif isinstance(tree_norm, dict):
+    # adapte si ton MCP renvoie autre structure
+    pass
+
+# step4 = tool loop multi tools
+step4_res = await gitlab_run_step4_tool_loop(
+    llm,
+    gitlab,
+    openai_tools,
+    project_id=PROJECT_ID,
+    ref=GITLAB_REF,
+    jira_summary=jira_summary_text,   # <- résumé Jira que tu ajoutes
+    tree_preview=tree_preview,
+    max_steps=20,
+)
+
+print("\n=== STEP4 SYNTHÈSE ===\n")
+print(step4_res["final_synthesis"])
+print("\nFichiers lus:")
+for f in step4_res["files_read"]:
+    print(" -", f)
