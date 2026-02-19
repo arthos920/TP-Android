@@ -5,8 +5,7 @@ import json
 import os
 import re
 from contextlib import AsyncExitStack
-from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, TypedDict
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 from openai import AsyncOpenAI
@@ -24,13 +23,12 @@ from mcp.client.stdio import stdio_client
 JIRA_MCP_URL = os.getenv("JIRA_MCP_URL", "http://localhost:9000/mcp")
 
 # --- Mobile MCP (stdio node) : mobile-next/mobile-mcp
-# Mets ici le chemin exact vers le index.js (build) de ton mobile-mcp.
 MOBILE_MCP_COMMAND = os.getenv("MOBILE_MCP_COMMAND", "node")
 MOBILE_MCP_ARGS = json.loads(
     os.getenv("MOBILE_MCP_ARGS_JSON", r'["C:/ads_mcp/mobile-mcp-main/lib/index.js"]')
 )
 
-# (Optionnel) Forcer un device précis. Sinon on auto-pick.
+# (Optionnel) Forcer un device précis. Sinon auto-pick.
 MOBILE_DEVICE_ID = os.getenv("MOBILE_DEVICE_ID")  # ex: "R5CX72Q8CBR"
 
 # --- LLM OpenAI-compatible
@@ -54,14 +52,13 @@ STRIP_CONTROL_CHARS = True
 
 
 def _strip_control_chars(s: str) -> str:
-    # Enlève control chars (sauf \n, \t) si besoin
     return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", s)
 
 
 def mcp_result_to_text(result: Any) -> str:
     """
     Convertit un résultat MCP (souvent list[TextContent]) en string,
-    puis clean + truncate (évite les 500 côté backend LLM).
+    puis clean + truncate.
     """
     content = getattr(result, "content", result)
 
@@ -120,9 +117,9 @@ class MCPRemoteHTTP:
     """
     Jira MCP streamable-http wrapper.
     Compatible anciennes versions:
-      - streamable_http_client(url) peut renvoyer tuple(read_stream, write_stream)
-      - ou un objet avec read_stream/write_stream
-      - ou un objet avec streams[]
+      - streamable_http_client(url) -> tuple(read_stream, write_stream)
+      - ou objet read_stream/write_stream
+      - ou objet streams[]
     """
 
     def __init__(self, url: str):
@@ -178,7 +175,6 @@ class MCPMobileStdio:
         if isinstance(transport, tuple) and len(transport) >= 2:
             read_stream, write_stream = transport[0], transport[1]
         else:
-            # fallback si la lib renvoie déjà (read_stream, write_stream)
             read_stream, write_stream = transport
 
         self.session = await self._stack.enter_async_context(ClientSession(read_stream, write_stream))
@@ -219,7 +215,6 @@ def mcp_tools_to_openai_tools_and_schema(mcp_tools) -> Tuple[List[dict], Dict[st
             or {"type": "object", "properties": {}}
         )
 
-        # Normalisation safe
         if not isinstance(schema, dict) or schema.get("type") != "object":
             schema = {"type": "object", "properties": {}}
         schema.setdefault("properties", {})
@@ -252,7 +247,6 @@ def maybe_inject_device_id(
     """
     if not device_id:
         return
-
     if any(k in args for k in DEVICE_KEYS):
         return
 
@@ -281,7 +275,6 @@ def extract_first_device_id(devices_payload: Any) -> Optional[str]:
         except Exception:
             return None
 
-    # Si dict avec une liste à l'intérieur
     if isinstance(devices_payload, dict):
         for key in ["devices", "result", "data", "items"]:
             if key in devices_payload and isinstance(devices_payload[key], list) and devices_payload[key]:
@@ -293,13 +286,50 @@ def extract_first_device_id(devices_payload: Any) -> Optional[str]:
         if isinstance(first, str):
             return first.strip()
         if isinstance(first, dict):
-            # cherche id/serial/udid
             for k in DEVICE_KEYS + ["id", "name"]:
                 v = first.get(k)
                 if isinstance(v, str) and v.strip():
                     return v.strip()
 
     return None
+
+
+async def get_devices_payload_with_retries(
+    mobile_mcp: MCPMobileStdio,
+    attempts: int = 6,
+    delay_s: float = 0.5,
+) -> Any:
+    """
+    Appelle mobile_list_available_devices plusieurs fois.
+    Retourne le payload (dict/list/str) du "meilleur" résultat obtenu.
+    Stop dès qu'on peut extraire un device_id.
+    """
+    last_payload: Any = None
+
+    for i in range(attempts):
+        try:
+            result = await mobile_mcp.call_tool("mobile_list_available_devices", {})
+            devices_text = mcp_result_to_text(result)
+
+            print(f"\n[MOBILE] devices attempt {i+1}/{attempts} preview:\n{devices_text[:800]}\n")
+
+            try:
+                payload = json.loads(devices_text)
+            except Exception:
+                payload = devices_text
+
+            last_payload = payload
+
+            picked = extract_first_device_id(payload)
+            if picked:
+                return payload
+
+        except Exception as e:
+            print(f"[MOBILE] WARNING devices attempt {i+1}/{attempts} failed: {repr(e)}")
+
+        await asyncio.sleep(delay_s * (i + 1))
+
+    return last_payload
 
 
 # =============================================================================
@@ -319,13 +349,6 @@ async def run_tool_call_loop(
     selected_device_id: Optional[str] = None,
     label: str = "AGENT",
 ) -> List[Message]:
-    """
-    Boucle non-stream :
-      - appelle LLM (tool_choice auto)
-      - exécute tool_calls via MCP
-      - append results (sanitized+truncated)
-      - stop si plus de tool_calls
-    """
     for _ in range(max_steps):
         resp = await safe_chat_completion(
             async_client,
@@ -357,7 +380,6 @@ async def run_tool_call_loop(
             if not isinstance(args, dict):
                 args = {}
 
-            # injection device id si requis et disponible
             maybe_inject_device_id(tool_name, args, schema_by_name, selected_device_id)
 
             print(f"\n[{label}] CALL TOOL: {tool_name} ARGS: {args}\n")
@@ -438,9 +460,6 @@ Règles:
 # =============================================================================
 
 def _make_httpx_async_client() -> httpx.AsyncClient:
-    # Compat proxy selon version httpx:
-    # - nouvelles versions: proxy=
-    # - anciennes: proxies=
     kwargs: Dict[str, Any] = dict(
         verify=False,
         follow_redirects=False,
@@ -448,7 +467,6 @@ def _make_httpx_async_client() -> httpx.AsyncClient:
     )
 
     if PROXY_URL:
-        # Essaye d'abord "proxy", fallback "proxies"
         try:
             return httpx.AsyncClient(proxy=PROXY_URL, **kwargs)  # type: ignore[arg-type]
         except TypeError:
@@ -492,14 +510,13 @@ async def main():
             jira_messages.append({"role": "user", "content": "Donne maintenant le résumé final au format demandé."})
             await stream_final_answer(async_client, jira_messages, "RÉSUMÉ JIRA")
 
-            # Récupérer le dernier assistant content en texte (optionnel)
             for m in reversed(jira_messages):
                 if m.get("role") == "assistant" and m.get("content"):
                     jira_summary_text = m["content"]
                     break
 
         # ---------------------------------------------------------------------
-        # 2) MOBILE - Sélection device + exécution via tool-calls
+        # 2) MOBILE - Devices (retries) + exécution
         # ---------------------------------------------------------------------
         async with MCPMobileStdio(MOBILE_MCP_COMMAND, MOBILE_MCP_ARGS) as mobile_mcp:
             mobile_mcp_tools = await mobile_mcp.list_tools()
@@ -507,34 +524,24 @@ async def main():
 
             selected_device = MOBILE_DEVICE_ID
 
-            # Détection devices (best effort)
             try:
-                result = await mobile_mcp.call_tool("mobile_list_available_devices", {})
-                devices_text = mcp_result_to_text(result)
+                devices_payload = await get_devices_payload_with_retries(
+                    mobile_mcp,
+                    attempts=6,
+                    delay_s=0.5,
+                )
 
-                # Preview debug
-                print("\n[MOBILE] Devices raw preview:\n", devices_text[:1200], "\n")
-
-                try:
-                    devices_payload = json.loads(devices_text)
-                except Exception:
-                    devices_payload = devices_text
-
-                if not selected_device:
+                if not selected_device and devices_payload is not None:
                     selected_device = extract_first_device_id(devices_payload)
 
                 if selected_device:
                     print(f"[MOBILE] Selected device id: {selected_device}")
                 else:
-                    print(
-                        "[MOBILE] WARNING: impossible de détecter un device_id. "
-                        "Le serveur peut utiliser un device par défaut."
-                    )
+                    print("[MOBILE] WARNING: impossible de détecter un device_id (même après retries).")
 
             except Exception as e:
-                print("[MOBILE] WARNING: mobile_list_available_devices a échoué:", repr(e))
+                print("[MOBILE] WARNING: devices retrieval failed:", repr(e))
 
-            # Messages Mobile (on peut injecter le résumé Jira)
             mobile_messages: List[Message] = [
                 {"role": "system", "content": SYSTEM_MOBILE},
                 {
@@ -559,9 +566,7 @@ async def main():
                 label="MOBILE",
             )
 
-            mobile_messages.append(
-                {"role": "user", "content": "Donne le résultat final (RESULT + justification)."}
-            )
+            mobile_messages.append({"role": "user", "content": "Donne le résultat final (RESULT + justification)."})
             await stream_final_answer(async_client, mobile_messages, "RÉSULTAT MOBILE")
 
 
