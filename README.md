@@ -7,7 +7,7 @@ import re
 import time
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Callable, Awaitable
 
 import httpx
 from openai import AsyncOpenAI
@@ -32,7 +32,7 @@ MOBILE_MCP_ARGS = json.loads(
     os.getenv("MOBILE_MCP_ARGS_JSON", r'["C:/ads_mcp/mobile-mcp-main/lib/index.js"]')
 )
 
-# LLM (OpenAI-compatible)
+# LLM
 LLM_API_KEY = os.getenv("LLM_API_KEY", "xxxx")
 LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:8000/v1")
 MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
@@ -40,26 +40,30 @@ MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 # Proxy (optional)
 PROXY_URL = os.getenv("PROXY_URL", "")
 
-# Truncation
-MAX_TOOL_CHARS = int(os.getenv("MAX_TOOL_CHARS", "12000"))
-MAX_TOOL_LINES = int(os.getenv("MAX_TOOL_LINES", "300"))
-
-# Parallel / step retry/timeout
-STEP_DEFAULT_TIMEOUT_S = float(os.getenv("STEP_DEFAULT_TIMEOUT_S", "60"))
-STEP_DEFAULT_ATTEMPTS = int(os.getenv("STEP_DEFAULT_ATTEMPTS", "3"))
-STEP_BACKOFF_BASE_S = float(os.getenv("STEP_BACKOFF_BASE_S", "0.6"))
-
-# Device overrides (optional)
-FORCE_DEVICE_DRIVER1 = os.getenv("FORCE_DEVICE_DRIVER1", "").strip()
-FORCE_DEVICE_DRIVER2 = os.getenv("FORCE_DEVICE_DRIVER2", "").strip()
-
-# ✅ Package override per driver (requested)
+# Packages per driver
 GLOBAL_PACKAGE = os.getenv("GLOBAL_PACKAGE", "").strip()
 DRIVER1_PACKAGE = os.getenv("DRIVER1_PACKAGE", GLOBAL_PACKAGE).strip()
 DRIVER2_PACKAGE = os.getenv("DRIVER2_PACKAGE", GLOBAL_PACKAGE).strip()
 
+# Optional device override
+FORCE_DEVICE_DRIVER1 = os.getenv("FORCE_DEVICE_DRIVER1", "").strip()
+FORCE_DEVICE_DRIVER2 = os.getenv("FORCE_DEVICE_DRIVER2", "").strip()
+
+# Limits
+MAX_TOOL_CHARS = int(os.getenv("MAX_TOOL_CHARS", "12000"))
+MAX_TOOL_LINES = int(os.getenv("MAX_TOOL_LINES", "300"))
+
+# ReAct loop limits
+MAX_TURNS_PER_DRIVER = int(os.getenv("MAX_TURNS_PER_DRIVER", "30"))
+TOOL_TIMEOUT_S = float(os.getenv("TOOL_TIMEOUT_S", "60"))
+TOOL_ATTEMPTS = int(os.getenv("TOOL_ATTEMPTS", "3"))
+TOOL_BACKOFF_BASE_S = float(os.getenv("TOOL_BACKOFF_BASE_S", "0.6"))
+
+DEVICE_KEYS = ["device", "device_id", "deviceId", "udid", "serial", "android_device_id"]
+
+
 # =============================================================================
-# TOOLS (whitelist from your screenshots)
+# TOOL WHITELIST (from your screenshots)
 # =============================================================================
 
 ALLOWED_MOBILE_TOOLS = [
@@ -84,18 +88,23 @@ ALLOWED_MOBILE_TOOLS = [
     "mobile_get_orientation",
 ]
 
-# Pseudo-tools handled by our runner (not MCP):
-PSEUDO_UI_TOOLS = ["ui_click", "ui_type", "ui_swipe"]
-
-DEVICE_KEYS = ["device", "device_id", "deviceId", "udid", "serial", "android_device_id"]
-
 
 # =============================================================================
-# TEXT + MCP RESULT HELPERS
+# TEXT / TRUNCATION
 # =============================================================================
 
 def _strip_control_chars(s: str) -> str:
     return re.sub(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]", "", s)
+
+
+def truncate_text(text: str) -> str:
+    text = _strip_control_chars(text)
+    lines = text.splitlines()
+    if len(lines) > MAX_TOOL_LINES:
+        text = "\n".join(lines[:MAX_TOOL_LINES]) + "\n...[TRUNCATED_LINES]..."
+    if len(text) > MAX_TOOL_CHARS:
+        text = text[:MAX_TOOL_CHARS] + "\n...[TRUNCATED_CHARS]..."
+    return text
 
 
 def mcp_result_to_text(result: Any) -> str:
@@ -118,16 +127,7 @@ def mcp_result_to_text(result: Any) -> str:
         except Exception:
             text = str(content)
 
-    text = _strip_control_chars(text)
-
-    lines = text.splitlines()
-    if len(lines) > MAX_TOOL_LINES:
-        text = "\n".join(lines[:MAX_TOOL_LINES]) + "\n...[TRUNCATED_LINES]..."
-
-    if len(text) > MAX_TOOL_CHARS:
-        text = text[:MAX_TOOL_CHARS] + "\n...[TRUNCATED_CHARS]..."
-
-    return text
+    return truncate_text(text)
 
 
 async def safe_chat(async_client: AsyncOpenAI, **kwargs):
@@ -146,12 +146,6 @@ async def safe_chat(async_client: AsyncOpenAI, **kwargs):
 # =============================================================================
 
 def extract_all_device_ids(devices_payload: Any) -> List[str]:
-    """
-    Supporte:
-    - JSON (dict/list)
-    - string JSON
-    - string texte: "Android devices: [ID1, ID2]"
-    """
     if devices_payload is None:
         return []
 
@@ -280,7 +274,7 @@ class MCPMobileStdio:
 
 
 # =============================================================================
-# MCP TOOL SCHEMAS (for safe injection)
+# SCHEMA HELPERS (for "noParams" detection)
 # =============================================================================
 
 def schema_from_mcp_tool(t: Any) -> Dict[str, Any]:
@@ -303,7 +297,7 @@ def schema_allows_key(schema: Dict[str, Any], key: str) -> bool:
 
 
 # =============================================================================
-# MOBILE SAFE CALLS + INTELLIGENT RETRY
+# MOBILE SAFE CALLS (retry + device + noParams)
 # =============================================================================
 
 def is_transient_error(text: str) -> bool:
@@ -336,9 +330,9 @@ async def mobile_call_safe(
     args: Optional[Dict[str, Any]],
     device_id: Optional[str],
     schema_by_name: Dict[str, Dict[str, Any]],
-    timeout_s: float,
-    attempts: int,
-    backoff_base_s: float,
+    timeout_s: float = TOOL_TIMEOUT_S,
+    attempts: int = TOOL_ATTEMPTS,
+    backoff_base_s: float = TOOL_BACKOFF_BASE_S,
 ) -> Tuple[bool, str, Dict[str, Any]]:
     if args is None or not isinstance(args, dict):
         args = {}
@@ -346,17 +340,18 @@ async def mobile_call_safe(
     call_args = dict(args)
     schema = schema_by_name.get(tool, {"type": "object", "properties": {}})
 
-    # Inject device if needed/possible
+    # Inject device
     if device_id and not any(k in call_args for k in DEVICE_KEYS):
+        injected = False
         for k in DEVICE_KEYS:
             if schema_allows_key(schema, k):
                 call_args[k] = device_id
+                injected = True
                 break
-        else:
-            if tool.startswith("mobile_") and tool != "mobile_list_available_devices":
-                call_args["device"] = device_id
+        if not injected and tool.startswith("mobile_") and tool != "mobile_list_available_devices":
+            call_args["device"] = device_id
 
-    # Inject noParams only if schema expects it OR for list_available_devices
+    # Inject noParams only if needed
     if tool == "mobile_list_available_devices" and "noParams" not in call_args:
         call_args["noParams"] = {}
     elif "noParams" not in call_args and schema_allows_key(schema, "noParams"):
@@ -367,21 +362,14 @@ async def mobile_call_safe(
         try:
             text = await asyncio.wait_for(mobile_call_raw(mobile_mcp, tool, call_args), timeout=timeout_s)
             last_text = text
-
-            # If tool output shows argument error, fail fast (not transient)
             if "invalid arguments" in text.lower() or "invalid_type" in text.lower():
                 return False, text, call_args
-
             return True, text, call_args
-
         except Exception as e:
             last_text = f"[TOOL_ERROR] {tool}: {repr(e)}"
             if attempt >= attempts:
                 break
-            # backoff
             await asyncio.sleep(backoff_base_s * attempt)
-
-            # fail fast if not transient
             if not is_transient_error(last_text):
                 break
 
@@ -420,7 +408,7 @@ async def get_devices_payload_with_retries(
 
 
 # =============================================================================
-# UI HELPER: list elements -> select -> click
+# UI PARSING: elements -> coords
 # =============================================================================
 
 def _maybe_json(text: str) -> Any:
@@ -488,7 +476,6 @@ def find_click_target(elements_payload: Any, target: str) -> Optional[Dict[str, 
                 candidates.append(it)
 
     best: Optional[Tuple[int, Dict[str, Any]]] = None
-
     for el in candidates:
         texts = _element_texts(el)
         joined = " | ".join(texts).lower()
@@ -517,7 +504,448 @@ def find_click_target(elements_payload: Any, target: str) -> Optional[Dict[str, 
 
 
 # =============================================================================
-# JIRA: tool-driven fetch + summary
+# TOOL WRAPPERS exposed to the MODEL
+#   These are the ONLY tools the model should call.
+#   They enforce "list -> act -> list" for UI actions.
+# =============================================================================
+
+@dataclass
+class DriverContext:
+    name: str                  # "driver1" / "driver2"
+    driver_index: int          # 1 / 2
+    device_id: Optional[str]
+    package_name: str
+    mcp: MCPMobileStdio
+    schema_by_name: Dict[str, Dict[str, Any]]
+    lock: asyncio.Lock         # ensures sequential actions per driver
+
+
+class Barrier:
+    """A 2-party barrier: both drivers call sync_barrier() to proceed."""
+    def __init__(self) -> None:
+        self._cond = asyncio.Condition()
+        self._count = 0
+        self._generation = 0
+
+    async def wait(self, who: str) -> str:
+        async with self._cond:
+            gen = self._generation
+            self._count += 1
+            if self._count >= 2:
+                self._count = 0
+                self._generation += 1
+                self._cond.notify_all()
+                return f"[BARRIER] released generation={self._generation} (last={who})"
+            # wait for release
+            while gen == self._generation:
+                await self._cond.wait()
+            return f"[BARRIER] released generation={self._generation} (waiter={who})"
+
+
+async def tool_observe(ctx: DriverContext) -> str:
+    """Observe = list elements + screenshot (no click)."""
+    async with ctx.lock:
+        ok1, elems, _ = await mobile_call_safe(
+            ctx.mcp, "mobile_list_elements_on_screen", {}, ctx.device_id, ctx.schema_by_name, timeout_s=45, attempts=2
+        )
+        ok2, ss, _ = await mobile_call_safe(
+            ctx.mcp, "mobile_take_screenshot", {}, ctx.device_id, ctx.schema_by_name, timeout_s=45, attempts=2
+        )
+    payload = {
+        "driver": ctx.name,
+        "device": ctx.device_id,
+        "list_ok": ok1,
+        "elements": elems[:2500],
+        "screenshot": ss[:800],
+    }
+    return json.dumps(payload, ensure_ascii=False)
+
+
+async def tool_launch_app(ctx: DriverContext, packageName: Optional[str] = None) -> str:
+    pkg = (packageName or "").strip() or ctx.package_name
+    if not pkg:
+        return json.dumps({"ok": False, "error": "Missing packageName (set DRIVERx_PACKAGE or pass packageName)."})
+    async with ctx.lock:
+        # pre observe
+        pre = await tool_observe(ctx)
+        ok, out, args_used = await mobile_call_safe(
+            ctx.mcp, "mobile_launch_app", {"packageName": pkg}, ctx.device_id, ctx.schema_by_name
+        )
+        post = await tool_observe(ctx)
+    return json.dumps(
+        {"ok": ok, "tool": "mobile_launch_app", "args": args_used, "output": out, "pre": json.loads(pre), "post": json.loads(post)},
+        ensure_ascii=False,
+    )
+
+
+async def tool_terminate_app(ctx: DriverContext, packageName: Optional[str] = None) -> str:
+    pkg = (packageName or "").strip() or ctx.package_name
+    if not pkg:
+        return json.dumps({"ok": False, "error": "Missing packageName (set DRIVERx_PACKAGE or pass packageName)."})
+    async with ctx.lock:
+        pre = await tool_observe(ctx)
+        ok, out, args_used = await mobile_call_safe(
+            ctx.mcp, "mobile_terminate_app", {"packageName": pkg}, ctx.device_id, ctx.schema_by_name
+        )
+        post = await tool_observe(ctx)
+    return json.dumps(
+        {"ok": ok, "tool": "mobile_terminate_app", "args": args_used, "output": out, "pre": json.loads(pre), "post": json.loads(post)},
+        ensure_ascii=False,
+    )
+
+
+async def tool_ui_click(ctx: DriverContext, target_text: str) -> str:
+    """
+    Enforce: list -> find coords -> click coords -> list + screenshot.
+    """
+    if not target_text or not isinstance(target_text, str):
+        return json.dumps({"ok": False, "error": "target_text is required"}, ensure_ascii=False)
+
+    async with ctx.lock:
+        # PRE
+        ok_list, elems_text, _ = await mobile_call_safe(
+            ctx.mcp, "mobile_list_elements_on_screen", {}, ctx.device_id, ctx.schema_by_name, timeout_s=45, attempts=2
+        )
+        ok_ss, ss_text, _ = await mobile_call_safe(
+            ctx.mcp, "mobile_take_screenshot", {}, ctx.device_id, ctx.schema_by_name, timeout_s=45, attempts=2
+        )
+        payload = _maybe_json(elems_text)
+        el = find_click_target(payload, target_text) if payload is not None else None
+
+        if not el:
+            # POST anyway for evidence
+            ok_list2, elems2, _ = await mobile_call_safe(
+                ctx.mcp, "mobile_list_elements_on_screen", {}, ctx.device_id, ctx.schema_by_name, timeout_s=45, attempts=2
+            )
+            ok_ss2, ss2, _ = await mobile_call_safe(
+                ctx.mcp, "mobile_take_screenshot", {}, ctx.device_id, ctx.schema_by_name, timeout_s=45, attempts=2
+            )
+            return json.dumps(
+                {
+                    "ok": False,
+                    "tool": "ui_click",
+                    "target_text": target_text,
+                    "error": "Target not found in elements list",
+                    "pre": {"list_ok": ok_list, "elements": elems_text[:2500], "screenshot": ss_text[:800]},
+                    "post": {"list_ok": ok_list2, "elements": elems2[:2500], "screenshot": ss2[:800]},
+                },
+                ensure_ascii=False,
+            )
+
+        x = int(el["_click_x"])
+        y = int(el["_click_y"])
+
+        ok_click, out_click, args_used = await mobile_call_safe(
+            ctx.mcp,
+            "mobile_click_on_screen_at_coordinates",
+            {"x": x, "y": y},
+            ctx.device_id,
+            ctx.schema_by_name,
+        )
+
+        # POST
+        ok_list2, elems2, _ = await mobile_call_safe(
+            ctx.mcp, "mobile_list_elements_on_screen", {}, ctx.device_id, ctx.schema_by_name, timeout_s=45, attempts=2
+        )
+        ok_ss2, ss2, _ = await mobile_call_safe(
+            ctx.mcp, "mobile_take_screenshot", {}, ctx.device_id, ctx.schema_by_name, timeout_s=45, attempts=2
+        )
+
+    return json.dumps(
+        {
+            "ok": ok_click,
+            "tool": "ui_click",
+            "target_text": target_text,
+            "chosen": {"x": x, "y": y, "matched_texts": el.get("_matched_texts", [])},
+            "args": args_used,
+            "output": out_click,
+            "pre": {"list_ok": ok_list, "elements": elems_text[:2500], "screenshot": ss_text[:800]},
+            "post": {"list_ok": ok_list2, "elements": elems2[:2500], "screenshot": ss2[:800]},
+        },
+        ensure_ascii=False,
+    )
+
+
+async def tool_ui_type(ctx: DriverContext, text: str, submit: bool = False) -> str:
+    if text is None or not isinstance(text, str):
+        return json.dumps({"ok": False, "error": "text is required"}, ensure_ascii=False)
+
+    async with ctx.lock:
+        pre = await tool_observe(ctx)
+        ok, out, args_used = await mobile_call_safe(
+            ctx.mcp,
+            "mobile_type_keys",
+            {"text": text, "submit": bool(submit)},
+            ctx.device_id,
+            ctx.schema_by_name,
+        )
+        post = await tool_observe(ctx)
+
+    return json.dumps(
+        {"ok": ok, "tool": "ui_type", "args": args_used, "output": out, "pre": json.loads(pre), "post": json.loads(post)},
+        ensure_ascii=False,
+    )
+
+
+async def tool_ui_swipe(ctx: DriverContext, direction: str = "down", distance: Optional[float] = None) -> str:
+    d = (direction or "down").strip().lower()
+    args: Dict[str, Any] = {"direction": d}
+    if isinstance(distance, (int, float)):
+        args["distance"] = distance
+
+    async with ctx.lock:
+        pre = await tool_observe(ctx)
+        ok, out, args_used = await mobile_call_safe(
+            ctx.mcp,
+            "mobile_swipe_on_screen",
+            args,
+            ctx.device_id,
+            ctx.schema_by_name,
+        )
+        post = await tool_observe(ctx)
+
+    return json.dumps(
+        {"ok": ok, "tool": "ui_swipe", "args": args_used, "output": out, "pre": json.loads(pre), "post": json.loads(post)},
+        ensure_ascii=False,
+    )
+
+
+async def tool_press_button(ctx: DriverContext, button: str) -> str:
+    # button: "home", "back", etc (depends on your MCP)
+    async with ctx.lock:
+        pre = await tool_observe(ctx)
+        ok, out, args_used = await mobile_call_safe(
+            ctx.mcp,
+            "mobile_press_button",
+            {"button": button},
+            ctx.device_id,
+            ctx.schema_by_name,
+        )
+        post = await tool_observe(ctx)
+
+    return json.dumps(
+        {"ok": ok, "tool": "mobile_press_button", "args": args_used, "output": out, "pre": json.loads(pre), "post": json.loads(post)},
+        ensure_ascii=False,
+    )
+
+
+# =============================================================================
+# OPENAI TOOL DEFINITIONS for our wrappers
+# =============================================================================
+
+def openai_tool(name: str, description: str, parameters: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "type": "function",
+        "function": {
+            "name": name,
+            "description": description,
+            "parameters": parameters,
+        },
+    }
+
+
+def build_react_tools() -> List[Dict[str, Any]]:
+    return [
+        openai_tool(
+            "observe",
+            "Observe current UI: lists elements on screen + screenshot.",
+            {"type": "object", "properties": {}, "required": []},
+        ),
+        openai_tool(
+            "launch_app",
+            "Launch the app. If packageName omitted, uses driver package config.",
+            {"type": "object", "properties": {"packageName": {"type": "string"}}, "required": []},
+        ),
+        openai_tool(
+            "terminate_app",
+            "Terminate the app. If packageName omitted, uses driver package config.",
+            {"type": "object", "properties": {"packageName": {"type": "string"}}, "required": []},
+        ),
+        openai_tool(
+            "ui_click",
+            "UI click by target text: automatically list elements, find coords, click, then list again + screenshot.",
+            {"type": "object", "properties": {"target_text": {"type": "string"}}, "required": ["target_text"]},
+        ),
+        openai_tool(
+            "ui_type",
+            "Type text (assumes focus is on a field). Auto observe before/after.",
+            {
+                "type": "object",
+                "properties": {
+                    "text": {"type": "string"},
+                    "submit": {"type": "boolean"},
+                },
+                "required": ["text"],
+            },
+        ),
+        openai_tool(
+            "ui_swipe",
+            "Swipe screen. Auto observe before/after.",
+            {
+                "type": "object",
+                "properties": {
+                    "direction": {"type": "string", "enum": ["up", "down", "left", "right"]},
+                    "distance": {"type": "number"},
+                },
+                "required": [],
+            },
+        ),
+        openai_tool(
+            "press_button",
+            "Press a device button (e.g., back, home). Auto observe before/after.",
+            {"type": "object", "properties": {"button": {"type": "string"}}, "required": ["button"]},
+        ),
+        openai_tool(
+            "sync_barrier",
+            "Synchronize with the other driver. Call this when both drivers must align before continuing.",
+            {"type": "object", "properties": {}, "required": []},
+        ),
+        openai_tool(
+            "finish",
+            "Finish the test for this driver. Provide status and notes.",
+            {
+                "type": "object",
+                "properties": {
+                    "status": {"type": "string", "enum": ["success", "failure", "blocked"]},
+                    "notes": {"type": "string"},
+                },
+                "required": ["status"],
+            },
+        ),
+    ]
+
+
+# =============================================================================
+# REACT AGENT LOOP (the model pilots live)
+# =============================================================================
+
+SYSTEM_REACT = """
+Tu es un agent QA mobile autonome en mode ReAct (observe → decide → act → observe).
+Tu pilotes l'application Android en appelant UNIQUEMENT les tools fournis.
+
+Règles:
+- Pour cliquer un élément UI: utilise toujours ui_click (NE PAS utiliser mobile_click_on_screen_at_coordinates).
+- Pour taper: ui_type. Pour scroller: ui_swipe.
+- Pour observer l'état: observe.
+- Utilise sync_barrier quand une étape doit être synchronisée avec l'autre driver (ex: appel entrant/sortant, action simultanée).
+- Sois robuste: observe souvent, et si un élément n'est pas visible, fais ui_swipe puis observe et réessaie.
+- Termine en appelant finish avec un status (success/failure/blocked).
+
+Tu reçois:
+- Résumé Jira
+- Contexte driver (driver1/driver2, device, package)
+"""
+
+async def run_react_driver(
+    async_client: AsyncOpenAI,
+    ctx: DriverContext,
+    barrier: Barrier,
+    jira_summary: str,
+) -> Dict[str, Any]:
+    tools = build_react_tools()
+
+    # Map tool name -> callable for this driver
+    async def _dispatch(tool_name: str, args: Dict[str, Any]) -> str:
+        if tool_name == "observe":
+            return await tool_observe(ctx)
+        if tool_name == "launch_app":
+            return await tool_launch_app(ctx, packageName=args.get("packageName"))
+        if tool_name == "terminate_app":
+            return await tool_terminate_app(ctx, packageName=args.get("packageName"))
+        if tool_name == "ui_click":
+            return await tool_ui_click(ctx, target_text=args.get("target_text", ""))
+        if tool_name == "ui_type":
+            return await tool_ui_type(ctx, text=args.get("text", ""), submit=bool(args.get("submit", False)))
+        if tool_name == "ui_swipe":
+            return await tool_ui_swipe(ctx, direction=args.get("direction", "down"), distance=args.get("distance"))
+        if tool_name == "press_button":
+            return await tool_press_button(ctx, button=args.get("button", "back"))
+        if tool_name == "sync_barrier":
+            return await barrier.wait(ctx.name)
+        if tool_name == "finish":
+            # finish handled by loop logic
+            return json.dumps({"ok": True})
+        return json.dumps({"ok": False, "error": f"Unknown tool {tool_name}"})
+
+    messages: List[Dict[str, Any]] = [
+        {"role": "system", "content": SYSTEM_REACT},
+        {
+            "role": "user",
+            "content": (
+                f"Résumé Jira:\n{jira_summary}\n\n"
+                f"Contexte:\n"
+                f"- driver: {ctx.name}\n"
+                f"- device: {ctx.device_id}\n"
+                f"- package: {ctx.package_name or '[EMPTY]'}\n\n"
+                f"Commence par observer, puis exécute le test."
+            ),
+        },
+    ]
+
+    # Initial observe (gives model a starting state)
+    messages.append({"role": "assistant", "content": "Je commence par observer l'UI."})
+    obs0 = await tool_observe(ctx)
+    messages.append({"role": "tool", "tool_call_id": "init_observe", "content": obs0})
+
+    final: Dict[str, Any] = {"status": "blocked", "notes": "No finish called"}
+
+    for turn in range(1, MAX_TURNS_PER_DRIVER + 1):
+        resp = await safe_chat(
+            async_client,
+            model=MODEL,
+            messages=messages,
+            tools=tools,
+            tool_choice="auto",
+            stream=False,
+            temperature=0.2,
+            max_tokens=1200,
+        )
+        msg = resp.choices[0].message
+        messages.append({"role": "assistant", "content": msg.content or ""})
+
+        tool_calls = getattr(msg, "tool_calls", None)
+        if not tool_calls:
+            # Model didn't call a tool; nudge it.
+            messages.append({"role": "user", "content": "Tu dois appeler un tool (observe/ui_click/ui_type/ui_swipe/...) ou finish."})
+            continue
+
+        for tc in tool_calls:
+            tool_name = tc.function.name
+            raw_args = tc.function.arguments or "{}"
+            try:
+                args = json.loads(raw_args) if isinstance(raw_args, str) else (raw_args or {})
+            except Exception:
+                args = {}
+            if not isinstance(args, dict):
+                args = {}
+
+            if tool_name == "finish":
+                final = {
+                    "status": args.get("status", "blocked"),
+                    "notes": args.get("notes", ""),
+                    "turn": turn,
+                    "driver": ctx.name,
+                    "device": ctx.device_id,
+                }
+                # add tool message for trace
+                messages.append({"role": "tool", "tool_call_id": tc.id, "content": json.dumps({"ok": True, "final": final})})
+                return final
+
+            out = await _dispatch(tool_name, args)
+            messages.append({"role": "tool", "tool_call_id": tc.id, "content": out})
+
+    # If max turns reached
+    final = {
+        "status": "blocked",
+        "notes": f"Max turns reached ({MAX_TURNS_PER_DRIVER}) without finish",
+        "driver": ctx.name,
+        "device": ctx.device_id,
+    }
+    return final
+
+
+# =============================================================================
+# JIRA SUMMARY (tool-driven)
 # =============================================================================
 
 SYSTEM_JIRA = f"""Tu es un assistant Jira.
@@ -536,7 +964,6 @@ Retourne STRICTEMENT ce format :
 - Données (inputs/valeurs):
 - Résultats attendus:
 """
-
 
 async def jira_fetch_and_summarize(async_client: AsyncOpenAI) -> str:
     async with MCPRemoteHTTP(JIRA_MCP_URL) as jira_mcp:
@@ -606,485 +1033,6 @@ async def jira_fetch_and_summarize(async_client: AsyncOpenAI) -> str:
 
 
 # =============================================================================
-# AUTONOMOUS QA AGENT (Planner -> Parallel Execute -> Verify)
-# =============================================================================
-
-SYSTEM_PLANNER = """
-Tu es un agent QA mobile autonome expert Android.
-
-Tu dois transformer un ticket Jira (résumé) en PLAN exécutable via MCP mobile tools.
-
-Règles strictes:
-- Tu ne dois PAS appeler de tools.
-- Tu produis UNIQUEMENT du JSON valide.
-- Tu n'utilises que les tools autorisés listés.
-- Les actions UI doivent se faire via pseudo-tools:
-  - ui_click: choisir un élément par texte/label, puis cliquer dessus (le runner liste les éléments avant d'agir)
-  - ui_type: taper du texte (runner liste avant/après)
-  - ui_swipe: swipe (runner liste avant/après)
-- Pour lancer/fermer app, utilise les vrais tools:
-  - mobile_launch_app, mobile_terminate_app
-- Driver mapping:
-  - driver1 -> device[0] (user1)
-  - driver2 -> device[1] (user2)
-- Synchronisation:
-  - Si une étape doit attendre l'autre driver, mets "barrier": true sur cette étape (ou sur une étape dédiée).
-- Robustesse:
-  - Mets "attempts" (1-5) et "timeout_s" si nécessaire.
-- IMPORTANT packages:
-  - On te donne package driver1 et package driver2 (peuvent être vides).
-  - Si tu connais le packageName, mets-le dans args.packageName.
-  - Sinon laisse args.packageName absent, le runner injectera automatiquement si disponible.
-
-FORMAT JSON STRICT:
-
-{
-  "steps": [
-    {
-      "id": "S1",
-      "driver": 1,
-      "tool": "mobile_launch_app",
-      "args": { "packageName": "..." },
-      "expect": "App opened",
-      "attempts": 3,
-      "timeout_s": 60,
-      "barrier": false
-    },
-    {
-      "id": "S2",
-      "driver": 1,
-      "tool": "ui_click",
-      "ui_target": "Login",
-      "expect": "Login screen shown"
-    }
-  ],
-  "verifications": [
-    {
-      "id": "V1",
-      "driver": 1,
-      "tool": "mobile_list_elements_on_screen",
-      "args": {},
-      "rule": "Condition lisible (ex: bouton PTT visible)"
-    }
-  ],
-  "final_rule": "success si toutes les verifications satisfaites"
-}
-"""
-
-SYSTEM_VERIFIER = """
-Tu es un vérificateur QA mobile strict.
-
-On te donne:
-- résumé Jira
-- plan JSON
-- logs d'exécution (tool outputs + éléments/screenshot)
-
-Tu dois rendre UNIQUEMENT du JSON valide:
-{
-  "result": "success" | "failure" | "blocked",
-  "justification": "courte et précise",
-  "evidence": ["...","..."]
-}
-
-Règles:
-- success seulement si les critères attendus sont vérifiés avec evidence.
-- blocked si infos indispensables manquantes (package, credentials, contacts, etc.) ou impossibilité technique.
-- failure si exécution échoue ou UI inattendue.
-"""
-
-
-def sanitize_plan(plan: Dict[str, Any]) -> Dict[str, Any]:
-    steps = plan.get("steps", [])
-    if not isinstance(steps, list):
-        plan["steps"] = []
-        return plan
-
-    clean_steps = []
-    for s in steps:
-        if not isinstance(s, dict):
-            continue
-        tool = s.get("tool")
-        if isinstance(tool, str) and (tool in ALLOWED_MOBILE_TOOLS or tool in PSEUDO_UI_TOOLS):
-            clean_steps.append(s)
-        else:
-            clean_steps.append(
-                {
-                    "id": s.get("id", "S?"),
-                    "driver": s.get("driver", 1),
-                    "tool": None,
-                    "status": "blocked",
-                    "reason": f"Tool not allowed/invalid: {tool}",
-                }
-            )
-
-    plan["steps"] = clean_steps
-
-    verifs = plan.get("verifications", [])
-    if isinstance(verifs, list):
-        clean_verifs = []
-        for v in verifs:
-            if not isinstance(v, dict):
-                continue
-            tool = v.get("tool")
-            if isinstance(tool, str) and tool in ALLOWED_MOBILE_TOOLS:
-                clean_verifs.append(v)
-            else:
-                clean_verifs.append(
-                    {
-                        "id": v.get("id", "V?"),
-                        "driver": v.get("driver", 1),
-                        "tool": None,
-                        "status": "blocked",
-                        "reason": f"Tool not allowed/invalid: {tool}",
-                    }
-                )
-        plan["verifications"] = clean_verifs
-
-    return plan
-
-
-async def build_plan(
-    async_client: AsyncOpenAI,
-    jira_summary: str,
-    allowed_tools_present: List[str],
-    driver1_package: str,
-    driver2_package: str,
-) -> Dict[str, Any]:
-    tool_list = "\n".join(f"- {n}" for n in allowed_tools_present)
-
-    messages = [
-        {"role": "system", "content": SYSTEM_PLANNER},
-        {
-            "role": "user",
-            "content": (
-                "Résumé Jira:\n"
-                f"{jira_summary}\n\n"
-                "Tools mobiles autorisés:\n"
-                f"{tool_list}\n\n"
-                f"Package driver1: {driver1_package or '[EMPTY]'}\n"
-                f"Package driver2: {driver2_package or '[EMPTY]'}\n\n"
-                "Génère le plan JSON."
-            ),
-        },
-    ]
-
-    resp = await safe_chat(
-        async_client,
-        model=MODEL,
-        messages=messages,
-        stream=False,
-        temperature=0.1,
-        max_tokens=2600,
-    )
-    content = resp.choices[0].message.content or "{}"
-
-    try:
-        plan = json.loads(content)
-        if not isinstance(plan, dict):
-            return {}
-        return sanitize_plan(plan)
-    except Exception:
-        m = re.search(r"\{.*\}", content, re.DOTALL)
-        if not m:
-            return {}
-        try:
-            plan = json.loads(m.group(0))
-            return sanitize_plan(plan if isinstance(plan, dict) else {})
-        except Exception:
-            return {}
-
-
-@dataclass
-class DriverContext:
-    driver_index: int
-    device_id: Optional[str]
-    package_name: str
-    mcp: MCPMobileStdio
-    schema_by_name: Dict[str, Dict[str, Any]]
-    lock: asyncio.Lock
-
-
-def fill_package_if_missing(tool: str, args: Dict[str, Any], package_name: str) -> Dict[str, Any]:
-    if tool in ("mobile_launch_app", "mobile_terminate_app") and "packageName" not in args:
-        if package_name:
-            new_args = dict(args)
-            new_args["packageName"] = package_name
-            return new_args
-    return args
-
-
-async def list_elements_and_screenshot(ctx: DriverContext, tag: str) -> Dict[str, Any]:
-    """
-    Always produce evidence. Best effort; never throws.
-    """
-    out: Dict[str, Any] = {}
-    ok_list, text_list, _ = await mobile_call_safe(
-        ctx.mcp,
-        "mobile_list_elements_on_screen",
-        {},
-        ctx.device_id,
-        ctx.schema_by_name,
-        timeout_s=45,
-        attempts=2,
-        backoff_base_s=0.4,
-    )
-    ok_ss, text_ss, _ = await mobile_call_safe(
-        ctx.mcp,
-        "mobile_take_screenshot",
-        {},
-        ctx.device_id,
-        ctx.schema_by_name,
-        timeout_s=45,
-        attempts=2,
-        backoff_base_s=0.4,
-    )
-
-    out[f"{tag}_list_ok"] = ok_list
-    out[f"{tag}_elements"] = text_list[:2500]
-    out[f"{tag}_screenshot"] = text_ss[:600]
-    out[f"{tag}_payload"] = _maybe_json(text_list)
-    return out
-
-
-async def execute_one_step(ctx: DriverContext, step: Dict[str, Any]) -> Dict[str, Any]:
-    """
-    Implements:
-    - For EVERY action: list elements first, then act, then list elements again.
-    - UI actions use pseudo-tools: ui_click / ui_type / ui_swipe.
-    - Native tools supported: mobile_launch_app, mobile_terminate_app, etc.
-    """
-    sid = step.get("id", "S?")
-    drv = step.get("driver", ctx.driver_index)
-    expect = step.get("expect", "")
-    barrier = bool(step.get("barrier", False))
-
-    tool = step.get("tool")
-    if not isinstance(tool, str):
-        return {"step": sid, "driver": drv, "status": "blocked", "reason": "missing tool", "barrier": barrier}
-
-    timeout_s = float(step.get("timeout_s", STEP_DEFAULT_TIMEOUT_S))
-    attempts = int(step.get("attempts", STEP_DEFAULT_ATTEMPTS))
-
-    ui_target = step.get("ui_target", "")  # for ui_click
-    text_to_type = step.get("text", "")    # for ui_type
-    submit = bool(step.get("submit", False))
-
-    direction = step.get("direction", "")  # for ui_swipe
-    distance = step.get("distance", None)
-
-    args = step.get("args", {})
-    if not isinstance(args, dict):
-        args = {}
-
-    # Auto inject packageName on launch/terminate if missing
-    args = fill_package_if_missing(tool, args, ctx.package_name)
-
-    t0 = time.time()
-
-    async with ctx.lock:
-        # PRE evidence
-        pre = await list_elements_and_screenshot(ctx, "pre")
-        pre_payload = pre.get("pre_payload")
-
-        action_ok = True
-        action_out = ""
-        action_args_used: Dict[str, Any] = args
-
-        # ACTION
-        if tool == "ui_click":
-            if not ui_target:
-                return {"step": sid, "driver": drv, "status": "blocked", "reason": "ui_click requires ui_target"}
-
-            target_el = find_click_target(pre_payload, ui_target) if pre_payload is not None else None
-            if not target_el:
-                action_ok = False
-                action_out = f"[UI_CLICK] target not found: {ui_target}"
-            else:
-                x = int(target_el["_click_x"])
-                y = int(target_el["_click_y"])
-                action_ok, action_out, action_args_used = await mobile_call_safe(
-                    ctx.mcp,
-                    "mobile_click_on_screen_at_coordinates",
-                    {"x": x, "y": y},
-                    ctx.device_id,
-                    ctx.schema_by_name,
-                    timeout_s=timeout_s,
-                    attempts=attempts,
-                    backoff_base_s=STEP_BACKOFF_BASE_S,
-                )
-
-        elif tool == "ui_type":
-            if not text_to_type:
-                return {"step": sid, "driver": drv, "status": "blocked", "reason": "ui_type requires text"}
-
-            action_ok, action_out, action_args_used = await mobile_call_safe(
-                ctx.mcp,
-                "mobile_type_keys",
-                {"text": text_to_type, "submit": submit},
-                ctx.device_id,
-                ctx.schema_by_name,
-                timeout_s=timeout_s,
-                attempts=attempts,
-                backoff_base_s=STEP_BACKOFF_BASE_S,
-            )
-
-        elif tool == "ui_swipe":
-            a: Dict[str, Any] = {"direction": direction or "down"}
-            if isinstance(distance, (int, float)):
-                a["distance"] = distance
-
-            action_ok, action_out, action_args_used = await mobile_call_safe(
-                ctx.mcp,
-                "mobile_swipe_on_screen",
-                a,
-                ctx.device_id,
-                ctx.schema_by_name,
-                timeout_s=timeout_s,
-                attempts=attempts,
-                backoff_base_s=STEP_BACKOFF_BASE_S,
-            )
-
-        else:
-            # Native MCP tool
-            if tool not in ALLOWED_MOBILE_TOOLS:
-                return {"step": sid, "driver": drv, "status": "blocked", "reason": f"tool not allowed: {tool}"}
-
-            action_ok, action_out, action_args_used = await mobile_call_safe(
-                ctx.mcp,
-                tool,
-                args,
-                ctx.device_id,
-                ctx.schema_by_name,
-                timeout_s=timeout_s,
-                attempts=attempts,
-                backoff_base_s=STEP_BACKOFF_BASE_S,
-            )
-
-        # POST evidence
-        post = await list_elements_and_screenshot(ctx, "post")
-        post.pop("post_payload", None)  # keep logs smaller
-
-    return {
-        "step": sid,
-        "driver": drv,
-        "device": ctx.device_id,
-        "tool": tool,
-        "args": action_args_used,
-        "ui_target": ui_target,
-        "expect": expect,
-        "ok": bool(action_ok),
-        "output": action_out,
-        "evidence": {
-            **{k: v for k, v in pre.items() if k != "pre_payload"},
-            **post,
-        },
-        "barrier": barrier,
-        "duration_s": round(time.time() - t0, 3),
-    }
-
-
-async def execute_plan_parallel(plan: Dict[str, Any], driver1: DriverContext, driver2: DriverContext) -> List[Dict[str, Any]]:
-    """
-    Parallel execution:
-    - tasks for steps
-    - each driver protected by its lock => sequential per driver, parallel across drivers
-    - barrier=true => wait all pending tasks (sync point)
-    """
-    steps = plan.get("steps", [])
-    if not isinstance(steps, list):
-        return []
-
-    driver_map = {1: driver1, 2: driver2}
-
-    pending: List[asyncio.Task] = []
-    results: List[Dict[str, Any]] = []
-
-    for step in steps:
-        if not isinstance(step, dict):
-            continue
-
-        drv = step.get("driver", 1)
-        ctx = driver_map.get(drv, driver1)
-
-        pending.append(asyncio.create_task(execute_one_step(ctx, step)))
-
-        if bool(step.get("barrier", False)):
-            done = await asyncio.gather(*pending, return_exceptions=False)
-            results.extend(done)
-            pending = []
-
-    if pending:
-        done = await asyncio.gather(*pending, return_exceptions=False)
-        results.extend(done)
-
-    # Verifications (also parallel)
-    verifs = plan.get("verifications", [])
-    if isinstance(verifs, list) and verifs:
-        v_pending: List[asyncio.Task] = []
-        for v in verifs:
-            if not isinstance(v, dict):
-                continue
-            drv = v.get("driver", 1)
-            ctx = driver_map.get(drv, driver1)
-
-            # treat verification like a native step
-            v_step = {
-                "id": v.get("id", "V?"),
-                "driver": drv,
-                "tool": v.get("tool"),
-                "args": v.get("args", {}),
-                "expect": v.get("rule", ""),
-                "attempts": int(v.get("attempts", 2)),
-                "timeout_s": float(v.get("timeout_s", 45)),
-                "barrier": bool(v.get("barrier", False)),
-            }
-            v_pending.append(asyncio.create_task(execute_one_step(ctx, v_step)))
-
-            if bool(v_step.get("barrier", False)):
-                done_v = await asyncio.gather(*v_pending, return_exceptions=False)
-                results.extend(done_v)
-                v_pending = []
-
-        if v_pending:
-            done_v = await asyncio.gather(*v_pending, return_exceptions=False)
-            results.extend(done_v)
-
-    return results
-
-
-async def verify_execution(
-    async_client: AsyncOpenAI,
-    jira_summary: str,
-    plan: Dict[str, Any],
-    exec_logs: List[Dict[str, Any]],
-) -> Dict[str, Any]:
-    messages = [
-        {"role": "system", "content": SYSTEM_VERIFIER},
-        {"role": "user", "content": "Résumé Jira:\n" + jira_summary},
-        {"role": "user", "content": "Plan JSON:\n" + json.dumps(plan, ensure_ascii=False, indent=2)},
-        {"role": "user", "content": "Logs exécution:\n" + json.dumps(exec_logs, ensure_ascii=False, indent=2)},
-        {"role": "user", "content": "Rends le verdict JSON."},
-    ]
-
-    resp = await safe_chat(
-        async_client,
-        model=MODEL,
-        messages=messages,
-        stream=False,
-        temperature=0.1,
-        max_tokens=900,
-    )
-    content = resp.choices[0].message.content or "{}"
-    try:
-        out = json.loads(content)
-        if isinstance(out, dict):
-            return out
-        return {"result": "failure", "justification": "Verifier output not dict", "evidence": []}
-    except Exception:
-        return {"result": "failure", "justification": "Verifier output not valid JSON", "evidence": [content[:600]]}
-
-
-# =============================================================================
 # HTTPX
 # =============================================================================
 
@@ -1119,22 +1067,12 @@ async def main():
         jira_summary = await jira_fetch_and_summarize(async_client)
         print(jira_summary)
 
-        # 2) Probe mobile tools + devices once
-        print("\n===== (2) MOBILE: Probe tools + devices =====\n")
-        async with MCPMobileStdio(MOBILE_MCP_COMMAND, MOBILE_MCP_ARGS) as mobile_probe:
-            mcp_tools = await mobile_probe.list_tools()
-            schema_probe = build_schema_by_name(mcp_tools)
-            tool_names = [t.name for t in mcp_tools]
-
-            allowed_present = [t for t in tool_names if t in ALLOWED_MOBILE_TOOLS]
-            print("[MOBILE] tools present:", allowed_present)
-
-            devices_payload = await get_devices_payload_with_retries(
-                mobile_probe,
-                schema_by_name=schema_probe,
-                attempts=6,
-                delay_s=0.5,
-            )
+        # 2) Probe devices
+        print("\n===== (2) MOBILE: Probe devices =====\n")
+        async with MCPMobileStdio(MOBILE_MCP_COMMAND, MOBILE_MCP_ARGS) as probe:
+            tools = await probe.list_tools()
+            schema_probe = build_schema_by_name(tools)
+            devices_payload = await get_devices_payload_with_retries(probe, schema_probe, attempts=6, delay_s=0.5)
             devices_list = extract_all_device_ids(devices_payload)
             print("[MOBILE] devices_list =", devices_list)
 
@@ -1142,80 +1080,69 @@ async def main():
         device2 = FORCE_DEVICE_DRIVER2 or pick_device_for_driver(devices_list, 2)
 
         if not device1:
-            verdict = {"result": "blocked", "justification": "No Android device detected", "evidence": []}
-            print("\n===== VERDICT =====\n")
-            print(json.dumps(verdict, ensure_ascii=False, indent=2))
+            print(json.dumps({"result": "blocked", "justification": "No Android device detected", "evidence": []}, indent=2))
             return
 
-        # 3) Plan
-        print("\n===== (3) PLAN (autonomous) =====\n")
-        plan = await build_plan(
-            async_client=async_client,
-            jira_summary=jira_summary,
-            allowed_tools_present=allowed_present,
-            driver1_package=DRIVER1_PACKAGE,
-            driver2_package=DRIVER2_PACKAGE,
-        )
-        print(json.dumps(plan, ensure_ascii=False, indent=2))
+        # 3) Run 2 drivers in parallel (live ReAct)
+        print("\n===== (3) REACT LIVE (parallel drivers) =====\n")
 
-        if not plan:
-            verdict = {"result": "blocked", "justification": "Planner failed to output a valid plan", "evidence": []}
-            print("\n===== VERDICT =====\n")
-            print(json.dumps(verdict, ensure_ascii=False, indent=2))
-            return
+        barrier = Barrier()
 
-        # 4) Parallel execution with 2 independent MCP sessions
-        print("\n===== (4) EXECUTE (parallel drivers, list->act->list each step) =====\n")
-        async with MCPMobileStdio(MOBILE_MCP_COMMAND, MOBILE_MCP_ARGS) as mobile_driver1, \
-                   MCPMobileStdio(MOBILE_MCP_COMMAND, MOBILE_MCP_ARGS) as mobile_driver2:
+        async with MCPMobileStdio(MOBILE_MCP_COMMAND, MOBILE_MCP_ARGS) as mcp1, \
+                   MCPMobileStdio(MOBILE_MCP_COMMAND, MOBILE_MCP_ARGS) as mcp2:
 
-            tools_d1 = await mobile_driver1.list_tools()
-            tools_d2 = await mobile_driver2.list_tools()
-            schema_d1 = build_schema_by_name(tools_d1)
-            schema_d2 = build_schema_by_name(tools_d2)
+            tools1 = await mcp1.list_tools()
+            tools2 = await mcp2.list_tools()
+            schema1 = build_schema_by_name(tools1)
+            schema2 = build_schema_by_name(tools2)
 
-            driver1 = DriverContext(
+            ctx1 = DriverContext(
+                name="driver1",
                 driver_index=1,
                 device_id=device1,
                 package_name=DRIVER1_PACKAGE,
-                mcp=mobile_driver1,
-                schema_by_name=schema_d1,
+                mcp=mcp1,
+                schema_by_name=schema1,
                 lock=asyncio.Lock(),
             )
-            driver2 = DriverContext(
+
+            ctx2 = DriverContext(
+                name="driver2",
                 driver_index=2,
                 device_id=device2,
                 package_name=DRIVER2_PACKAGE,
-                mcp=mobile_driver2,
-                schema_by_name=schema_d2,
+                mcp=mcp2,
+                schema_by_name=schema2,
                 lock=asyncio.Lock(),
             )
 
-            print(f"[MOBILE] driver1 device={driver1.device_id} package={driver1.package_name or '[EMPTY]'}")
-            print(f"[MOBILE] driver2 device={driver2.device_id} package={driver2.device_id or '[EMPTY]'}")
+            print(f"[CTX] driver1 device={ctx1.device_id} package={ctx1.package_name or '[EMPTY]'}")
+            print(f"[CTX] driver2 device={ctx2.device_id} package={ctx2.package_name or '[EMPTY]'}")
 
-            exec_logs = await execute_plan_parallel(plan, driver1, driver2)
+            r1, r2 = await asyncio.gather(
+                run_react_driver(async_client, ctx1, barrier, jira_summary),
+                run_react_driver(async_client, ctx2, barrier, jira_summary),
+            )
 
-        # 5) Print short summary
-        for item in exec_logs:
-            if isinstance(item, dict) and "tool" in item:
-                print(
-                    f"[LOG] {item.get('step')} drv={item.get('driver')} "
-                    f"tool={item.get('tool')} ok={item.get('ok')} dur={item.get('duration_s')}s"
-                )
+        # 4) Aggregate result
+        print("\n===== (4) DRIVER RESULTS =====\n")
+        print(json.dumps({"driver1": r1, "driver2": r2}, ensure_ascii=False, indent=2))
 
-        # 6) Verify
-        print("\n===== (5) VERIFY =====\n")
-        verdict = await verify_execution(async_client, jira_summary, plan, exec_logs)
+        # Simple aggregation rule:
+        # - if any failure => failure
+        # - elif any blocked => blocked
+        # - else success
+        statuses = [r1.get("status"), r2.get("status")]
+        if "failure" in statuses:
+            overall = "failure"
+        elif "blocked" in statuses:
+            overall = "blocked"
+        else:
+            overall = "success"
 
-        print("\n===== VERDICT =====\n")
-        print(json.dumps(verdict, ensure_ascii=False, indent=2))
+        print("\n===== OVERALL =====\n")
+        print(json.dumps({"result": overall, "details": {"driver1": r1, "driver2": r2}}, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
-
-print(f"[MOBILE] driver2 device={driver2.device_id} package={driver2.package_name or '[EMPTY]'}")
