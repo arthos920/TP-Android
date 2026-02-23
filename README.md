@@ -1,3 +1,6 @@
+
+docker cp script_jira_appium_v2.py <CONTAINER_ID>:/app/script_jira_appium_v2.py
+
 """
 script_jira_appium_v2.py — Runner Jira + Appium MCP générique
 
