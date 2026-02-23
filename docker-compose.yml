@@ -1,0 +1,56 @@
+# ============================================================
+# docker-compose.yml — appium-mcp-runner
+# ============================================================
+# Usage :
+#   docker compose run --rm runner                    # test Settings
+#   docker compose run --rm runner python3 script_jira_appium_v2.py
+# ============================================================
+
+version: "3.9"
+
+services:
+
+  # ── Runner principal ────────────────────────────────────────
+  runner:
+    image: appium-mcp-runner
+    build:
+      context: .
+      dockerfile: Dockerfile
+    network_mode: bridge            # accède au host via host.docker.internal
+    extra_hosts:
+      - "host.docker.internal:host-gateway"   # Linux compat (Docker ≥ 20.10)
+    volumes:
+      # Screenshots persistés sur le host
+      - ./screenshots:/app/screenshots
+      # capabilities.json modifiable sans rebuild
+      - ./capabilities.json:/app/capabilities.json:ro
+    environment:
+      # ── Devices (serial ADB des téléphones branchés en USB sur le HOST) ──
+      DEVICE_1_ID:  ${DEVICE_1_ID:-change-me}
+      DEVICE_2_ID:  ${DEVICE_2_ID:-}
+
+      # ── Appium server (sur le HOST Windows) ────────────────────────────
+      APPIUM_SERVER_URL: ${APPIUM_SERVER_URL:-http://host.docker.internal:4723}
+
+      # ── LLM (Ollama sur HOST ou autre) ─────────────────────────────────
+      LLM_API_KEY:  ${LLM_API_KEY:-no-key}
+      LLM_BASE_URL: ${LLM_BASE_URL:-http://host.docker.internal:11434/v1}
+      LLM_MODEL:    ${LLM_MODEL:-llama3.2}
+
+      # ── Jira MCP (optionnel, fallback si non dispo) ────────────────────
+      JIRA_MCP_URL: ${JIRA_MCP_URL:-http://host.docker.internal:9000/mcp}
+      TICKET_KEY:   ${TICKET_KEY:-XXXX-0001}
+
+      # ── App cible (si non extrait du résumé Jira) ─────────────────────
+      APP_PACKAGE:  ${APP_PACKAGE:-com.android.settings}
+      APP_ACTIVITY: ${APP_ACTIVITY:-.Settings}
+
+      # ── Tuning ────────────────────────────────────────────────────────
+      MAX_TURNS_PER_DRIVER: ${MAX_TURNS_PER_DRIVER:-30}
+      TOOL_TIMEOUT_S:       ${TOOL_TIMEOUT_S:-90}
+      NO_UI: "1"
+
+    # Par défaut : test déterministe (script_test_settings.py)
+    # Override : docker compose run runner python3 script_jira_appium_v2.py
+    command: ["python3", "script_test_settings.py"]
+    restart: "no"
