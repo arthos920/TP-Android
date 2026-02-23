@@ -776,8 +776,9 @@ async def run_react(ac: AsyncOpenAI, ctx: DriverContext,
 # =============================================================================
 
 _JIRA_SYS = f"""Tu es QA Automation. Ticket cible: {TICKET_KEY}.
-Résume le ticket de façon actionnable. Retourne STRICTEMENT :
+Résume le ticket de façon actionnable en te basant sur les test details du ticket qui correspondent au  customfiled_11504. Retourne STRICTEMENT :
 - Titre:
+- test details(customfiled_11504)
 - Objectif:
 - Plateforme:
 - App (package Android si connu):
