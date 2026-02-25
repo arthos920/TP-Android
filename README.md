@@ -1,4 +1,148 @@
 
+
+@echo off
+setlocal EnableDelayedExpansion
+
+:: Toujours travailler dans le dossier du script (offline_bundle)
+pushd "%~dp0"
+
+:: ===============================
+:: ADAPTER CES VALEURS AVANT LANCER
+:: ===============================
+
+:: Devices (serial ADB)
+set DEVICE_1_ID="R5CX72QBCBR"
+set DEVICE_2_ID="R5CX72QBS6J"
+
+:: Appium (tourne sur le HOST Windows)
+set APPIUM_SERVER_URL=http://host.docker.internal:4723
+
+:: LLM
+set LLM_BASE_URL="xxx"
+set LLM_MODEL="gpt-oss-20b"
+set LLM_API_KEY="xxx"
+
+:: Jira MCP (optionnel)
+set JIRA_MCP_URL="http://host.docker.internal:9000/mcp"
+set TICKET_KEY="xxx"
+
+:: Proxy HTTP (optionnel)
+set PROXY_URL=""
+
+:: Application a tester (NE PAS mettre dans capabilities.json)
+set GLOBAL_PACKAGE=xxx
+set DRIVER1_PACKAGE=xxx
+set DRIVER2_PACKAGE=xxx
+set APP_ACTIVITY=xxxx
+
+:: Script a executer dans le container
+set SCRIPT=script_jira_appium_v2.py
+
+:: Tuning
+set MAX_TURNS_PER_DRIVER=30
+set TOOL_TIMEOUT_S=90
+set TOOL_ATTEMPTS=3
+
+echo ==============================================
+echo 1/3 Import de l'image Docker (si pas encore fait)
+echo ==============================================
+docker image inspect appium-mcp-runner:latest >nul 2>&1
+if %ERRORLEVEL% neq 0 (
+    if not exist appium-mcp-runner.tar (
+        echo [ERREUR] Fichier appium-mcp-runner.tar introuvable.
+        echo Copier le fichier .tar dans ce dossier puis relancer.
+        pause
+        exit /b 1
+    )
+    echo Chargement de l'image...
+    docker load -i appium-mcp-runner.tar || goto :error
+    echo Image chargee avec succes.
+) else (
+    echo Image deja presente, skip load.
+)
+
+echo.
+echo ==============================================
+echo 2/3 Verification Appium server sur HOST :4723
+echo ==============================================
+curl -s --max-time 3 http://localhost:4723/status >nul 2>&1
+if %ERRORLEVEL% neq 0 (
+    echo [WARN] Appium server non detecte sur :4723
+    echo Lancer restart_appium.bat sur le HOST avant de continuer.
+    pause
+)
+
+echo.
+echo ==============================================
+echo 3/3 Lancement du container
+echo ==============================================
+echo Device 1 : %DEVICE_1_ID%
+echo Device 2 : %DEVICE_2_ID%
+echo Script   : %SCRIPT%
+echo.
+
+:: Creer le dossier screenshots si absent (sur l'hote)
+if not exist screenshots mkdir screenshots
+
+:: (Optionnel mais tres utile) Vérifier le contenu vu par le container
+echo --- Debug: contenu /app/capabilities.json dans le container ---
+docker run --rm ^
+  -v "%~dp0capabilities.json:/app/capabilities.json:ro" ^
+  appium-mcp-runner:latest ^
+  cat /app/capabilities.json
+echo --------------------------------------------------------------
+
+docker run --rm ^
+  --add-host=host.docker.internal:host-gateway ^
+  -e DEVICE_1_ID=%DEVICE_1_ID% ^
+  -e DEVICE_2_ID=%DEVICE_2_ID% ^
+  -e APPIUM_SERVER_URL=%APPIUM_SERVER_URL% ^
+  -e LLM_API_KEY=%LLM_API_KEY% ^
+  -e LLM_BASE_URL=%LLM_BASE_URL% ^
+  -e LLM_MODEL=%LLM_MODEL% ^
+  -e JIRA_MCP_URL=%JIRA_MCP_URL% ^
+  -e TICKET_KEY=%TICKET_KEY% ^
+  -e PROXY_URL=%PROXY_URL% ^
+  -e GLOBAL_PACKAGE=%GLOBAL_PACKAGE% ^
+  -e DRIVER1_PACKAGE=%DRIVER1_PACKAGE% ^
+  -e DRIVER2_PACKAGE=%DRIVER2_PACKAGE% ^
+  -e APP_ACTIVITY=%APP_ACTIVITY% ^
+  -e MAX_TURNS_PER_DRIVER=%MAX_TURNS_PER_DRIVER% ^
+  -e TOOL_TIMEOUT_S=%TOOL_TIMEOUT_S% ^
+  -e TOOL_ATTEMPTS=%TOOL_ATTEMPTS% ^
+  -v "%~dp0screenshots:/app/screenshots" ^
+  -v "%~dp0capabilities.json:/app/capabilities.json:ro" ^
+  appium-mcp-runner:latest ^
+  python3 %SCRIPT%
+
+echo.
+echo Logs et screenshots disponibles dans : %~dp0screenshots
+goto :end
+
+:error
+echo.
+echo [ERREUR] Code: %ERRORLEVEL%
+pause
+exit /b 1
+
+:end
+popd
+pause
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 docker cp script_jira_appium_v2.py <CONTAINER_ID>:/app/script_jira_appium_v2.py
 
 """
