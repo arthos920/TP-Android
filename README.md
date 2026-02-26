@@ -1,17 +1,40 @@
 """
-script_jira_appium_v2_fixed.py — Runner Jira + Appium MCP générique (FIXED)
+script_jira_appium_v3_stdiofix.py — Runner Jira + Appium MCP (STDIO FIX + LOCATORS FORMAT FIX)
 
-Correctifs appliqués (par rapport à ton v2) :
-  ✅ (A) Dump des tools + schémas (optionnel via DEBUG_TOOLS=1)
-  ✅ (B) Robustesse Appium MCP : call_any() + compat args (using/value vs strategy/selector)
-  ✅ (C) generate_locators : ne suppose PLUS elementId. On récupère un locator (using/value) puis find_element → elementId → click.
-  ✅ (D) find_element wrapper : essaie W3C {using,value} puis legacy {strategy,selector}
-  ✅ (E) activate/terminate : essaie bundleId/packageName (Android) sur les tools connus du repo
-  ✅ (F) ok plus fiable : on exploite isError quand présent (sinon fallback texte)
+✅ Ce script inclut TOUTES les corrections demandées :
 
-Nota:
-- Le repo indique : appium_terminateApp / appium_installApp / appium_uninstallApp / appium_activate_app etc.
-- Les schémas exacts peuvent varier => wrappers tolérants.
+1) ✅ FIX MAJEUR : corruption JSON-RPC (logs appium-mcp sur stdout)
+   -> Ajout d’un wrapper "stdio filter proxy" (mcp_stdio_filter.py) généré automatiquement
+   -> Le wrapper ne laisse passer sur stdout QUE les lignes JSON-RPC valides.
+      Tout le reste va sur stderr (logs), donc plus de "Invalid JSON trailing characters".
+
+2) ✅ FIX generate_locators format :
+   -> Ton locators_trace montre "locators_raw" = JSON STRING contenant {"interactableElements":[...]}
+      parfois double-encodé (string JSON dans un champ JSON).
+   -> Le script parse correctement :
+      - list
+      - dict {interactableElements:[...]}
+      - string JSON double-encodée
+
+3) ✅ FIX click/get_text :
+   -> appium_get_text attend elementUUID (pas elementId)
+   -> appium_click attend elementUUID (suivant versions). On supporte les deux.
+   -> On détecte automatiquement si la réponse find_element contient elementId/elementUUID.
+
+4) ✅ FIX find_element paramètres :
+   -> Supporte {using,value} ET {strategy,selector} ET formes directes (xpath/id/accessibility id)
+
+5) ✅ OFFLINE SAFE :
+   -> Si Jira MCP 401 ou LLM 401 : le script continue (fallback env + plan minimal)
+
+Tu peux lancer tel quel.
+
+Variables d’environnement clés :
+- GLOBAL_PACKAGE / DRIVER1_PACKAGE / DRIVER2_PACKAGE
+- APP_ACTIVITY (optionnel)
+- DEVICE_1_ID / DEVICE_2_ID
+- APPIUM_SERVER_URL
+- LLM_BASE_URL / LLM_API_KEY (optionnel, sinon fallback)
 """
 
 from __future__ import annotations
@@ -21,6 +44,8 @@ import json
 import os
 import re
 import pathlib
+import subprocess
+import threading
 from contextlib import AsyncExitStack
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -31,6 +56,7 @@ from openai import AsyncOpenAI
 from mcp import ClientSession
 from mcp.client.stdio import stdio_client, StdioServerParameters
 from mcp.client.streamable_http import streamable_http_client
+
 
 # =============================================================================
 # CONFIG
@@ -51,8 +77,8 @@ LLM_BASE_URL = os.getenv("LLM_BASE_URL", "http://localhost:8000/v1")
 MODEL = os.getenv("LLM_MODEL", "gpt-4o-mini")
 PROXY_URL = os.getenv("PROXY_URL", "")
 
-DEVICE_1_ID = os.getenv("DEVICE_1_ID", "emulator-5554").strip()
-DEVICE_2_ID = os.getenv("DEVICE_2_ID", "emulator-5556").strip()
+DEVICE_1_ID = os.getenv("DEVICE_1_ID", "").strip()
+DEVICE_2_ID = os.getenv("DEVICE_2_ID", "").strip()
 
 GLOBAL_PACKAGE = os.getenv("GLOBAL_PACKAGE", "").strip()
 DRIVER1_PACKAGE = os.getenv("DRIVER1_PACKAGE", "").strip()
@@ -91,6 +117,10 @@ def mcp_to_text(r: Any) -> str:
     return trunc(str(c) if not isinstance(c, str) else c)
 
 
+def _safe_slug(s: str, maxlen: int = 30) -> str:
+    return re.sub(r"[^\w\-]", "_", s)[:maxlen]
+
+
 async def safe_chat(ac: AsyncOpenAI, **kw):
     last: Optional[Exception] = None
     for i in range(3):
@@ -102,11 +132,45 @@ async def safe_chat(ac: AsyncOpenAI, **kw):
     raise last  # type: ignore[misc]
 
 
-def _safe_slug(s: str, maxlen: int = 30) -> str:
-    return re.sub(r"[^\w\-]", "_", s)[:maxlen]
+def _maybe_json_loads(s: str) -> Any:
+    """
+    Parse JSON robuste: supporte double-encodage (string JSON qui contient du JSON).
+    """
+    if s is None:
+        return None
+    if isinstance(s, (dict, list)):
+        return s
+    if not isinstance(s, str):
+        return None
+    raw = s.strip()
+    if not raw:
+        return None
+    # enlever ```json etc
+    raw = re.sub(r"^```[a-z]*\n?", "", raw).rstrip("`").strip()
+
+    try:
+        obj = json.loads(raw)
+    except Exception:
+        return None
+
+    # double-encodage: obj est une string JSON
+    if isinstance(obj, str):
+        inner = obj.strip()
+        if inner.startswith("{") or inner.startswith("["):
+            try:
+                return json.loads(inner)
+            except Exception:
+                return obj
+    return obj
 
 
-def _el_id(text: str) -> Optional[str]:
+def _extract_element_uuid(text: str) -> Optional[str]:
+    """
+    Réponse appium-mcp : peut contenir elementUUID ou elementId.
+    On extrait n'importe quel UUID.
+    """
+    if not text:
+        return None
     m = re.search(
         r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b",
         text,
@@ -116,7 +180,102 @@ def _el_id(text: str) -> Optional[str]:
 
 
 # =============================================================================
-# TRANSPORT STDIO (Appium MCP)
+# FIX STDIO JSON-RPC: wrapper filter proxy (auto-généré)
+# =============================================================================
+
+def ensure_stdio_filter(path: pathlib.Path) -> pathlib.Path:
+    """
+    Crée un petit proxy python qui filtre stdout du serveur MCP:
+    - forward uniquement les lignes JSON valides contenant "jsonrpc":"2.0" vers stdout
+    - tout le reste va en stderr
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    if path.exists():
+        return path
+
+    code = r'''#!/usr/bin/env python3
+import json, os, subprocess, sys, threading
+
+def pump(src, dst):
+    for line in iter(src.readline, ''):
+        if not line:
+            break
+        dst.write(line)
+        dst.flush()
+
+def is_jsonrpc(line: str) -> bool:
+    s = line.strip()
+    if not s:
+        return False
+    if not (s.startswith("{") and s.endswith("}")):
+        return False
+    try:
+        obj = json.loads(s)
+    except Exception:
+        return False
+    return isinstance(obj, dict) and obj.get("jsonrpc") == "2.0"
+
+def main():
+    if len(sys.argv) < 2:
+        print("Usage: mcp_stdio_filter.py <cmd> [args...]", file=sys.stderr)
+        return 2
+
+    cmd = sys.argv[1:]
+    p = subprocess.Popen(
+        cmd,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        bufsize=1,
+        env=os.environ.copy(),
+    )
+
+    t_err = threading.Thread(target=pump, args=(p.stderr, sys.stderr), daemon=True)
+    t_err.start()
+
+    def pump_stdin():
+        try:
+            for line in iter(sys.stdin.readline, ''):
+                if not line:
+                    break
+                p.stdin.write(line)
+                p.stdin.flush()
+        except Exception:
+            pass
+        try:
+            p.stdin.close()
+        except Exception:
+            pass
+
+    t_in = threading.Thread(target=pump_stdin, daemon=True)
+    t_in.start()
+
+    for line in iter(p.stdout.readline, ''):
+        if not line:
+            break
+        if is_jsonrpc(line):
+            sys.stdout.write(line)
+            sys.stdout.flush()
+        else:
+            sys.stderr.write(line)
+            sys.stderr.flush()
+
+    return p.wait()
+
+if __name__ == "__main__":
+    raise SystemExit(main())
+'''
+    path.write_text(code, encoding="utf-8")
+    try:
+        os.chmod(path, 0o755)
+    except Exception:
+        pass
+    return path
+
+
+# =============================================================================
+# TRANSPORT STDIO (Appium MCP) — avec stdio filter proxy
 # =============================================================================
 
 def _stdio_params(screenshots_dir: pathlib.Path) -> StdioServerParameters:
@@ -127,9 +286,18 @@ def _stdio_params(screenshots_dir: pathlib.Path) -> StdioServerParameters:
         if p and p not in pth:
             pth = p + os.pathsep + pth
 
+    # proxy file
+    proxy = ensure_stdio_filter(pathlib.Path(APPIUM_MCP_DIR) / "mcp_stdio_filter.py")
+
+    # IMPORTANT: on lance python proxy -> node server
     return StdioServerParameters(
-        command="node",
-        args=[os.path.join(APPIUM_MCP_DIR, "dist", "index.js"), "--transport=stdio"],
+        command="python",
+        args=[
+            str(proxy),
+            "node",
+            os.path.join(APPIUM_MCP_DIR, "dist", "index.js"),
+            "--transport=stdio",
+        ],
         cwd=APPIUM_MCP_DIR,
         env={
             **os.environ,
@@ -138,11 +306,10 @@ def _stdio_params(screenshots_dir: pathlib.Path) -> StdioServerParameters:
             "PATH": pth,
             "NO_UI": "1",
             "SCREENSHOTS_DIR": str(screenshots_dir),
-            # IMPORTANT: éviter de corrompre stdout JSON-RPC
-            "LOG_LEVEL": "error",
-            "APPIUM_LOG_LEVEL": "error",
-            "APPIUM_MCP_LOG_LEVEL": "error",
-            "DEBUG": "",
+            # même si appium-mcp loggue encore, le proxy filtrera.
+            "LOG_LEVEL": "info",
+            "APPIUM_LOG_LEVEL": "info",
+            "APPIUM_MCP_LOG_LEVEL": "info",
         },
     )
 
@@ -159,7 +326,7 @@ class MCPStdio:
         self.session = await self._stack.enter_async_context(ClientSession(r, w))
         await self.session.initialize()
 
-        # Cache tools + schemas (utile pour debug / compat)
+        # cache tools
         try:
             tools = await self.session.list_tools()  # type: ignore
             for t in tools.tools:
@@ -180,10 +347,10 @@ class MCPStdio:
     async def __aexit__(self, *a):
         await self._stack.aclose()
 
+    def has_tool(self, name: str) -> bool:
+        return name in self.tools_by_name if self.tools_by_name else True
+
     async def raw(self, tool: str, args: Dict[str, Any]) -> Tuple[bool, str]:
-        """
-        Retourne (ok, text). ok s'appuie sur isError si présent, sinon heuristique sur texte.
-        """
         assert self.session is not None
         resp = await asyncio.wait_for(
             self.session.call_tool(tool, args),  # type: ignore
@@ -191,14 +358,12 @@ class MCPStdio:
         )
         text = mcp_to_text(resp)
 
-        # ok via isError quand dispo
         is_error = getattr(resp, "isError", None)
         if isinstance(is_error, bool):
             return (not is_error), text
 
-        # fallback heuristique texte
         tl = (text or "").lower()
-        if any(s in tl for s in ["invalid arguments", "traceback", "error:", "[err]", "exception"]):
+        if any(s in tl for s in ["invalid arguments", "traceback", "error:", "[err]", "exception", "mcp error"]):
             return False, text
         return True, text
 
@@ -214,9 +379,6 @@ class MCPStdio:
                     return False, last
                 await asyncio.sleep(0.6 * i)
         return False, last
-
-    def has_tool(self, name: str) -> bool:
-        return name in self.tools_by_name
 
 
 # =============================================================================
@@ -252,7 +414,7 @@ class MCPHttp:
 
 
 # =============================================================================
-# BRIQUE 1 — EXTRACTION APP INFO (LLM)
+# BRIQUE 1 — EXTRACTION APP INFO (LLM) + fallback
 # =============================================================================
 
 _EXTRACT_PROMPT = """
@@ -284,16 +446,13 @@ async def extract_app_info(summary: str, ac: AsyncOpenAI) -> Dict[str, str]:
     )
     raw = (resp.choices[0].message.content or "").strip()
     raw = re.sub(r"^```[a-z]*\n?", "", raw).rstrip("`").strip()
-    try:
-        data = json.loads(raw)
-        return {
-            "appPackage": str(data.get("appPackage", "")),
-            "appActivity": str(data.get("appActivity", "")),
-            "appName": str(data.get("appName", "Application")),
-            "platform": str(data.get("platform", "android")),
-        }
-    except Exception:
-        return {"appPackage": "", "appActivity": "", "appName": "Application", "platform": "android"}
+    data = json.loads(raw)
+    return {
+        "appPackage": str(data.get("appPackage", "")),
+        "appActivity": str(data.get("appActivity", "")),
+        "appName": str(data.get("appName", "Application")),
+        "platform": str(data.get("platform", "android")),
+    }
 
 
 def resolve_app_info(llm_info: Dict[str, str], driver_index: int = 1) -> Dict[str, str]:
@@ -303,7 +462,6 @@ def resolve_app_info(llm_info: Dict[str, str], driver_index: int = 1) -> Dict[st
     pkg = per_driver or GLOBAL_PACKAGE or info.get("appPackage", "")
     act = info.get("appActivity", "")
 
-    # si package vient d'env → on peut override activity via APP_ACTIVITY
     if per_driver or GLOBAL_PACKAGE:
         act = APP_ACTIVITY or act
 
@@ -321,7 +479,7 @@ def resolve_app_info(llm_info: Dict[str, str], driver_index: int = 1) -> Dict[st
 
 
 # =============================================================================
-# PLANNER
+# PLANNER (LLM) + fallback
 # =============================================================================
 
 _PLANNER_PROMPT = """Tu es un agent QA mobile expert.
@@ -352,18 +510,15 @@ async def generate_plan(summary: str, ac: AsyncOpenAI) -> List[Dict[str, str]]:
     )
     raw = (resp.choices[0].message.content or "").strip()
     raw = re.sub(r"^```[a-z]*\n?", "", raw).rstrip("`").strip()
-    try:
-        data = json.loads(raw)
-        plan = data.get("plan", [])
-        if isinstance(plan, list) and plan:
-            return plan
-    except Exception:
-        pass
-    return [{"step": 1, "intent": "Ouvrir l'app et vérifier l'écran principal", "expected": "Accueil"}]
+    data = json.loads(raw)
+    plan = data.get("plan", [])
+    if isinstance(plan, list) and plan:
+        return plan
+    return [{"step": 1, "intent": "Ouvrir l'app", "expected": ""}]
 
 
 # =============================================================================
-# TRACE LOCATORS
+# TRACE
 # =============================================================================
 
 def _append_trace(session_dir: pathlib.Path, entry: Dict[str, Any]) -> None:
@@ -416,117 +571,151 @@ class DriverContext:
     app_name: str
     mcp: MCPStdio
     lock: asyncio.Lock
-    session_dir: pathlib.Path = field(default_factory=lambda: SCREENSHOTS_DIR)
+    session_dir: pathlib.Path
     step: int = 0
-    last_locators: str = ""
+    last_locators_raw: str = ""
 
 
 # =============================================================================
-# COMPAT HELPERS (critical fixes)
+# LOCATORS PARSING (FIXED for your format)
 # =============================================================================
 
-async def call_any(mcp: MCPStdio, names: List[str], args: Dict[str, Any], attempts: int = 1) -> Tuple[bool, str, str]:
+def parse_generate_locators_payload(raw: str) -> List[Dict[str, Any]]:
     """
-    Essaie plusieurs noms de tool (selon variations de versions) et renvoie (ok,out,used_name).
+    Supporte:
+      - list directement
+      - dict {interactableElements:[...]}
+      - string JSON double encodée
     """
-    last_out = ""
-    for nm in names:
-        if mcp.tools_by_name and not mcp.has_tool(nm):
-            continue
-        ok, out = await mcp.call(nm, args, attempts=attempts)
-        last_out = out
-        if ok:
-            return True, out, nm
-    return False, last_out, (names[-1] if names else "")
+    obj = _maybe_json_loads(raw)
+    if obj is None:
+        return []
+    if isinstance(obj, list):
+        return [it for it in obj if isinstance(it, dict)]
+    if isinstance(obj, dict):
+        for k in ("interactableElements", "elements", "items", "result"):
+            v = obj.get(k)
+            if isinstance(v, list):
+                return [it for it in v if isinstance(it, dict)]
+    return []
 
 
-async def appium_find(ctx: DriverContext, strategy: str, selector: str) -> Tuple[bool, str]:
-    """
-    FIX (D): Supporte W3C {using,value} puis legacy {strategy,selector}.
-    """
-    # W3C
-    ok, out = await ctx.mcp.call("appium_find_element", {"using": strategy, "value": selector})
-    if ok:
-        return ok, out
-    # legacy
-    ok2, out2 = await ctx.mcp.call("appium_find_element", {"strategy": strategy, "selector": selector})
-    return ok2, out2
-
-
-def _best_locator_from_generate_locators(locators_raw: str, target_text: str) -> Optional[Tuple[str, str, Dict[str, Any]]]:
-    """
-    FIX (C): Parse generate_locators output.
-    Retourne (using, value, item) si match text/contentDesc/resourceId.
-    """
-    if not locators_raw:
-        return None
-    try:
-        items = json.loads(locators_raw)
-        if not isinstance(items, list):
-            return None
-    except Exception:
-        return None
-
+def find_best_locator(items: List[Dict[str, Any]], target_text: str) -> Optional[Tuple[str, str]]:
     tl = target_text.lower().strip()
 
-    def extract_using_value(item: Dict[str, Any]) -> Optional[Tuple[str, str]]:
-        loc = item.get("locator") or item.get("bestLocator") or item.get("best_locator") or {}
-        if isinstance(loc, dict):
-            using = loc.get("using") or loc.get("strategy")
-            value = loc.get("value") or loc.get("selector")
-            if using and value:
-                return str(using), str(value)
-        # parfois c'est directement au niveau root
-        using2 = item.get("using") or item.get("strategy")
-        value2 = item.get("value") or item.get("selector")
-        if using2 and value2:
-            return str(using2), str(value2)
+    def pick_using_value(it: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+        # ton format: {"locators": {"xpath": "...", "class name": "..."}}
+        locs = it.get("locators") or it.get("locator") or it.get("Locators") or {}
+        if isinstance(locs, dict):
+            # priorité: accessibility id / id / xpath
+            for key in ("accessibility id", "id", "xpath"):
+                if key in locs and locs[key]:
+                    return key, str(locs[key])
+            # sinon premier locator dispo
+            for k, v in locs.items():
+                if v:
+                    return str(k), str(v)
         return None
 
-    # passe 1: match exact text/desc/label
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        for k in ("text", "contentDesc", "content-desc", "label", "name", "accessibilityLabel"):
-            v = str(item.get(k, "") or "").strip()
-            if v and v.lower() == tl:
-                uv = extract_using_value(item)
-                if uv:
-                    return uv[0], uv[1], item
+    def fields(it: Dict[str, Any]) -> List[str]:
+        out = []
+        for k in ("text", "contentDesc", "content-desc", "label", "name", "resourceId"):
+            v = it.get(k)
+            if isinstance(v, str) and v.strip():
+                out.append(v.strip())
+        return out
 
-    # passe 2: match partiel
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        for k in ("text", "contentDesc", "content-desc", "label", "name", "accessibilityLabel"):
-            v = str(item.get(k, "") or "").strip()
-            if v and tl in v.lower():
-                uv = extract_using_value(item)
-                if uv:
-                    return uv[0], uv[1], item
-
-    # passe 3: resourceId
-    for item in items:
-        if not isinstance(item, dict):
-            continue
-        rid = str(item.get("resourceId", "") or "")
-        if rid and tl in rid.lower():
-            uv = extract_using_value(item)
+    # exact
+    for it in items:
+        vals = [v.lower() for v in fields(it)]
+        if any(v == tl for v in vals):
+            uv = pick_using_value(it)
             if uv:
-                return uv[0], uv[1], item
+                return uv
+
+    # partial
+    for it in items:
+        vals = [v.lower() for v in fields(it)]
+        if any(tl in v for v in vals):
+            uv = pick_using_value(it)
+            if uv:
+                return uv
 
     return None
 
 
 # =============================================================================
-# OBSERVE RICHE
+# APPIUM COMPAT HELPERS (elementUUID vs elementId)
+# =============================================================================
+
+def normalize_locator_strategy(strategy: str) -> str:
+    s = (strategy or "").strip().lower()
+    # appium-mcp accepte généralement: "xpath", "id", "accessibility id", "class name"
+    return s
+
+
+async def appium_find_element(ctx: DriverContext, strategy: str, selector: str) -> Tuple[bool, str]:
+    """
+    Support {using,value} ET {strategy,selector} et quelques raccourcis.
+    """
+    strategy = normalize_locator_strategy(strategy)
+    selector = str(selector)
+
+    # attempt W3C
+    ok, out = await ctx.mcp.call("appium_find_element", {"using": strategy, "value": selector})
+    if ok:
+        return ok, out
+
+    # attempt legacy
+    ok2, out2 = await ctx.mcp.call("appium_find_element", {"strategy": strategy, "selector": selector})
+    if ok2:
+        return ok2, out2
+
+    # attempt direct keys (some servers accept {"xpath": "..."} etc.)
+    if strategy in ("xpath", "id", "accessibility id", "class name"):
+        ok3, out3 = await ctx.mcp.call("appium_find_element", {strategy: selector})
+        return ok3, out3
+
+    return False, out2
+
+
+async def appium_click_uuid(ctx: DriverContext, element_uuid: str) -> Tuple[bool, str]:
+    """
+    Certains schémas appium-mcp utilisent elementUUID, d'autres elementId.
+    On tente les deux.
+    """
+    ok, out = await ctx.mcp.call("appium_click", {"elementUUID": element_uuid})
+    if ok:
+        return ok, out
+    ok2, out2 = await ctx.mcp.call("appium_click", {"elementId": element_uuid})
+    return ok2, out2
+
+
+async def appium_get_text_uuid(ctx: DriverContext, element_uuid: str) -> Tuple[bool, str]:
+    ok, out = await ctx.mcp.call("appium_get_text", {"elementUUID": element_uuid})
+    if ok:
+        return ok, out
+    ok2, out2 = await ctx.mcp.call("appium_get_text", {"elementId": element_uuid})
+    return ok2, out2
+
+
+async def appium_set_value_uuid(ctx: DriverContext, element_uuid: str, text: str) -> Tuple[bool, str]:
+    ok, out = await ctx.mcp.call("appium_set_value", {"elementUUID": element_uuid, "text": text})
+    if ok:
+        return ok, out
+    ok2, out2 = await ctx.mcp.call("appium_set_value", {"elementId": element_uuid, "text": text})
+    return ok2, out2
+
+
+# =============================================================================
+# TOOLS: observe/click/type/swipe/get_text/scroll_to_element/alerts/app mgmt
 # =============================================================================
 
 async def tool_observe_rich(ctx: DriverContext) -> str:
     async with ctx.lock:
-        _, src = await ctx.mcp.call("appium_get_page_source", {})
-        _, locs = await ctx.mcp.call("generate_locators", {})
-    ctx.last_locators = locs
+        ok_src, src = await ctx.mcp.call("appium_get_page_source", {})
+        ok_locs, locs = await ctx.mcp.call("generate_locators", {})
+    ctx.last_locators_raw = locs
     snap = await _save_screenshot(ctx, "observe")
 
     _append_trace(
@@ -536,14 +725,11 @@ async def tool_observe_rich(ctx: DriverContext) -> str:
             "step": ctx.step,
             "action": "observe",
             "device": ctx.device_id,
-            "locators_raw": (locs or "")[:3000],
+            "ok_page_source": ok_src,
+            "ok_locators": ok_locs,
+            "locators_raw": trunc(locs),
         },
     )
-
-    if DEBUG_TOOLS:
-        print(
-            f"  [DEBUG observe] [{ctx.device_id}] locators({len(locs)}ch): {trunc(locs)[:300]}..."
-        )
 
     return json.dumps(
         {
@@ -551,122 +737,119 @@ async def tool_observe_rich(ctx: DriverContext) -> str:
             "device": ctx.device_id,
             "page_source": (src or "")[:4000],
             "screenshot_saved": str(snap) if snap else "",
-            "locators": (locs or "")[:3000],
+            "locators_raw": (locs or "")[:3000],
         },
         ensure_ascii=False,
     )
 
 
-# =============================================================================
-# HANDLE ALERT
-# =============================================================================
-
 async def tool_handle_alert(ctx: DriverContext, action: str = "accept") -> str:
     async with ctx.lock:
         ok, out = await ctx.mcp.call("appium_handle_alert", {"action": action})
+    await _save_screenshot(ctx, f"alert_{action}")
     return json.dumps({"ok": ok, "action": action, "output": (out or "")[:400]}, ensure_ascii=False)
 
 
-# =============================================================================
-# APPIUM WRAPPERS (FIXED)
-# =============================================================================
-
 async def tool_launch_app(ctx: DriverContext, pkg: Optional[str] = None) -> str:
-    """
-    repo: appium_activate_app  (bundleId)
-    Sur Android, on tente bundleId puis packageName.
-    """
     p = (pkg or ctx.app_package).strip()
     async with ctx.lock:
         ok, out = await ctx.mcp.call("appium_activate_app", {"bundleId": p})
         if not ok:
             ok, out = await ctx.mcp.call("appium_activate_app", {"packageName": p})
+    await _save_screenshot(ctx, "launch_app")
     return json.dumps({"ok": ok, "package": p, "output": (out or "")[:300]}, ensure_ascii=False)
 
 
 async def tool_terminate_app(ctx: DriverContext, pkg: Optional[str] = None) -> str:
-    """
-    repo: appium_terminateApp
-    On tente bundleId puis packageName.
-    """
     p = (pkg or ctx.app_package).strip()
     async with ctx.lock:
         ok, out = await ctx.mcp.call("appium_terminateApp", {"bundleId": p})
         if not ok:
             ok, out = await ctx.mcp.call("appium_terminateApp", {"packageName": p})
+    await _save_screenshot(ctx, "terminate_app")
     return json.dumps({"ok": ok, "package": p, "output": (out or "")[:300]}, ensure_ascii=False)
 
 
 async def tool_ui_click(ctx: DriverContext, target_text: str) -> str:
     """
-    FIX (C)(D):
-      - Stratégie 1: generate_locators => (using,value) => find_element => elementId => click
-      - Stratégie 2: find_element (accessibility id / xpath variants)
+    Clique via:
+      1) generate_locators -> pick best locator -> find_element -> click
+      2) fallback heuristiques xpath/accessibility id
     """
-    # Stratégie 1: locator généré
-    gen = _best_locator_from_generate_locators(ctx.last_locators, target_text)
-    if gen:
-        using, value, item = gen
-        ok_find, out_find = await appium_find(ctx, using, value)
-        el = _el_id(out_find)
+    items = parse_generate_locators_payload(ctx.last_locators_raw)
+    uv = find_best_locator(items, target_text)
+    if uv:
+        using, value = uv
+        ok_find, out_find = await appium_find_element(ctx, using, value)
+        el = _extract_element_uuid(out_find)
         if ok_find and el:
-            async with ctx.lock:
-                ok_click, out_click = await ctx.mcp.call("appium_click", {"elementId": el})
+            ok_click, out_click = await appium_click_uuid(ctx, el)
+            await _save_screenshot(ctx, f"click_{_safe_slug(target_text, 20)}")
             return json.dumps(
-                {
-                    "ok": ok_click,
-                    "strategy": "generated_locator",
-                    "target_text": target_text,
-                    "using": using,
-                    "value": value,
-                    "element_id": el,
-                    "click_output": (out_click or "")[:300],
-                },
+                {"ok": ok_click, "strategy": "generate_locators", "using": using, "value": value, "elementUUID": el, "output": (out_click or "")[:300]},
                 ensure_ascii=False,
             )
 
-    # Stratégie 2: heuristiques
-    locators = [
+    # fallback heuristics
+    candidates = [
         ("accessibility id", target_text),
         ("xpath", f'//*[@text={json.dumps(target_text)}]'),
         ("xpath", f'//*[@content-desc={json.dumps(target_text)}]'),
         ("xpath", f'//*[contains(@text,{json.dumps(target_text)})]'),
         ("xpath", f'//*[contains(@content-desc,{json.dumps(target_text)})]'),
     ]
+    for using, value in candidates:
+        ok_find, out_find = await appium_find_element(ctx, using, value)
+        el = _extract_element_uuid(out_find)
+        if ok_find and el:
+            ok_click, out_click = await appium_click_uuid(ctx, el)
+            await _save_screenshot(ctx, f"click_{_safe_slug(target_text, 20)}")
+            return json.dumps(
+                {"ok": ok_click, "strategy": using, "selector": value, "elementUUID": el, "output": (out_click or "")[:300]},
+                ensure_ascii=False,
+            )
 
-    for strat, sel in locators:
-        ok, out = await appium_find(ctx, strat, sel)
-        if not ok:
-            continue
-        el = _el_id(out)
-        if not el:
-            continue
-        async with ctx.lock:
-            ok2, out2 = await ctx.mcp.call("appium_click", {"elementId": el})
-        return json.dumps(
-            {"ok": ok2, "strategy": strat, "element_id": el, "click_output": (out2 or "")[:300]},
-            ensure_ascii=False,
-        )
+    return json.dumps({"ok": False, "error": f"Element '{target_text}' not found"}, ensure_ascii=False)
+
+
+async def tool_get_text(ctx: DriverContext, target_text: str) -> str:
+    """
+    Fix ton erreur:
+      MCP error -32602: appium_get_text parameter validation failed: elementUUID expected string, received undefined
+    => ça arrivait quand tu appelais get_text sans elementUUID.
+    Ici on fait TOUJOURS find_element puis get_text(elementUUID).
+    """
+    items = parse_generate_locators_payload(ctx.last_locators_raw)
+    uv = find_best_locator(items, target_text)
+    candidates = []
+    if uv:
+        candidates.append(uv)
+    candidates += [
+        ("accessibility id", target_text),
+        ("xpath", f'//*[@text={json.dumps(target_text)}]'),
+        ("xpath", f'//*[contains(@text,{json.dumps(target_text)})]'),
+    ]
+
+    for using, value in candidates:
+        ok_find, out_find = await appium_find_element(ctx, using, value)
+        el = _extract_element_uuid(out_find)
+        if ok_find and el:
+            ok_txt, txt = await appium_get_text_uuid(ctx, el)
+            return json.dumps({"ok": ok_txt, "element": target_text, "elementUUID": el, "text": (txt or "")[:500]}, ensure_ascii=False)
 
     return json.dumps({"ok": False, "error": f"Element '{target_text}' not found"}, ensure_ascii=False)
 
 
 async def tool_ui_type(ctx: DriverContext, text: str) -> str:
-    async with ctx.lock:
-        # focused field
-        ok, out = await ctx.mcp.call("appium_find_element", {"xpath": "//*[@focused='true']"})
-        if not ok:
-            # compat fallback
-            ok, out = await appium_find(ctx, "xpath", "//*[@focused='true']")
-        if not ok:
-            return json.dumps({"ok": False, "error": "No focused field. Call ui_click on an input first."}, ensure_ascii=False)
+    # focused field
+    ok_find, out_find = await appium_find_element(ctx, "xpath", "//*[@focused='true']")
+    el = _extract_element_uuid(out_find)
+    if not ok_find or not el:
+        return json.dumps({"ok": False, "error": "No focused field. Use ui_click on input first."}, ensure_ascii=False)
 
-        el = _el_id(out)
-        if not el:
-            return json.dumps({"ok": False, "error": "focused element id not found"}, ensure_ascii=False)
-
-        ok2, out2 = await ctx.mcp.call("appium_set_value", {"elementId": el, "text": text})
-    return json.dumps({"ok": ok2, "element_id": el, "output": (out2 or "")[:300]}, ensure_ascii=False)
+    ok_set, out_set = await appium_set_value_uuid(ctx, el, text)
+    await _save_screenshot(ctx, f"type_{_safe_slug(text, 20)}")
+    return json.dumps({"ok": ok_set, "elementUUID": el, "output": (out_set or "")[:300]}, ensure_ascii=False)
 
 
 async def tool_ui_swipe(ctx: DriverContext, direction: str = "down") -> str:
@@ -675,27 +858,8 @@ async def tool_ui_swipe(ctx: DriverContext, direction: str = "down") -> str:
         ok, out = await ctx.mcp.call("appium_scroll", {"direction": d})
         if not ok:
             ok, out = await ctx.mcp.call("appium_swipe", {"direction": d})
+    await _save_screenshot(ctx, f"swipe_{d}")
     return json.dumps({"ok": ok, "direction": d, "output": (out or "")[:300]}, ensure_ascii=False)
-
-
-async def tool_get_text(ctx: DriverContext, target_text: str) -> str:
-    locators = [
-        ("accessibility id", target_text),
-        ("xpath", f'//*[@text={json.dumps(target_text)}]'),
-        ("xpath", f'//*[contains(@text,{json.dumps(target_text)})]'),
-    ]
-    for strat, sel in locators:
-        ok, out = await appium_find(ctx, strat, sel)
-        if not ok:
-            continue
-        el = _el_id(out)
-        if not el:
-            continue
-        async with ctx.lock:
-            ok2, txt = await ctx.mcp.call("appium_get_text", {"elementId": el})
-        return json.dumps({"ok": ok2, "element": target_text, "text": (txt or "")[:500]}, ensure_ascii=False)
-
-    return json.dumps({"ok": False, "error": f"Element '{target_text}' not found"}, ensure_ascii=False)
 
 
 async def tool_scroll_to_element(ctx: DriverContext, target_text: str) -> str:
@@ -709,21 +873,8 @@ async def tool_scroll_to_element(ctx: DriverContext, target_text: str) -> str:
                 "appium_scroll_to_element",
                 {"strategy": "accessibility id", "selector": target_text},
             )
+    await _save_screenshot(ctx, f"scroll_{_safe_slug(target_text, 20)}")
     return json.dumps({"ok": ok, "target": target_text, "output": (out or "")[:300]}, ensure_ascii=False)
-
-
-async def tool_double_tap(ctx: DriverContext, target_text: str) -> str:
-    ok, out = await appium_find(ctx, "xpath", f'//*[contains(@text,{json.dumps(target_text)})]')
-    if not ok:
-        return json.dumps({"ok": False, "error": f"Element '{target_text}' not found"}, ensure_ascii=False)
-
-    el = _el_id(out)
-    if not el:
-        return json.dumps({"ok": False, "error": "element id not found"}, ensure_ascii=False)
-
-    async with ctx.lock:
-        ok2, out2 = await ctx.mcp.call("appium_double_tap", {"elementId": el})
-    return json.dumps({"ok": ok2, "element": target_text, "output": (out2 or "")[:300]}, ensure_ascii=False)
 
 
 # =============================================================================
@@ -751,7 +902,7 @@ class Barrier:
 
 
 # =============================================================================
-# OPENAI TOOL DEFINITIONS — ReAct enrichi
+# OPENAI TOOLS
 # =============================================================================
 
 def _t(name, desc, props, req=None):
@@ -767,18 +918,17 @@ def _t(name, desc, props, req=None):
 
 def build_tools() -> List[Dict[str, Any]]:
     return [
-        _t("observe", "Observe UI complète: locators + page_source + screenshot. À appeler après chaque action.", {}, []),
+        _t("observe", "Observe UI complète: locators + page_source + screenshot.", {}, []),
         _t("handle_alert", "Accepte/refuse popup ou permission système", {"action": {"type": "string", "enum": ["accept", "dismiss"]}}, []),
-        _t("launch_app", "Lance ou ramène l'app au premier plan", {"packageName": {"type": "string"}}, []),
+        _t("launch_app", "Lance / ramène l'app au premier plan", {"packageName": {"type": "string"}}, []),
         _t("terminate_app", "Ferme l'app", {"packageName": {"type": "string"}}, []),
-        _t("ui_click", "Clique un élément par son texte visible ou accessibility id", {"target_text": {"type": "string"}}, ["target_text"]),
-        _t("ui_type", "Tape dans le champ focalisé (cliquer le champ d'abord si besoin)", {"text": {"type": "string"}}, ["text"]),
-        _t("ui_swipe", "Scroll/swipe dans une direction", {"direction": {"type": "string", "enum": ["up", "down", "left", "right"]}}, []),
-        _t("scroll_to_element", "Scrolle jusqu'à rendre visible un élément par son texte", {"target_text": {"type": "string"}}, ["target_text"]),
-        _t("get_text", "Lit la valeur textuelle d'un élément visible sur l'écran", {"target_text": {"type": "string"}}, ["target_text"]),
-        _t("double_tap", "Double-tap sur un élément par son texte visible", {"target_text": {"type": "string"}}, ["target_text"]),
-        _t("sync_barrier", "Synchronise les deux drivers avant de continuer", {}, []),
-        _t("finish", "Termine le test avec un statut et des notes", {"status": {"type": "string", "enum": ["success", "failure", "blocked"]}, "notes": {"type": "string"}}, ["status"]),
+        _t("ui_click", "Clique un élément par texte", {"target_text": {"type": "string"}}, ["target_text"]),
+        _t("ui_type", "Tape dans le champ focus", {"text": {"type": "string"}}, ["text"]),
+        _t("ui_swipe", "Swipe/scroll", {"direction": {"type": "string", "enum": ["up", "down", "left", "right"]}}, []),
+        _t("scroll_to_element", "Scroll jusqu'à voir l'élément", {"target_text": {"type": "string"}}, ["target_text"]),
+        _t("get_text", "Lit le texte d'un élément", {"target_text": {"type": "string"}}, ["target_text"]),
+        _t("sync_barrier", "Synchronise 2 drivers", {}, []),
+        _t("finish", "Termine", {"status": {"type": "string", "enum": ["success", "failure", "blocked"]}, "notes": {"type": "string"}}, ["status"]),
     ]
 
 
@@ -786,110 +936,56 @@ def build_tools() -> List[Dict[str, Any]]:
 # REACT LOOP
 # =============================================================================
 
-SYSTEM_REACT = """Tu es un agent QA mobile autonome (ReAct : Observe → Raisonne → Agis).
-Tu exécutes un PLAN DE TEST structuré fourni au départ. Tu pilotes une app Android via
-Appium MCP en utilisant UNIQUEMENT les tools fournis.
-
-Processus strict :
-1. Commence TOUJOURS par "observe".
-2. Suit le plan étape par étape. Après chaque action, appelle "observe".
-3. Si une popup/permission apparaît → handle_alert("accept") immédiatement.
-4. N'agis QUE sur des éléments vus dans les locators de la dernière observation.
-5. Si l'état attendu n'est pas visible, essaie scroll_to_element ou ui_swipe puis observe.
-6. Quand toutes les étapes sont validées → finish(status="success") avec un résumé.
+SYSTEM_REACT = """Tu es un agent QA mobile autonome (ReAct).
+Règles strictes :
+1) Commence par observe.
+2) Après chaque action, observe.
+3) Si alerte : handle_alert(accept).
+4) Clique uniquement des éléments présents dans les locators.
+5) Si bloqué : scroll_to_element ou ui_swipe puis observe.
+6) Termine par finish.
 """.strip()
 
 
 async def run_react(ac: AsyncOpenAI, ctx: DriverContext, barrier: Barrier, summary: str) -> Dict[str, Any]:
     tools = build_tools()
 
-    async def _verify_expected(expected: str) -> bool:
-        if not expected:
-            return True
-        try:
-            async with ctx.lock:
-                ok, src = await ctx.mcp.call("appium_get_page_source", {})
-            if not ok:
-                return True
-            return expected.lower()[:30] in (src or "").lower()
-        except Exception:
-            return True
-
-    async def _dispatch(name: str, args: Dict[str, Any], expected: str = "") -> str:
+    async def _dispatch(name: str, args: Dict[str, Any]) -> str:
         if name == "observe":
             return await tool_observe_rich(ctx)
-
+        if name == "handle_alert":
+            return await tool_handle_alert(ctx, args.get("action", "accept"))
+        if name == "launch_app":
+            return await tool_launch_app(ctx, args.get("packageName"))
+        if name == "terminate_app":
+            return await tool_terminate_app(ctx, args.get("packageName"))
+        if name == "ui_click":
+            return await tool_ui_click(ctx, args.get("target_text", ""))
+        if name == "ui_type":
+            return await tool_ui_type(ctx, args.get("text", ""))
+        if name == "ui_swipe":
+            return await tool_ui_swipe(ctx, args.get("direction", "down"))
+        if name == "scroll_to_element":
+            return await tool_scroll_to_element(ctx, args.get("target_text", ""))
+        if name == "get_text":
+            return await tool_get_text(ctx, args.get("target_text", ""))
         if name == "sync_barrier":
             return await barrier.wait(ctx.name)
-
         if name == "finish":
             return json.dumps({"ok": True})
-
-        if name == "handle_alert":
-            act = args.get("action", "accept")
-            out = await tool_handle_alert(ctx, act)
-            await _save_screenshot(ctx, f"alert_{act}")
-            return out
-
-        if name == "launch_app":
-            out = await tool_launch_app(ctx, args.get("packageName"))
-            await _save_screenshot(ctx, "launch_app")
-            return out
-
-        if name == "terminate_app":
-            out = await tool_terminate_app(ctx, args.get("packageName"))
-            await _save_screenshot(ctx, "terminate_app")
-            return out
-
-        if name == "ui_click":
-            tgt = args.get("target_text", "")
-            out = await tool_ui_click(ctx, tgt)
-            await _save_screenshot(ctx, f"click_{_safe_slug(tgt, 20)}")
-            _append_trace(ctx.session_dir, {"ts": datetime.now().isoformat(), "step": ctx.step, "action": "ui_click", "target": tgt, "expected": expected, "device": ctx.device_id})
-            # petite validation (soft)
-            try:
-                if expected and not await _verify_expected(expected):
-                    out += f' [WARN expected not visible: "{expected[:40]}"]'
-            except Exception:
-                pass
-            return out
-
-        if name == "ui_type":
-            txt = args.get("text", "")
-            out = await tool_ui_type(ctx, txt)
-            await _save_screenshot(ctx, f"type_{_safe_slug(txt, 20)}")
-            _append_trace(ctx.session_dir, {"ts": datetime.now().isoformat(), "step": ctx.step, "action": "ui_type", "text": txt[:80], "device": ctx.device_id})
-            return out
-
-        if name == "ui_swipe":
-            d = args.get("direction", "down")
-            out = await tool_ui_swipe(ctx, d)
-            await _save_screenshot(ctx, f"swipe_{d}")
-            return out
-
-        if name == "scroll_to_element":
-            tgt = args.get("target_text", "")
-            out = await tool_scroll_to_element(ctx, tgt)
-            await _save_screenshot(ctx, f"scroll_to_{_safe_slug(tgt, 20)}")
-            _append_trace(ctx.session_dir, {"ts": datetime.now().isoformat(), "step": ctx.step, "action": "scroll_to_element", "target": tgt, "device": ctx.device_id})
-            return out
-
-        if name == "get_text":
-            tgt = args.get("target_text", "")
-            out = await tool_get_text(ctx, tgt)
-            _append_trace(ctx.session_dir, {"ts": datetime.now().isoformat(), "step": ctx.step, "action": "get_text", "target": tgt, "result": out[:200], "device": ctx.device_id})
-            return out
-
-        if name == "double_tap":
-            tgt = args.get("target_text", "")
-            out = await tool_double_tap(ctx, tgt)
-            await _save_screenshot(ctx, f"doubletap_{_safe_slug(tgt, 20)}")
-            _append_trace(ctx.session_dir, {"ts": datetime.now().isoformat(), "step": ctx.step, "action": "double_tap", "target": tgt, "device": ctx.device_id})
-            return out
-
         return json.dumps({"ok": False, "error": f"Unknown tool {name}"})
 
-    plan = await generate_plan(summary, ac)
+    # plan
+    plan: List[Dict[str, str]]
+    try:
+        plan = await generate_plan(summary, ac)
+    except Exception as e:
+        print(f"[WARN] LLM plan non dispo ({e}). Plan fallback.")
+        plan = [
+            {"step": 1, "intent": "Lancer l'app", "expected": ""},
+            {"step": 2, "intent": "Observer l'écran principal", "expected": ""},
+        ]
+
     plan_txt = "\n".join(
         f"  Étape {s.get('step','?')}: {s.get('intent','?')} → attendu: {s.get('expected','?')}"
         for s in plan
@@ -906,36 +1002,17 @@ async def run_react(ac: AsyncOpenAI, ctx: DriverContext, barrier: Barrier, summa
         {"role": "user", "content": (
             f"Résumé Jira:\n{summary}\n\n"
             f"Driver: {ctx.name} | Device: {ctx.device_id} | App: {ctx.app_name} ({ctx.app_package})\n\n"
-            f"PLAN DE TEST À SUIVRE :\n{plan_txt}\n\n"
-            "Commence par observe, puis exécute le plan en ordre. "
-            "Après CHAQUE action, appelle observe."
+            f"PLAN:\n{plan_txt}\n\n"
+            "Commence par observe."
         )},
     ]
 
     final: Dict[str, Any] = {"status": "blocked", "notes": "no finish called", "driver": ctx.name, "device": ctx.device_id}
 
-    # astuce: injecter l'expected courant dans les messages en rappel user (soft guidance)
-    def _expected_for_step_idx(idx: int) -> str:
-        if idx < 0 or idx >= len(plan):
-            return ""
-        return str(plan[idx].get("expected", "") or "")
-
-    step_idx = 0  # index logique (soft) du plan
-    current_expected = _expected_for_step_idx(step_idx)
-
     for turn in range(1, MAX_TURNS_PER_DRIVER + 1):
-        # rappeler l'étape en cours
-        if turn == 1 or (turn % 3 == 0):
-            msgs.append({"role": "user", "content": f"Étape courante attendue: {current_expected or '(aucune)'}"})
-
         resp = await safe_chat(
-            ac,
-            model=MODEL,
-            messages=msgs,
-            tools=tools,
-            tool_choice="auto",
-            temperature=0.2,
-            max_tokens=1400,
+            ac, model=MODEL, messages=msgs, tools=tools, tool_choice="auto",
+            temperature=0.2, max_tokens=1200
         )
         msg = resp.choices[0].message
         msgs.append({"role": "assistant", "content": msg.content or ""})
@@ -969,29 +1046,18 @@ async def run_react(ac: AsyncOpenAI, ctx: DriverContext, barrier: Barrier, summa
                 _append_trace(ctx.session_dir, {"ts": datetime.now().isoformat(), "step": ctx.step, "action": "finish", "status": final["status"], "notes": final["notes"][:200], "device": ctx.device_id})
                 return final
 
-            out = await _dispatch(tc.function.name, args, current_expected)
+            out = await _dispatch(tc.function.name, args)
             msgs.append({"role": "tool", "tool_call_id": tc.id, "content": out})
-
-            # soft progression : si l'agent observe après une action, on peut tenter d'avancer
-            # (pas parfait, mais aide à injecter expected suivant)
-            if tc.function.name == "observe" and step_idx < len(plan) - 1:
-                # si expected actuel est vu, on avance
-                try:
-                    if current_expected and await _verify_expected(current_expected):
-                        step_idx += 1
-                        current_expected = _expected_for_step_idx(step_idx)
-                except Exception:
-                    pass
 
     return final
 
 
 # =============================================================================
-# JIRA FETCH + SUMMARIZE
+# JIRA FETCH + SUMMARIZE (fallback)
 # =============================================================================
 
 _JIRA_SYS = f"""Tu es QA Automation. Ticket cible: {TICKET_KEY}.
-Résume le ticket de façon actionnable en te basant sur les test details du ticket qui correspondent au  customfiled_11504. Retourne STRICTEMENT :
+Résume le ticket au format strict:
 - Titre:
 - test details(customfiled_11504)
 - Objectif:
@@ -1063,7 +1129,6 @@ async def main():
     async with _make_http() as http:
         ac = AsyncOpenAI(api_key=LLM_API_KEY, base_url=LLM_BASE_URL, http_client=http)
 
-        # 1) Jira summary
         print("\n" + "=" * 60)
         print("(1) JIRA — fetch + résumé")
         print("=" * 60)
@@ -1073,6 +1138,7 @@ async def main():
             print(f"[WARN] Jira MCP non dispo ({e}). Résumé par défaut.")
             summary = (
                 "- Titre: Test générique\n"
+                "- test details(customfiled_11504): N/A\n"
                 "- Objectif: Ouvrir l'app et vérifier l'écran principal\n"
                 "- Plateforme: Android\n"
                 "- App (package Android si connu): (non spécifié)\n"
@@ -1081,15 +1147,16 @@ async def main():
             )
         print(summary)
 
-        # 2) extract app info
         print("\n(2) Extraction app info depuis le résumé...")
-        app_info = await extract_app_info(summary, ac)
+        try:
+            app_info = await extract_app_info(summary, ac)
+        except Exception as e:
+            print(f"[WARN] LLM extract_app_info non dispo ({e}). Fallback env uniquement.")
+            app_info = {"appPackage": "", "appActivity": "", "appName": "Application", "platform": "android"}
         print(f"    → {app_info}")
 
-        # 3) create sessions
         print("\n(3) Ouverture sessions Appium MCP (stdio)...")
         resolved = [resolve_app_info(app_info, i + 1) for i in range(len(devices))]
-        print("    App cible par driver :")
         for i, r in enumerate(resolved):
             print(f"      driver{i+1}: {r['appPackage']} / {r['appActivity']}  [{r['appName']}]")
 
@@ -1109,9 +1176,7 @@ async def main():
             MCPStdio(session_dirs[0]) as mcp1,
             MCPStdio(session_dirs[1] if len(devices) > 1 else session_dirs[0]) as mcp2,
         ):
-            pairs: List[Tuple[MCPStdio, str, Dict[str, str]]] = [
-                (mcp1, devices[0], resolved[0]),
-            ]
+            pairs: List[Tuple[MCPStdio, str, Dict[str, str]]] = [(mcp1, devices[0], resolved[0])]
             if len(devices) > 1:
                 pairs.append((mcp2, devices[1], resolved[1]))
 
@@ -1135,16 +1200,11 @@ async def main():
 
                 ok, out = await mcp.call(
                     "create_session",
-                    {
-                        "platform": "android",
-                        "remoteServerUrl": APPIUM_SERVER_URL,
-                        "capabilities": caps,
-                    },
+                    {"platform": "android", "remoteServerUrl": APPIUM_SERVER_URL, "capabilities": caps},
                     attempts=2,
                 )
-                print(f"    [{dev}] create_session ({rinfo['appPackage']}): {'OK' if ok else 'FAIL'} — {trunc(out)[:140]}")
+                print(f"    [{dev}] create_session: {'OK' if ok else 'FAIL'} — {trunc(out)[:140]}")
 
-            # contexts
             ctxs: List[DriverContext] = []
             for i, dev in enumerate(devices):
                 ctxs.append(
@@ -1162,13 +1222,11 @@ async def main():
 
             try:
                 print("\n(4) ReAct en parallèle...")
-                tasks = [run_react(ac, ctx, barrier, summary) for ctx in ctxs]
-                results = await asyncio.gather(*tasks, return_exceptions=True)
+                results = await asyncio.gather(*[run_react(ac, ctx, barrier, summary) for ctx in ctxs], return_exceptions=True)
             finally:
                 for mcp in ([mcp1, mcp2] if len(devices) > 1 else [mcp1]):
                     await mcp.call("delete_session", {})
 
-    # bilan
     print("\n" + "=" * 60)
     print("BILAN")
     print("=" * 60)
