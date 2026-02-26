@@ -1,150 +1,3 @@
-
-
-@echo off
-setlocal EnableDelayedExpansion
-
-:: Toujours travailler dans le dossier du script (offline_bundle)
-pushd "%~dp0"
-
-:: ===============================
-:: ADAPTER CES VALEURS AVANT LANCER
-:: ===============================
-
-:: Devices (serial ADB)
-set DEVICE_1_ID="R5CX72QBCBR"
-set DEVICE_2_ID="R5CX72QBS6J"
-
-:: Appium (tourne sur le HOST Windows)
-set APPIUM_SERVER_URL=http://host.docker.internal:4723
-
-:: LLM
-set LLM_BASE_URL="xxx"
-set LLM_MODEL="gpt-oss-20b"
-set LLM_API_KEY="xxx"
-
-:: Jira MCP (optionnel)
-set JIRA_MCP_URL="http://host.docker.internal:9000/mcp"
-set TICKET_KEY="xxx"
-
-:: Proxy HTTP (optionnel)
-set PROXY_URL=""
-
-:: Application a tester (NE PAS mettre dans capabilities.json)
-set GLOBAL_PACKAGE=xxx
-set DRIVER1_PACKAGE=xxx
-set DRIVER2_PACKAGE=xxx
-set APP_ACTIVITY=xxxx
-
-:: Script a executer dans le container
-set SCRIPT=script_jira_appium_v2.py
-
-:: Tuning
-set MAX_TURNS_PER_DRIVER=30
-set TOOL_TIMEOUT_S=90
-set TOOL_ATTEMPTS=3
-
-echo ==============================================
-echo 1/3 Import de l'image Docker (si pas encore fait)
-echo ==============================================
-docker image inspect appium-mcp-runner:latest >nul 2>&1
-if %ERRORLEVEL% neq 0 (
-    if not exist appium-mcp-runner.tar (
-        echo [ERREUR] Fichier appium-mcp-runner.tar introuvable.
-        echo Copier le fichier .tar dans ce dossier puis relancer.
-        pause
-        exit /b 1
-    )
-    echo Chargement de l'image...
-    docker load -i appium-mcp-runner.tar || goto :error
-    echo Image chargee avec succes.
-) else (
-    echo Image deja presente, skip load.
-)
-
-echo.
-echo ==============================================
-echo 2/3 Verification Appium server sur HOST :4723
-echo ==============================================
-curl -s --max-time 3 http://localhost:4723/status >nul 2>&1
-if %ERRORLEVEL% neq 0 (
-    echo [WARN] Appium server non detecte sur :4723
-    echo Lancer restart_appium.bat sur le HOST avant de continuer.
-    pause
-)
-
-echo.
-echo ==============================================
-echo 3/3 Lancement du container
-echo ==============================================
-echo Device 1 : %DEVICE_1_ID%
-echo Device 2 : %DEVICE_2_ID%
-echo Script   : %SCRIPT%
-echo.
-
-:: Creer le dossier screenshots si absent (sur l'hote)
-if not exist screenshots mkdir screenshots
-
-:: (Optionnel mais tres utile) Vérifier le contenu vu par le container
-echo --- Debug: contenu /app/capabilities.json dans le container ---
-docker run --rm ^
-  -v "%~dp0capabilities.json:/app/capabilities.json:ro" ^
-  appium-mcp-runner:latest ^
-  cat /app/capabilities.json
-echo --------------------------------------------------------------
-
-docker run --rm ^
-  --add-host=host.docker.internal:host-gateway ^
-  -e DEVICE_1_ID=%DEVICE_1_ID% ^
-  -e DEVICE_2_ID=%DEVICE_2_ID% ^
-  -e APPIUM_SERVER_URL=%APPIUM_SERVER_URL% ^
-  -e LLM_API_KEY=%LLM_API_KEY% ^
-  -e LLM_BASE_URL=%LLM_BASE_URL% ^
-  -e LLM_MODEL=%LLM_MODEL% ^
-  -e JIRA_MCP_URL=%JIRA_MCP_URL% ^
-  -e TICKET_KEY=%TICKET_KEY% ^
-  -e PROXY_URL=%PROXY_URL% ^
-  -e GLOBAL_PACKAGE=%GLOBAL_PACKAGE% ^
-  -e DRIVER1_PACKAGE=%DRIVER1_PACKAGE% ^
-  -e DRIVER2_PACKAGE=%DRIVER2_PACKAGE% ^
-  -e APP_ACTIVITY=%APP_ACTIVITY% ^
-  -e MAX_TURNS_PER_DRIVER=%MAX_TURNS_PER_DRIVER% ^
-  -e TOOL_TIMEOUT_S=%TOOL_TIMEOUT_S% ^
-  -e TOOL_ATTEMPTS=%TOOL_ATTEMPTS% ^
-  -v "%~dp0screenshots:/app/screenshots" ^
-  -v "%~dp0capabilities.json:/app/capabilities.json:ro" ^
-  appium-mcp-runner:latest ^
-  python3 %SCRIPT%
-
-echo.
-echo Logs et screenshots disponibles dans : %~dp0screenshots
-goto :end
-
-:error
-echo.
-echo [ERREUR] Code: %ERRORLEVEL%
-pause
-exit /b 1
-
-:end
-popd
-pause
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-docker cp script_jira_appium_v2.py <CONTAINER_ID>:/app/script_jira_appium_v2.py
-
 """
 script_jira_appium_v2.py — Runner Jira + Appium MCP générique
 
@@ -256,7 +109,14 @@ def _stdio_params(screenshots_dir: pathlib.Path) -> StdioServerParameters:
         env={**os.environ,
              "ANDROID_HOME": ANDROID_HOME, "ANDROID_SDK_ROOT": ANDROID_HOME,
              "PATH": pth, "NO_UI": "1",
-             "SCREENSHOTS_DIR": str(screenshots_dir)},
+             "SCREENSHOTS_DIR": str(screenshots_dir),
+             # FIX 1 : supprime les logs appium-mcp sur stdout
+             # qui corrompaient le flux JSON-RPC
+             "LOG_LEVEL": "error",
+             "APPIUM_LOG_LEVEL": "error",
+             "APPIUM_MCP_LOG_LEVEL": "error",
+             "DEBUG": "",
+             },
     )
 
 class MCPStdio:
@@ -466,15 +326,14 @@ def _safe_slug(s: str, maxlen: int = 30) -> str:
 
 async def _save_screenshot(ctx: "DriverContext", label: str) -> Optional[pathlib.Path]:
     """
-    Prend un screenshot via Appium MCP et le sauvegarde dans session_dir.
-    Nom : step_NNN_<label>.png
-    Le node process (appium-mcp) sauvegarde déjà dans SCREENSHOTS_DIR ;
-    on renomme le dernier fichier créé avec le bon label.
-    Fallback : si pas de fichier trouvé, on ignore silencieusement.
+    Prend un screenshot via Appium MCP (FIX 2 : outputDir passé explicitement).
+    Sauvegarde dans session_dir avec nom step_NNN_<label>.png.
     """
     try:
         async with ctx.lock:
-            await ctx.mcp.call("appium_screenshot", {})
+            # FIX 2 : passer outputDir pour que appium-mcp sache où sauvegarder
+            await ctx.mcp.call("appium_screenshot",
+                               {"outputDir": str(ctx.session_dir)})
         # Trouver le fichier le plus récent dans session_dir
         files = sorted(ctx.session_dir.glob("*.png"), key=lambda f: f.stat().st_mtime)
         if not files:
@@ -484,7 +343,10 @@ async def _save_screenshot(ctx: "DriverContext", label: str) -> Optional[pathlib
         ctx.step += 1
         dest  = ctx.session_dir / f"step_{ctx.step:03d}_{slug}.png"
         if latest.name != dest.name:
-            latest.rename(dest)
+            try:
+                latest.rename(dest)
+            except Exception:
+                pass
         return dest
     except Exception:
         return None
@@ -504,6 +366,8 @@ class DriverContext:
     lock:         asyncio.Lock
     session_dir:  pathlib.Path = field(default_factory=lambda: SCREENSHOTS_DIR)
     step:         int          = field(default=0)
+    # FIX 6 : stocke les locators du dernier observe pour click rapide
+    last_locators: str         = field(default="")
 
 # =============================================================================
 # BRIQUE 2 — OBSERVE RICHE : screenshot + page_source + generate_locators
@@ -512,26 +376,32 @@ class DriverContext:
 async def tool_observe_rich(ctx: DriverContext) -> str:
     """
     Observation complète de l'UI :
-      - appium_screenshot   → preuve visuelle + sauvegardée dans session_dir
       - appium_get_page_source → arbre XML complet
-      - generate_locators   → locators intelligents pour tous les éléments interactifs
+      - generate_locators      → locators intelligents pour tous les éléments interactifs
+      - _save_screenshot       → screenshot (FIX 3 : un seul appel, via _save_screenshot)
     Trace les locators dans locators_trace.json pour aide à la décision.
     """
+    # FIX 3 : page_source + locators sous lock (pas de screenshot ici)
     async with ctx.lock:
         _, src  = await ctx.mcp.call("appium_get_page_source", {})
-        await ctx.mcp.call("appium_screenshot", {})
         _, locs = await ctx.mcp.call("generate_locators", {})
-    await _save_screenshot(ctx, "observe")
+    # FIX 6 : stocker les locators pour tool_ui_click
+    ctx.last_locators = locs
+    # FIX 3 : screenshot via _save_screenshot UNIQUEMENT (évite le doublon)
+    snap = await _save_screenshot(ctx, "observe")
     # Tracer les locators disponibles
     _append_trace(ctx.session_dir, {
         "ts": datetime.now().isoformat(), "step": ctx.step,
         "action": "observe", "device": ctx.device_id,
         "locators_raw": locs[:2000],
     })
+    # FIX 5 : debug — afficher locators bruts reçus
+    print(f"  [DEBUG observe] [{ctx.device_id}] locators({len(locs)}ch): "
+          f"{locs[:300]}...")
     return json.dumps({
         "driver": ctx.name, "device": ctx.device_id,
         "page_source": src[:4000],
-        "screenshot_saved": str(ctx.session_dir / f"step_{ctx.step:03d}_observe.png"),
+        "screenshot_saved": str(snap) if snap else "",
         "locators": locs[:3000],
     }, ensure_ascii=False)
 
@@ -559,8 +429,57 @@ def _el_id(text: str) -> Optional[str]:
                   text, re.I)
     return m.group(1) if m else None
 
+# =============================================================================
+# FIX 6 — CLICK VIA LOCATORS generate_locators
+# =============================================================================
+
+def _find_el_in_locators(locators_raw: str, target_text: str) -> Optional[str]:
+    """
+    FIX 6 : Cherche target_text dans la réponse JSON de generate_locators.
+    Retourne l'elementId si trouvé (match exact ou partiel sur text/contentDesc/resourceId).
+    """
+    if not locators_raw or not locators_raw.strip().startswith("["):
+        return None
+    try:
+        items = json.loads(locators_raw)
+        tl = target_text.lower().strip()
+        # Passe 1 : match exact
+        for item in items:
+            for field_name in ("text", "contentDesc", "content-desc", "label"):
+                v = str(item.get(field_name, "") or "").strip()
+                if v.lower() == tl and item.get("elementId"):
+                    return str(item["elementId"])
+        # Passe 2 : match partiel
+        for item in items:
+            for field_name in ("text", "contentDesc", "content-desc", "label"):
+                v = str(item.get(field_name, "") or "").strip()
+                if tl in v.lower() and item.get("elementId"):
+                    return str(item["elementId"])
+        # Passe 3 : resourceId (last segment)
+        for item in items:
+            rid = str(item.get("resourceId", "") or "")
+            if tl in rid.lower() and item.get("elementId"):
+                return str(item["elementId"])
+    except Exception:
+        pass
+    return None
+
 async def tool_ui_click(ctx: DriverContext, target_text: str) -> str:
-    """Trouve puis clique un élément par son texte visible, accessibility id ou contenu."""
+    """
+    FIX 6 : Clique un élément.
+    Stratégie 1 (rapide) : cherche dans ctx.last_locators (generate_locators).
+    Stratégie 2 (fallback) : appium_find_element avec XPath/accessibility id.
+    """
+    # --- Stratégie 1 : locators du dernier observe ---
+    el_from_loc = _find_el_in_locators(ctx.last_locators, target_text)
+    if el_from_loc:
+        async with ctx.lock:
+            ok2, out2 = await ctx.mcp.call("appium_click", {"elementId": el_from_loc})
+        return json.dumps({"ok": ok2, "strategy": "locators_cache",
+                           "element_id": el_from_loc, "click_output": out2[:300]},
+                          ensure_ascii=False)
+
+    # --- Stratégie 2 : find_element XPath/accessibility ---
     async with ctx.lock:
         locators = [
             ("accessibility id", target_text),
@@ -580,8 +499,8 @@ async def tool_ui_click(ctx: DriverContext, target_text: str) -> str:
             ok2, out2 = await ctx.mcp.call("appium_click", {"elementId": el})
             return json.dumps({"ok": ok2, "strategy": strat, "element_id": el,
                                 "click_output": out2[:300]}, ensure_ascii=False)
-        return json.dumps({"ok": False, "error": f"Element '{target_text}' not found"},
-                          ensure_ascii=False)
+    return json.dumps({"ok": False, "error": f"Element '{target_text}' not found"},
+                      ensure_ascii=False)
 
 async def tool_ui_type(ctx: DriverContext, text: str) -> str:
     """Tape dans le champ focalisé (cliquer d'abord si besoin)."""
@@ -895,6 +814,10 @@ async def run_react(ac: AsyncOpenAI, ctx: DriverContext,
             if not isinstance(args, dict):
                 args = {}
 
+            # FIX 5 : debug — afficher chaque tool call du LLM
+            print(f"  [TURN {turn:02d}] [{ctx.device_id}] LLM→ "
+                  f"{tc.function.name}({json.dumps(args, ensure_ascii=False)[:120]})")
+
             if tc.function.name == "finish":
                 final = {
                     "status":  args.get("status", "blocked"),
@@ -1039,13 +962,16 @@ async def main():
                      else (mcp1, devices[0], resolved[0])]
             for mcp, dev, rinfo in pairs:
                 caps = {
-                    "platformName":              "Android",
-                    "appium:automationName":     "UiAutomator2",
-                    "appium:udid":               dev,
-                    "appium:appPackage":         rinfo["appPackage"],
-                    "appium:appActivity":        rinfo["appActivity"],
-                    "appium:autoGrantPermissions": True,
-                    "appium:newCommandTimeout":  300,
+                    "platformName":                  "Android",
+                    "appium:automationName":         "UiAutomator2",
+                    "appium:udid":                   dev,
+                    "appium:appPackage":             rinfo["appPackage"],
+                    "appium:appActivity":            rinfo["appActivity"],
+                    "appium:autoGrantPermissions":   True,
+                    "appium:newCommandTimeout":      300,
+                    # FIX 4 : ne PAS effacer le cache/données de l'app entre runs
+                    "appium:noReset":                True,
+                    "appium:fullReset":              False,
                 }
                 await mcp.call("select_platform", {"platform": "android"})
                 ok, out = await mcp.call("create_session", {
