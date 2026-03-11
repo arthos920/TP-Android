@@ -1,81 +1,53 @@
-sldie 1:
-In this slide, I present our automation testing environment.
+Introduction de la démo
 
-Our automation framework is based on Robot Framework, where we define the automated test cases.
+I will now show an example of the output generated for the second use case.
 
-We also use Python scripts to implement reusable functions and manage selectors used in the tests.
+⸻
 
-Selectors, also called locators, are identifiers used by the automation tools to find elements in the user interface, such as buttons, text fields, or menus.
+Partie 1 — Lecture du test Jira
 
-The framework relies on several libraries depending on the type of testing.
+(Pointe le haut de l’écran)
 
-We use Selenium for web testing, Appium for mobile testing, and curl for API requests.
+First, the AI reads the test case written in Jira.
 
-Using this framework, we can automate tests for different systems under test, including web applications, mobile applications, and APIs.
+Here we can see the description of the scenario, including the steps of the test and the expected results.
 
+For example, this test verifies a PTT call between two users, including the call initiation, the communication, and the call termination.
 
-transi :
+⸻
 
-The first use case focused on helping maintain the automation framework.
+Partie 2 — Analyse du framework
 
-The second use case focuses on helping convert manual test cases into automated tests.
+(Pointe la partie où on voit les appels GitLab)
 
+After reading the Jira test case, the AI analyzes the automation framework stored in GitLab.
 
+It searches for existing keywords and test templates in the repository.
 
+This step allows the AI to understand how tests are structured and which reusable keywords already exist.
 
+⸻
 
+Partie 3 — Identification des keywords
 
+(Pointe la partie avec la liste des keywords)
 
-slide 4:
+Based on this analysis, the AI identifies the keywords that can be reused in the automation framework.
 
-In this second use case, the goal is to translate manual test cases written in Jira into Robot Framework automated tests.
+For example, keywords for navigating to contacts, initiating a call, pressing the PTT button, or ending the call.
 
-Today, the process is mostly manual.
+⸻
 
-First, testers read the test case written in Jira and understand the scenario.
+Partie 4 — Génération du test Robot Framework
 
-Then, they manually create the corresponding automation script in Robot Framework.
+(Pointe la partie finale avec le test généré)
 
-Finally, this script is integrated into the automation framework and can be executed as part of the automated test suite.
+Finally, the AI generates a Robot Framework test case template.
 
+The test includes the structure of the scenario and the main steps using existing keywords from the framework.
 
-transi:
+⸻
 
+Conclusion de la démo
 
-Today this whole process is mostly manual.
-
-To simplify this process, we explored how AI could help translate these test cases automatically.
-
-slide 5:
-
-In this slide, I present the workflow used to translate Jira test cases into Robot Framework tests using our internal AI tool, Daisei.
-
-First, the AI is integrated into the development environment using the Continue extension in the IDE.
-This allows developers and testers to interact directly with the AI.
-
-Then, the AI connects to different sources using MCP servers.
-
-On one side, it connects to Jira, where the manual test cases are written.
-The AI reads the test case and generates a summary of the scenario.
-
-On the other side, the AI connects to GitLab, where the automation framework is stored.
-This allows the AI to understand the existing code structure and context.
-
-Using both the test description and the framework context, the AI generates an output template for a Robot Framework test case.
-
-
-
-
-excuse demo :
-
-Normally, we planned to include a live demonstration of this workflow.
-
-However, due to a platform restart earlier this week, the environment was not available and the demo could not be prepared in time.
-
-Instead, I will show the generated outputs to illustrate the results.
-
-
-
-
-
-
+This generated test provides a starting point for the automation script, which can then be reviewed and completed by the tester before integration into the framework.
