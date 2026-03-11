@@ -1,53 +1,39 @@
-Introduction de la démo
+MOBILE AUTOMATION RULE — MANDATORY SCREEN ANALYSIS
 
-I will now show an example of the output generated for the second use case.
+The AI is controlling a mobile device through MCP tools.
 
-⸻
+RULE: Before performing ANY action on the mobile device, the AI MUST first call the tool `mobile_list_elements_on_screen`.
 
-Partie 1 — Lecture du test Jira
+Purpose:
+This tool returns the list of all visible UI elements currently present on the screen (texts, buttons, icons, input fields, labels, ids, and positions). The AI must always use this information to determine what element it should interact with.
 
-(Pointe le haut de l’écran)
+Mandatory workflow:
 
-First, the AI reads the test case written in Jira.
+1. Screen inspection
+Before any mobile interaction (tap, click, swipe, scroll, long press, input text, etc.), the AI MUST call:
 
-Here we can see the description of the scenario, including the steps of the test and the expected results.
+mobile_list_elements_on_screen
 
-For example, this test verifies a PTT call between two users, including the call initiation, the communication, and the call termination.
+2. Element identification
+After retrieving the list of elements, the AI must analyze the returned data and identify the correct target element using available properties such as:
+- text
+- label
+- id
+- accessibility label
+- position
+- element type
 
-⸻
+3. Action validation
+Before performing the action, the AI must ensure that:
+- the target element exists in the returned list
+- the element is visible on screen
+- the element corresponds to the user's request
 
-Partie 2 — Analyse du framework
+4. Execute action
+Only after the element has been clearly identified from the tool results can the AI perform the requested action (tap, swipe, input text, etc.).
 
-(Pointe la partie où on voit les appels GitLab)
+5. Re-check after UI change
+If an action may change the UI (navigation, opening a page, closing a popup, scrolling, etc.), the AI MUST call `mobile_list_elements_on_screen` again before performing the next action.
 
-After reading the Jira test case, the AI analyzes the automation framework stored in GitLab.
-
-It searches for existing keywords and test templates in the repository.
-
-This step allows the AI to understand how tests are structured and which reusable keywords already exist.
-
-⸻
-
-Partie 3 — Identification des keywords
-
-(Pointe la partie avec la liste des keywords)
-
-Based on this analysis, the AI identifies the keywords that can be reused in the automation framework.
-
-For example, keywords for navigating to contacts, initiating a call, pressing the PTT button, or ending the call.
-
-⸻
-
-Partie 4 — Génération du test Robot Framework
-
-(Pointe la partie finale avec le test généré)
-
-Finally, the AI generates a Robot Framework test case template.
-
-The test includes the structure of the scenario and the main steps using existing keywords from the framework.
-
-⸻
-
-Conclusion de la démo
-
-This generated test provides a starting point for the automation script, which can then be reviewed and completed by the tester before integration into the framework.
+Critical rule:
+The AI MUST NEVER perform a mobile interaction without first calling `mobile_list_elements_on_screen` to understand the current screen state.
