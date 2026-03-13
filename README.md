@@ -1,28 +1,33 @@
+import time
 from typing import Callable
-from selenium.webdriver.remote.webelement import WebElement
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as expected_conditions
+
 from selenium.common.exceptions import (
     TimeoutException,
-    StaleElementReferenceException,
     NoSuchElementException,
+    StaleElementReferenceException,
     JavascriptException,
+    WebDriverException,
 )
+from selenium.webdriver.remote.webelement import WebElement
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
 
 def get_component(
     self,
     find_by,
     value: str,
-    expected_condition: Callable = expected_conditions.visibility_of_element_located,
+    expected_condition: Callable = EC.visibility_of_element_located,
     timeout: float = None,
     throw: bool = True,
     exception_class=ComponentNotFoundException,
 ) -> WebElement:
     """
-    Return first visible element located by using specified search locator.
-    Compatible headless / non-headless without changing call sites.
+    Retourne le premier élément trouvé de manière robuste,
+    compatible headless / non-headless sans changer les appels existants.
     """
     timeout = self.get_timeout(timeout)
+    locator = (find_by, value)
 
     wait = WebDriverWait(
         self.driver,
@@ -31,25 +36,26 @@ def get_component(
         ignored_exceptions=(NoSuchElementException, StaleElementReferenceException),
     )
 
-    locator = (find_by, value)
-    component = None
+    start_time = time.time()
     last_exception = None
 
-    def _is_headless() -> bool:
-        caps = self.driver.capabilities or {}
-        browser_name = str(caps.get("browserName", "")).lower()
-        args = []
+    def _remaining_time() -> float:
+        return max(0.2, timeout - (time.time() - start_time))
 
-        goog = caps.get("goog:chromeOptions", {})
-        if isinstance(goog, dict):
-            args.extend(goog.get("args", []))
-
-        moz = caps.get("moz:firefoxOptions", {})
-        if isinstance(moz, dict):
-            args.extend(moz.get("args", []))
-
-        args_str = " ".join(args).lower()
-        return "headless" in args_str or caps.get("headless", False) is True or browser_name == "headlesschrome"
+    def _wait_document_ready(max_wait: float = 2.0) -> None:
+        """
+        Attend un minimum que le DOM soit chargé.
+        On ne bloque pas trop longtemps pour ne pas casser le comportement global.
+        """
+        end = time.time() + max_wait
+        while time.time() < end:
+            try:
+                state = self.driver.execute_script("return document.readyState")
+                if state == "complete":
+                    return
+            except Exception:
+                pass
+            time.sleep(0.1)
 
     def _scroll_into_view(element: WebElement) -> None:
         try:
@@ -62,79 +68,112 @@ def get_component(
                 """,
                 element,
             )
-        except JavascriptException:
+        except Exception:
             pass
 
-    def _has_real_visibility(element: WebElement) -> bool:
+    def _is_really_visible(element: WebElement) -> bool:
         try:
-            return bool(self.driver.execute_script(
-                """
-                const el = arguments[0];
-                if (!el) return false;
+            return bool(
+                self.driver.execute_script(
+                    """
+                    const el = arguments[0];
+                    if (!el) return false;
 
-                const style = window.getComputedStyle(el);
-                if (!style) return false;
-                if (style.display === 'none') return false;
-                if (style.visibility === 'hidden') return false;
-                if (style.opacity === '0') return false;
+                    const style = window.getComputedStyle(el);
+                    if (!style) return false;
+                    if (style.display === 'none') return false;
+                    if (style.visibility === 'hidden') return false;
+                    if (style.opacity === '0') return false;
 
-                const rect = el.getBoundingClientRect();
-                return rect.width > 0 && rect.height > 0;
-                """,
-                element
-            ))
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                    """,
+                    element,
+                )
+            )
         except Exception:
             try:
                 return element.is_displayed()
             except Exception:
                 return False
 
-    def _wait_default_condition():
-        condition = expected_condition(locator)
-        return wait.until(condition)
+    def _find_present_element():
+        local_wait = WebDriverWait(
+            self.driver,
+            _remaining_time(),
+            poll_frequency=self.POLL_FREQUENCY,
+            ignored_exceptions=(NoSuchElementException, StaleElementReferenceException),
+        )
+        return local_wait.until(EC.presence_of_element_located(locator))
 
-    def _wait_headless_fallback():
-        # 1) attendre la présence
-        element = wait.until(expected_conditions.presence_of_element_located(locator))
+    def _find_with_requested_condition():
+        local_wait = WebDriverWait(
+            self.driver,
+            _remaining_time(),
+            poll_frequency=self.POLL_FREQUENCY,
+            ignored_exceptions=(NoSuchElementException, StaleElementReferenceException),
+        )
+        return local_wait.until(expected_condition(locator))
 
-        # 2) scroller
-        _scroll_into_view(element)
+    while (time.time() - start_time) < timeout:
+        try:
+            _wait_document_ready(max_wait=1.0)
 
-        # 3) attendre qu'il ait une vraie visibilité exploitable
-        def _element_ready(_driver):
+            # 1) tentative normale avec la condition demandée
+            element = _find_with_requested_condition()
+
             try:
-                refreshed = _driver.find_element(*locator)
-                _scroll_into_view(refreshed)
-                if _has_real_visibility(refreshed):
-                    return refreshed
-                return False
-            except (NoSuchElementException, StaleElementReferenceException):
-                return False
+                _scroll_into_view(element)
+            except Exception:
+                pass
 
-        return wait.until(_element_ready)
+            return element
 
-    try:
-        component = _wait_default_condition()
-        return component
+        except TimeoutException as e:
+            last_exception = e
 
-    except TimeoutException as e:
-        last_exception = e
-
-        # Fallback intelligent uniquement si la condition demandée est la visibilité
-        if expected_condition == expected_conditions.visibility_of_element_located:
+            # 2) fallback : si la condition demandée est trop stricte,
+            #    on tente au moins de récupérer l'élément présent
             try:
-                component = _wait_headless_fallback()
-                return component
-            except TimeoutException as fallback_error:
+                element = _find_present_element()
+                _scroll_into_view(element)
+
+                if expected_condition == EC.visibility_of_element_located:
+                    if _is_really_visible(element):
+                        return element
+                else:
+                    return element
+
+            except Exception as fallback_error:
                 last_exception = fallback_error
 
-        if throw:
-            raise exception_class(
-                find_by=find_by,
-                locator=value,
-                expected_condition=expected_condition(locator),
-                timeout=timeout,
-                terminal=self
-            ) from last_exception
+        except (NoSuchElementException, StaleElementReferenceException, WebDriverException) as e:
+            last_exception = e
 
-        return None
+        time.sleep(0.2)
+
+    # debug utile en cas d'échec
+    try:
+        current_url = self.driver.current_url
+    except Exception:
+        current_url = "<unavailable>"
+
+    try:
+        page_state = self.driver.execute_script("return document.readyState")
+    except Exception:
+        page_state = "<unavailable>"
+
+    if throw:
+        raise exception_class(
+            find_by=find_by,
+            locator=value,
+            expected_condition=expected_condition(locator),
+            timeout=timeout,
+            terminal=self,
+            message=(
+                f"Unable to locate element {locator} after {timeout} seconds. "
+                f"current_url={current_url}, document.readyState={page_state}"
+            )
+        ) from last_exception
+
+    return None
