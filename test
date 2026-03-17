@@ -1,0 +1,376 @@
+# Explication du script Python d'analyse d'espace disque Windows
+
+## Objectif
+
+Ce script sert à **analyser l’occupation disque sur Windows** afin d’identifier ce qui prend le plus de place sur un disque ou dans un dossier donné.
+
+Il permet notamment de :
+- connaître l’espace total, utilisé et libre du disque ;
+- scanner récursivement un chemin ;
+- lister les dossiers les plus volumineux ;
+- lister les fichiers les plus volumineux ;
+- signaler les erreurs d’accès sans interrompre l’analyse.
+
+---
+
+## Vue d’ensemble
+
+Le script fonctionne en 5 grandes étapes :
+
+1. lecture des arguments passés en ligne de commande ;
+2. récupération de l’espace disque global ;
+3. scan récursif du chemin demandé ;
+4. tri des plus gros dossiers et fichiers ;
+5. affichage d’un rapport lisible dans la console.
+
+---
+
+## Modules utilisés
+
+### `os`
+Permet de manipuler les chemins, parcourir les dossiers et récupérer des informations sur les fichiers.
+
+### `sys`
+Utilisé pour quitter proprement le programme en cas d’erreur critique.
+
+### `argparse`
+Permet de gérer les arguments en ligne de commande, par exemple :
+- le chemin à analyser ;
+- le nombre de gros fichiers à afficher ;
+- le nombre de gros dossiers à afficher.
+
+### `ctypes`
+Permet d’appeler directement une fonction Windows (`GetDiskFreeSpaceExW`) pour connaître l’espace disque.
+
+### `collections.defaultdict`
+Utilisé pour stocker facilement la taille des dossiers.
+
+### `pathlib.Path`
+Permet de récupérer proprement la racine du disque à partir d’un chemin.
+
+---
+
+## Explication des fonctions
+
+## `format_size(size_bytes: int) -> str`
+
+Cette fonction convertit une taille exprimée en octets vers un format lisible :
+- B
+- KB
+- MB
+- GB
+- TB
+
+### Exemple
+- `1024` devient `1.00 KB`
+- `1073741824` devient `1.00 GB`
+
+Elle est utilisée pour rendre le rapport final compréhensible.
+
+---
+
+## `get_disk_usage(path: str)`
+
+Cette fonction retourne :
+- l’espace total ;
+- l’espace utilisé ;
+- l’espace libre.
+
+Elle délègue en réalité le travail à la fonction `shutil_disk_usage(path)`.
+
+---
+
+## `shutil_disk_usage(path: str)`
+
+Cette fonction interroge directement Windows avec l’API :
+
+`GetDiskFreeSpaceExW`
+
+Elle récupère :
+- les octets libres ;
+- les octets totaux ;
+- les octets libres totaux.
+
+Ensuite, elle calcule l’espace utilisé avec :
+
+`used = total - free`
+
+### Pourquoi utiliser `ctypes` ?
+Parce que le script veut rester compatible Windows **sans dépendance externe**.
+
+---
+
+## `is_reparse_point(path: str) -> bool`
+
+Cette fonction sert à détecter les liens symboliques ou points de jonction.
+
+L’idée est d’éviter :
+- les boucles de parcours ;
+- les scans incohérents ;
+- les doublons de taille.
+
+Dans ce script, elle existe comme fonction utilitaire, même si la logique principale utilise surtout `entry.is_symlink()` dans le parcours.
+
+---
+
+## `scan_directory(root_path: str, max_files=50, max_dirs=50, skip_dirs=None)`
+
+C’est la fonction centrale du script.
+
+Elle scanne récursivement tout le contenu du dossier demandé et retourne :
+- la taille totale scannée ;
+- les plus gros dossiers ;
+- les plus gros fichiers ;
+- les erreurs rencontrées.
+
+### Paramètres
+- `root_path` : chemin de départ à analyser ;
+- `max_files` : nombre maximal de gros fichiers à conserver ;
+- `max_dirs` : nombre maximal de gros dossiers à conserver ;
+- `skip_dirs` : ensemble de dossiers à ignorer.
+
+### Variables internes
+- `dir_sizes` : stocke la taille de chaque dossier ;
+- `largest_files` : liste des plus gros fichiers ;
+- `errors` : liste des erreurs rencontrées.
+
+---
+
+## Fonction interne `add_largest_file(file_path, size)`
+
+Cette fonction ajoute un fichier à la liste des plus gros fichiers, puis trie la liste par taille décroissante.
+
+Si la liste dépasse `max_files`, le plus petit élément est supprimé.
+
+### Intérêt
+Cela permet de ne conserver que les plus gros fichiers sans stocker tous les fichiers du disque en mémoire.
+
+---
+
+## Fonction interne `walk(path: str) -> int`
+
+Cette fonction parcourt récursivement un dossier et calcule sa taille totale.
+
+### Ce qu’elle fait
+Pour chaque élément du dossier :
+- si c’est un lien symbolique : elle l’ignore ;
+- si c’est un dossier : elle descend récursivement dedans ;
+- si c’est un fichier : elle récupère sa taille et l’ajoute au total.
+
+### Gestion des erreurs
+Elle capture :
+- `PermissionError`
+- `FileNotFoundError`
+- `OSError`
+
+Ainsi, le scan continue même si certains fichiers ou dossiers sont inaccessibles.
+
+### Pourquoi `os.scandir()` ?
+Parce que c’est plus efficace que `os.listdir()` pour les gros volumes de fichiers.
+
+---
+
+## Tri des dossiers les plus lourds
+
+À la fin du scan, la fonction exécute :
+
+```python
+largest_dirs = sorted(dir_sizes.items(), key=lambda x: x[1], reverse=True)[:max_dirs]
+```
+
+Cela permet de trier tous les dossiers selon leur taille et de ne garder que les plus gros.
+
+---
+
+## Valeurs retournées par `scan_directory`
+
+La fonction retourne 4 éléments :
+1. `total_scanned`
+2. `largest_dirs`
+3. `largest_files`
+4. `errors`
+
+---
+
+## `print_report(...)`
+
+Cette fonction affiche le rapport final dans la console.
+
+### Informations affichées
+- chemin analysé ;
+- espace total du disque ;
+- espace utilisé ;
+- espace libre ;
+- taille réellement scannée ;
+- top des dossiers les plus lourds ;
+- top des fichiers les plus lourds ;
+- erreurs et accès refusés.
+
+### Pourquoi distinguer “espace utilisé” et “taille scannée” ?
+Parce qu’il peut exister une différence entre :
+- l’espace réellement occupé sur le disque ;
+- la somme des fichiers que le script a pu lire.
+
+Cette différence peut venir de :
+- fichiers système spéciaux ;
+- fichiers verrouillés ;
+- accès refusés ;
+- métadonnées et allocation disque.
+
+---
+
+## `main()`
+
+C’est le point d’entrée du script.
+
+### 1. Création du parseur d’arguments
+Le script accepte :
+- un chemin optionnel ;
+- `--top-files`
+- `--top-dirs`
+
+### Exemples
+```bash
+python analyse_disque.py
+```
+
+Analyse `C:\` par défaut.
+
+```bash
+python analyse_disque.py C:\Users
+```
+
+Analyse uniquement `C:\Users`.
+
+```bash
+python analyse_disque.py C:\ --top-files 100 --top-dirs 50
+```
+
+Affiche 100 gros fichiers et 50 gros dossiers.
+
+---
+
+### 2. Normalisation du chemin
+```python
+root_path = os.path.abspath(args.path)
+```
+
+Cela garantit que le chemin analysé est absolu.
+
+---
+
+### 3. Définition des dossiers ignorés
+Le script ignore par défaut :
+
+- `C:\$Recycle.Bin`
+- `C:\System Volume Information`
+
+### Pourquoi les ignorer ?
+Parce que :
+- ils sont souvent protégés ;
+- ils peuvent générer des erreurs d’accès ;
+- ils ne sont pas toujours utiles dans un premier diagnostic.
+
+---
+
+### 4. Lecture de l’espace disque global
+Le script récupère la racine du disque avec :
+
+```python
+drive = Path(root_path).anchor or "C:\"
+```
+
+Puis il lit :
+- total ;
+- utilisé ;
+- libre.
+
+En cas d’erreur, il affiche un message et quitte avec `sys.exit(1)`.
+
+---
+
+### 5. Lancement du scan
+Le script affiche :
+
+`Scan en cours sur ... cela peut prendre plusieurs minutes.`
+
+Puis il appelle `scan_directory(...)`.
+
+---
+
+### 6. Affichage du rapport
+Une fois le scan terminé, il appelle `print_report(...)`.
+
+---
+
+## Points forts du script
+
+### Robuste
+Il continue le scan même en cas d’erreurs d’accès.
+
+### Pratique
+Il permet d’identifier rapidement :
+- les gros dossiers ;
+- les gros fichiers ;
+- les zones problématiques d’un disque saturé.
+
+### Sans dépendance externe
+Il ne nécessite aucune bibliothèque à installer.
+
+### Adapté à Windows
+Il s’appuie sur l’API Windows pour la lecture de l’espace disque.
+
+---
+
+## Limites du script
+
+### 1. Scan potentiellement long
+Sur `C:\`, le scan peut prendre plusieurs minutes.
+
+### 2. Certaines tailles peuvent être incomplètes
+Certains fichiers système peuvent être inaccessibles.
+
+### 3. Pas de suppression
+Ce script est uniquement un outil de diagnostic. Il n’efface rien.
+
+### 4. Mémoire et performance
+La liste des dossiers peut devenir importante sur de très gros disques, même si la gestion des fichiers lourds est déjà optimisée.
+
+---
+
+## Exemple d’utilisation typique
+
+Tu peux utiliser ce script pour comprendre pourquoi une VM Windows de 50 Go est presque pleine.
+
+Le résultat permet souvent d’identifier :
+- un dossier `Windows` trop volumineux ;
+- un dossier `Users\...\AppData` rempli de cache ;
+- Docker ;
+- des installateurs ou archives ;
+- des fichiers système comme `pagefile.sys`.
+
+---
+
+## Améliorations possibles
+
+Voici quelques évolutions possibles si tu veux aller plus loin :
+
+- filtrer certaines extensions ;
+- exporter le rapport en `.txt` ou `.csv` ;
+- ajouter un mode JSON ;
+- ignorer plus de dossiers système ;
+- afficher le top des extensions ;
+- ajouter une option de suppression guidée des fichiers temporaires.
+
+---
+
+## Conclusion
+
+Ce script est un **outil de diagnostic disque** simple et efficace pour Windows.
+
+Il est particulièrement utile pour :
+- analyser une VM saturée ;
+- repérer les dossiers et fichiers responsables d’un manque d’espace ;
+- préparer un nettoyage ciblé.
+
+Il ne modifie rien sur le système : il sert uniquement à **observer et comprendre** où passe l’espace disque.
