@@ -158,3 +158,42 @@ def start_terminal_sessions(self, *terminals: Terminal):
     self.test_run_terminals.set_terminal_objects(*terminals)
 
     self.start_log_and_screen_capture(self.suite_data, setup=True)
+
+
+
+added_capabilities = {
+    "autoGrantPermissions": True,
+    "noReset": True,
+    "fullReset": False,
+    "noSign": True,
+    "skipServerInstallation": False,
+    "skipDeviceInitialization": False,
+    "clearDeviceLogsOnStart": True,
+    "adbExecTimeout": 120000,
+    "androidInstallTimeout": 120000,
+    "uiautomator2ServerInstallTimeout": 120000,
+    "uiautomator2ServerLaunchTimeout": 120000,
+    "appWaitForLaunch": False,
+    "skipLogcatCapture": False
+}
+
+capabilities.update(added_capabilities)
+
+super().__init__(**{
+    "autoLaunch": False,
+    "platformName": self.platform_name,
+    "automationName": self.automation_name,
+    "adbExecTimeout": self.adb_exec_timeout,
+    "appWaitDuration": self.app_wait_duration,
+    "newCommandTimeout": self.new_command_timeout,
+    "uiautomator2ServerInstallTimeout": self.uiautomator_server_install_timeout,
+    "uiautomator2ServerLaunchTimeout": self.uiautomator_server_launch_timeout,
+    "androidInstallTimeout": 120000,
+    "systemPort": self.session_port,
+    "clearSystemFiles": True,
+    "enforceAppInstall": True,
+    "unlockType": "pin",
+    "unlockKey": "1234",
+    "unlockStrategy": "uiautomator",
+    **capabilities
+})
