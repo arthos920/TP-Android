@@ -55,3 +55,23 @@ def serial_short(self):
 
     # Cas normal
     return serial[-7:]
+
+
+
+
+try:
+    print("[DEBUG] Creating driver for:", self.udid)
+    print("[DEBUG] Capabilities:", self.data)
+
+    self.driver = webdriver.Remote(
+        command_executor,
+        options=UiAutomator2Options().load_capabilities(self.data)
+    )
+
+    print("[DEBUG] Driver created:", self.driver)
+
+except Exception as e:
+    logger.error(f"[ERROR] Driver creation failed for {self.udid}: {repr(e)}", also_to_console=True)
+    raise
+
+
