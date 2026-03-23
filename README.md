@@ -65,10 +65,17 @@ def start_session(self, command_executor) -> TerminalAppium:
     :param command_executor: Either a string representing URL of the Appium remote server
         or a custom remote_connection.RemoteConnection object.
     """
+    if not command_executor:
+        raise ValueError(
+            f"command_executor is empty for device {self.udid}. "
+            f"Cannot create Appium session."
+        )
+
     try:
         logger.info(
             f"Creating Appium driver for device: {self.udid} "
-            f"with capabilities: {self.data}",
+            f"with command_executor: {command_executor} "
+            f"and capabilities: {self.data}",
             also_to_console=True
         )
 
@@ -83,7 +90,7 @@ def start_session(self, command_executor) -> TerminalAppium:
         )
 
     except Exception as e:
-        logger.error(
+        logger.info(
             f"Failed to instantiate driver for device: {self.udid}. "
             f"Exception type: {type(e).__name__}. "
             f"Exception message: {e}",
