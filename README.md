@@ -1,8 +1,10 @@
 def _is_android_terminal(self, terminal) -> bool:
     platform = getattr(terminal, "platform_name", None) or getattr(terminal, "platformName", None)
-    automation = getattr(terminal, "automation_name", None) or getattr(terminal, "automationName", None)
+    automation = getattr(terminal, "automation_name", None) or getattr(terminal, "automationName", 
+    if browser_tasks:
+        sessions.extend(self.run_concurrently(browser_tasks, command_executor))
 
-    return platform == "Android" and automation == "UiAutomator2"
+
 
 
 @keyword
@@ -14,48 +16,46 @@ def start_terminal_sessions(self, *terminals: Terminal):
     """
     handle_tag_based_suite_skip(self.suite_data, terminals)
 
-    mobile_tasks = []
-    browser_tasks = []
-
     command_executor = AppiumServer.get_appium_url()
     if not command_executor:
         raise ValueError("AppiumServer.get_appium_url() returned empty value.")
 
-    for terminal in terminals:
-        if self._is_android_terminal(terminal):
-            self.assign_terminal_port(terminal)
+    tasks = []
 
+    logger.info(f"All terminals count: {len(terminals)}", also_to_console=True)
+
+    for terminal in terminals:
+        platform = getattr(terminal, "platform_name", None) or getattr(terminal, "platformName", None)
+        automation = getattr(terminal, "automation_name", None) or getattr(terminal, "automationName", None)
+        is_android = platform == "Android" and automation == "UiAutomator2"
+
+        logger.info(
+            f"Preparing terminal {terminal} | class={terminal.__class__.__name__} "
+            f"| platform={platform} | automation={automation}",
+            also_to_console=True
+        )
+
+        if is_android:
+            self.assign_terminal_port(terminal)
             logger.info(
                 f"Assigned systemPort {getattr(terminal, 'session_port', None)} "
                 f"to terminal {getattr(terminal, 'udid', terminal)}",
                 also_to_console=True
             )
 
-            logger.info(
-                f"Device {getattr(terminal, 'udid', terminal)} -> Appium URL: {command_executor}",
-                also_to_console=True
-            )
+        logger.info(
+            f"Terminal {getattr(terminal, 'udid', terminal)} -> Appium URL: {command_executor}",
+            also_to_console=True
+        )
 
-            mobile_tasks.append(
-                lambda terminal=terminal, command_executor=command_executor:
-                    terminal.start_session(command_executor)
-            )
-        else:
-            logger.info(
-                f"Browser/Desktop terminal {getattr(terminal, 'udid', terminal)} "
-                f"-> Appium URL: {command_executor}",
-                also_to_console=True
-            )
+        tasks.append(
+            lambda terminal=terminal, command_executor=command_executor:
+                terminal.start_session(command_executor)
+        )
 
-            browser_tasks.append(terminal.start_session)
+    logger.info(f"Total start tasks: {len(tasks)}", also_to_console=True)
 
-    sessions = []
-
-    if mobile_tasks:
-        sessions.extend(self.run_concurrently(mobile_tasks))
-
-    if browser_tasks:
-        sessions.extend(self.run_concurrently(browser_tasks, command_executor))
+    sessions = self.run_concurrently(tasks)
 
     self.terminal_sessions.extend(sessions)
     self.test_run_data.write_suite_terminals_metadata(self.terminal_sessions)
