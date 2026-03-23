@@ -1,68 +1,19 @@
-def _is_android_terminal(self, terminal) -> bool:
-    platform = getattr(terminal, "platform_name", None) or getattr(terminal, "platformName", None)
-    automation = getattr(terminal, "automation_name", None) or getattr(terminal, "automationName", 
-    if browser_tasks:
-        sessions.extend(self.run_concurrently(browser_tasks, command_executor))
-
-
-
-
-@keyword
-def start_terminal_sessions(self, *terminals: Terminal):
+def stop_adb_screenrecord(self) -> None:
     """
-    Keyword to start WebDriver session and terminal.
-    NOTE! Appium removes application data by default on start.
-    :param terminals: terminals to execute on
+    Stops adb screenrecord.
     """
-    handle_tag_based_suite_skip(self.suite_data, terminals)
-
-    command_executor = AppiumServer.get_appium_url()
-    if not command_executor:
-        raise ValueError("AppiumServer.get_appium_url() returned empty value.")
-
-    tasks = []
-
-    logger.info(f"All terminals count: {len(terminals)}", also_to_console=True)
-
-    for terminal in terminals:
-        platform = getattr(terminal, "platform_name", None) or getattr(terminal, "platformName", None)
-        automation = getattr(terminal, "automation_name", None) or getattr(terminal, "automationName", None)
-        is_android = platform == "Android" and automation == "UiAutomator2"
-
-        logger.info(
-            f"Preparing terminal {terminal} | class={terminal.__class__.__name__} "
-            f"| platform={platform} | automation={automation}",
-            also_to_console=True
-        )
-
-        if is_android:
-            self.assign_terminal_port(terminal)
-            logger.info(
-                f"Assigned systemPort {getattr(terminal, 'session_port', None)} "
-                f"to terminal {getattr(terminal, 'udid', terminal)}",
-                also_to_console=True
-            )
-
-        logger.info(
-            f"Terminal {getattr(terminal, 'udid', terminal)} -> Appium URL: {command_executor}",
-            also_to_console=True
-        )
-
-        tasks.append(
-            lambda terminal=terminal, command_executor=command_executor:
-                terminal.start_session(command_executor)
-        )
-
-    logger.info(f"Total start tasks: {len(tasks)}", also_to_console=True)
-
-    sessions = self.run_concurrently(tasks)
-
-    self.terminal_sessions.extend(sessions)
-    self.test_run_data.write_suite_terminals_metadata(self.terminal_sessions)
-    self.test_run_terminals.set_terminal_objects(*terminals)
-
-    self.start_log_and_screen_capture(self.suite_data, setup=True)
-
+    try:
+        for session in self.recording_sessions:
+            try:
+                session.terminate()
+                session.wait(timeout=5)
+            except Exception:
+                try:
+                    session.kill()
+                except Exception:
+                    pass
+    finally:
+        del self.recording_sessions[:]
 
 
 def restart_session(self, terminal):
