@@ -59,19 +59,36 @@ def serial_short(self):
 
 
 
-try:
-    print("[DEBUG] Creating driver for:", self.udid)
-    print("[DEBUG] Capabilities:", self.data)
+def start_session(self, command_executor) -> TerminalAppium:
+    """
+    Start WebDriver session
+    :param command_executor: Either a string representing URL of the Appium remote server
+        or a custom remote_connection.RemoteConnection object.
+    """
+    try:
+        logger.info(
+            f"Creating Appium driver for device: {self.udid} "
+            f"with capabilities: {self.data}",
+            also_to_console=True
+        )
 
-    self.driver = webdriver.Remote(
-        command_executor,
-        options=UiAutomator2Options().load_capabilities(self.data)
-    )
+        self.driver = webdriver.Remote(
+            command_executor,
+            options=UiAutomator2Options().load_capabilities(self.data)
+        )
 
-    print("[DEBUG] Driver created:", self.driver)
+        logger.info(
+            f"Driver successfully created for device: {self.udid}",
+            also_to_console=True
+        )
 
-except Exception as e:
-    logger.error(f"[ERROR] Driver creation failed for {self.udid}: {repr(e)}", also_to_console=True)
-    raise
+    except Exception as e:
+        logger.error(
+            f"Failed to instantiate driver for device: {self.udid}. "
+            f"Exception type: {type(e).__name__}. "
+            f"Exception message: {e}",
+            also_to_console=True
+        )
+        raise
 
-
+    return self
