@@ -208,3 +208,10 @@ def __init__(self, **capabilities):
         self.scr_rec_dim["width"],
         self.scr_rec_dim["height"]
     )
+
+
+def assign_terminal_port(self, terminal: Terminal):
+    port = find_free_port()
+    self.terminal_assigned_ports[terminal.udid] = port
+    terminal.assign_session_port(port)
+    logger.info(f"Assigned systemPort {port} to terminal {terminal.udid}")
