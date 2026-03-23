@@ -1,3 +1,118 @@
+def _is_android_terminal(self, terminal) -> bool:
+    platform = getattr(terminal, "platform_name", None) or getattr(terminal, "platformName", None)
+    automation = getattr(terminal, "automation_name", None) or getattr(terminal, "automationName", None)
+
+    return platform == "Android" and automation == "UiAutomator2"
+
+
+@keyword
+def start_terminal_sessions(self, *terminals: Terminal):
+    """
+    Keyword to start WebDriver session and terminal.
+    NOTE! Appium removes application data by default on start.
+    :param terminals: terminals to execute on
+    """
+    handle_tag_based_suite_skip(self.suite_data, terminals)
+
+    mobile_tasks = []
+    browser_tasks = []
+
+    command_executor = AppiumServer.get_appium_url()
+    if not command_executor:
+        raise ValueError("AppiumServer.get_appium_url() returned empty value.")
+
+    for terminal in terminals:
+        if self._is_android_terminal(terminal):
+            self.assign_terminal_port(terminal)
+
+            logger.info(
+                f"Assigned systemPort {getattr(terminal, 'session_port', None)} "
+                f"to terminal {getattr(terminal, 'udid', terminal)}",
+                also_to_console=True
+            )
+
+            logger.info(
+                f"Device {getattr(terminal, 'udid', terminal)} -> Appium URL: {command_executor}",
+                also_to_console=True
+            )
+
+            mobile_tasks.append(
+                lambda terminal=terminal, command_executor=command_executor:
+                    terminal.start_session(command_executor)
+            )
+        else:
+            logger.info(
+                f"Browser/Desktop terminal {getattr(terminal, 'udid', terminal)} "
+                f"-> Appium URL: {command_executor}",
+                also_to_console=True
+            )
+
+            browser_tasks.append(terminal.start_session)
+
+    sessions = []
+
+    if mobile_tasks:
+        sessions.extend(self.run_concurrently(mobile_tasks))
+
+    if browser_tasks:
+        sessions.extend(self.run_concurrently(browser_tasks, command_executor))
+
+    self.terminal_sessions.extend(sessions)
+    self.test_run_data.write_suite_terminals_metadata(self.terminal_sessions)
+    self.test_run_terminals.set_terminal_objects(*terminals)
+
+    self.start_log_and_screen_capture(self.suite_data, setup=True)
+
+
+
+def restart_session(self, terminal):
+    """
+    Restart WebDriver session.
+    :param terminal: terminal where executed
+    """
+    try:
+        if getattr(terminal, "driver", None):
+            terminal.stop_session()
+    except Exception as e:
+        logger.warn(f"Failed to stop previous session for {terminal}: {e}")
+
+    if self._is_android_terminal(terminal):
+        force_stop(terminal.udid, "io.appium.uiautomator2.server")
+        force_stop(terminal.udid, "io.appium.uiautomator2.server.test")
+
+        self.terminal_assigned_ports.pop(terminal.udid, None)
+        self.assign_terminal_port(terminal)
+
+        logger.info(
+            f"Restarting Android session for {terminal.udid} with systemPort="
+            f"{getattr(terminal, 'session_port', None)}",
+            also_to_console=True
+        )
+
+        terminal.start_session(AppiumServer.get_appium_url())
+    else:
+        logger.info(
+            f"Restarting browser/desktop session for {terminal}",
+            also_to_console=True
+        )
+        terminal.start_session(AppiumServer.get_appium_url())
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 @property
 def serial(self):
     """
