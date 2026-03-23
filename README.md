@@ -99,3 +99,62 @@ def start_session(self, command_executor) -> TerminalAppium:
         raise
 
     return self
+
+
+
+
+
+
+
+@staticmethod
+def get_appium_url(port=None):
+    """
+    Get Appium server URL.
+    """
+    data = AppiumServerData()
+
+    if port is not None:
+        return f"http://127.0.0.1:{port}"
+
+    return data.appium_url
+
+
+
+
+@keyword
+def start_terminal_sessions(self, *terminals: Terminal):
+    """
+    Keyword to start WebDriver session and terminal.
+    NOTE! Appium removes application data by default on start.
+    :param terminals: terminals to execute on
+    """
+    handle_tag_based_suite_skip(self.suite_data, terminals)
+
+    tasks = []
+    for terminal in terminals:
+        self.assign_terminal_port(terminal)
+
+        command_executor = AppiumServer.get_appium_url(terminal.session_port)
+        if not command_executor:
+            raise ValueError(
+                f"No Appium URL for device {terminal.udid} "
+                f"(session_port={getattr(terminal, 'session_port', None)})"
+            )
+
+        logger.info(
+            f"Device {terminal.udid} -> Appium URL: {command_executor}",
+            also_to_console=True
+        )
+
+        tasks.append(
+            lambda terminal=terminal, command_executor=command_executor:
+                terminal.start_session(command_executor)
+        )
+
+    sessions = self.run_concurrently(tasks)
+
+    self.terminal_sessions.extend(sessions)
+    self.test_run_data.write_suite_terminals_metadata(self.terminal_sessions)
+    self.test_run_terminals.set_terminal_objects(*terminals)
+
+    self.start_log_and_screen_capture(self.suite_data, setup=True)
