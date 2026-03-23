@@ -215,3 +215,85 @@ def assign_terminal_port(self, terminal: Terminal):
     self.terminal_assigned_ports[terminal.udid] = port
     terminal.assign_session_port(port)
     logger.info(f"Assigned systemPort {port} to terminal {terminal.udid}")
+
+
+
+
+def restart_session(self, terminal):
+    """
+    Restart WebDriver session.
+    :param terminal: terminal where executed
+    """
+    for _ in range(10):
+        if terminal.udid in get_all_connected_device_serials()[0]:
+            break
+        time.sleep(2)
+    else:
+        logger.warn(
+            f"{terminal.udid} was not in connected devices when trying to restart session"
+        )
+
+    # Ferme proprement l'ancienne session si elle existe
+    try:
+        if getattr(terminal, "driver", None):
+            terminal.stop_session()
+    except Exception as e:
+        logger.warn(f"Failed to stop previous session for {terminal.udid}: {e}")
+
+    # Tue les restes côté device
+    force_stop(terminal.udid, "io.appium.uiautomator2.server")
+    force_stop(terminal.udid, "io.appium.uiautomator2.server.test")
+
+    # Libère l'ancien port mémorisé
+    self.terminal_assigned_ports.pop(terminal.udid, None)
+
+    # Réassigne un nouveau systemPort
+    self.assign_terminal_port(terminal)
+
+    logger.info(
+        f"Restarting session for {terminal.udid} with systemPort="
+        f"{getattr(terminal, 'session_port', None)}",
+        also_to_console=True
+    )
+
+    terminal.start_session(AppiumServer.get_appium_url())
+
+
+def assign_terminal_port(self, terminal: Terminal):
+    """
+    Assign port number for Appium UiAutomator2 systemPort.
+    :param terminal: Terminal getting port number assigned
+    """
+    port = find_free_port()
+    self.terminal_assigned_ports[terminal.udid] = port
+    terminal.assign_session_port(port)
+
+    logger.info(
+        f"Assigned systemPort {port} to terminal {terminal.udid}",
+        also_to_console=True
+    )
+
+
+
+@keyword
+def close_terminal_sessions(self):
+    """
+    Keyword to close all started WebDriver sessions.
+    """
+    try:
+        for terminal in self.terminal_sessions:
+            try:
+                terminal.stop_session()
+            finally:
+                self.terminal_assigned_ports.pop(terminal.udid, None)
+    finally:
+        self.terminal_sessions.clear()
+
+
+
+logger.info(
+    f"Creating Appium driver for {self.udid} "
+    f"with systemPort={self.data.get('systemPort')} "
+    f"and command_executor={command_executor}",
+    also_to_console=True
+)
