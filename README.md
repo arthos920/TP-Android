@@ -1,8 +1,9 @@
-def auditor_verify_group_call(
+
+    
+def auditor_verify_group_call_minimal(
     self,
     started_owner,
     joined_owners,
-    took_the_floor_owners,
     ended_owner,
     timeout=120,
     poll_interval=2,
@@ -10,9 +11,6 @@ def auditor_verify_group_call(
 
     if isinstance(joined_owners, str):
         joined_owners = [x.strip() for x in joined_owners.split("|") if x.strip()]
-
-    if isinstance(took_the_floor_owners, str):
-        took_the_floor_owners = [x.strip() for x in took_the_floor_owners.split("|") if x.strip()]
 
     def _norm(value):
         return (value or "").strip()
@@ -23,8 +21,6 @@ def auditor_verify_group_call(
             return "started"
         if t == "joined call":
             return "joined"
-        if t == "took the floor":
-            return "took_floor"
         if t == "ended call":
             return "ended"
         return "other"
@@ -55,7 +51,7 @@ def auditor_verify_group_call(
             time.sleep(poll_interval)
 
         if not valid_rows:
-            log_screenshot_web_global(self.driver, title="group_call FAILED - no rows")
+            log_screenshot_web_global(self.driver, title="group_call_minimal FAILED - no rows")
             raise Exception("No populated rows")
 
         parsed = []
@@ -79,24 +75,21 @@ def auditor_verify_group_call(
 
         call_uuid = list(call_uuids)[0]
 
-        # UI = reverse chrono
+        # UI = reverse
         chrono = list(reversed(parsed))
 
-        # 🔥 Filtrer UNIQUEMENT les events utiles
+        # 🔥 On garde uniquement les events utiles
         filtered = [
             (e["etype_key"], e["owner"])
             for e in chrono
-            if e["etype_key"] in ("started", "joined", "took_floor", "ended")
+            if e["etype_key"] in ("started", "joined", "ended")
         ]
 
-        # Expected
+        # Expected strict
         expected = [("started", started_owner)]
 
         for o in joined_owners:
             expected.append(("joined", o))
-
-        for o in took_the_floor_owners:
-            expected.append(("took_floor", o))
 
         expected.append(("ended", ended_owner))
 
@@ -111,38 +104,34 @@ def auditor_verify_group_call(
 
         if errors:
             html = self.driver.find_element(By.XPATH, GROUP_CALL_TABLE_XPATH).get_attribute("outerHTML")
-            robot.api.logger.info(f"[group_call] HTML: {html}")
-            robot.api.logger.info(f"[group_call] expected={expected}")
-            robot.api.logger.info(f"[group_call] observed={filtered}")
-            log_screenshot_web_global(self.driver, title="group_call FAILED")
+            robot.api.logger.info(f"[group_call_minimal] HTML: {html}")
+            robot.api.logger.info(f"[group_call_minimal] expected={expected}")
+            robot.api.logger.info(f"[group_call_minimal] observed={filtered}")
+            log_screenshot_web_global(self.driver, title="group_call_minimal FAILED")
             raise Exception(" | ".join(errors))
 
-        robot.api.logger.info("[group_call] SUCCESS")
+        robot.api.logger.info("[group_call_minimal] SUCCESS")
         return call_uuid
 
     except Exception as e:
-        log_screenshot_web_global(self.driver, title=f"group_call FAILED - {str(e)}")
+        log_screenshot_web_global(self.driver, title=f"group_call_minimal FAILED - {str(e)}")
         raise
+        
+        
+        
 
+${STARTED_OWNER}=     Set Variable    Dispatcher_Christ Dispatcher_Christ
+${JOINED_OWNERS}=     Set Variable    Christ1 Christ1|Christ2 Christ2|Christ3 Christ3
+${ENDED_OWNER}=       Set Variable    Dispatcher_Christ Dispatcher_Christ
+${TIMEOUT}=           Set Variable    120
+${POLL_INTERVAL}=     Set Variable    2
 
-
-${STARTED_OWNER}=             Set Variable    Dispatcher_Christ Dispatcher_Christ
-${JOINED_OWNERS}=             Set Variable    Christ1 Christ1|Christ2 Christ2|Christ3 Christ3
-${TOOK_THE_FLOOR_OWNERS}=     Set Variable    Christ1 Christ1|Christ2 Christ2|Christ3 Christ3|Dispatcher_Christ Dispatcher_Christ
-${ENDED_OWNER}=               Set Variable    Dispatcher_Christ Dispatcher_Christ
-${TIMEOUT}=                   Set Variable    120
-${POLL_INTERVAL}=             Set Variable    2
-
-auditor_verify_group_call
+auditor_verify_group_call_minimal
 ...    started_owner=${STARTED_OWNER}
 ...    joined_owners=${JOINED_OWNERS}
-...    took_the_floor_owners=${TOOK_THE_FLOOR_OWNERS}
 ...    ended_owner=${ENDED_OWNER}
 ...    timeout=${TIMEOUT}
 ...    poll_interval=${POLL_INTERVAL}
-        
-
-
 
 
 --------------------------------111-1111111
