@@ -8,42 +8,55 @@ from selenium.webdriver.support import expected_conditions as EC
 # LOCATORS
 # =========================
 
-LATE_ENTRY_TABLE_XPATH = "//table[contains(@class,'reports-table') and @data-report-type='audio-calls-ptt']"
-LATE_ENTRY_ROWS_XPATH = LATE_ENTRY_TABLE_XPATH + "//tbody//tr[@data-role='row-template']"
+GROUP_CALL_TABLE_XPATH = "//table[contains(@class,'reports-table') and @data-report-type='audio-calls-ptt']"
+GROUP_CALL_ROWS_XPATH = GROUP_CALL_TABLE_XPATH + "//tbody//tr[@data-role='row-template']"
 
-LATE_ENTRY_OWNER_XPATH = ".//td[@data-role='EventOwner']"
-LATE_ENTRY_TYPE_XPATH = ".//td[@data-role='EventType']"
-LATE_ENTRY_DATE_XPATH = ".//td[@data-role='EventDate']"
-LATE_ENTRY_ADDITIONAL_INFO_XPATH = ".//td[@data-role='AdditionalInfo']"
-LATE_ENTRY_CALL_UUID_XPATH = ".//td[@data-role='CallUuid']"
+GROUP_CALL_OWNER_XPATH = ".//td[@data-role='EventOwner']"
+GROUP_CALL_TYPE_XPATH = ".//td[@data-role='EventType']"
+GROUP_CALL_DATE_XPATH = ".//td[@data-role='EventDate']"
+GROUP_CALL_ADDITIONAL_INFO_XPATH = ".//td[@data-role='AdditionalInfo']"
+GROUP_CALL_CALL_UUID_XPATH = ".//td[@data-role='CallUuid']"
 
 
-def auditor_verify_late_entry(
+def auditor_verify_group_call(
     self,
     started_owner,
-    first_joined_owner,
-    rejected_owner,
-    second_joined_owner,
+    joined_owners,
+    took_the_floor_owners,
+    released_the_floor_owners,
+    left_owners,
     ended_owner,
-    rejected_info="Declined",
     timeout=120,
     poll_interval=2,
 ):
     """
-    Vérifie un scénario late entry dans la table PTT avec ordre STRICT.
+    Vérifie un scénario group call PTT avec ordre STRICT.
 
-    Ordre chronologique attendu :
-      1) Started call          -> started_owner
-      2) Joined call           -> first_joined_owner
-      3) Call rejected         -> rejected_owner + AdditionalInfo == rejected_info
-      4) Joined call           -> second_joined_owner
-      5) Left call             -> owner ignoré
-      6) Left call             -> owner ignoré
-      7) Ended call            -> ended_owner
+    Ordre attendu en chronologique :
+      1) Started call              -> started_owner
+      2) Joined call               -> joined_owners dans l'ordre
+      3) Took the floor            -> took_the_floor_owners dans l'ordre
+      4) Released the floor        -> released_the_floor_owners dans l'ordre
+      5) Left call                 -> left_owners dans l'ordre
+      6) Ended call                -> ended_owner
 
-    Screenshot + dump HTML en cas d'échec.
-    Retourne le call_uuid.
+    Remarque :
+    - La table UI est affichée du plus récent au plus ancien, donc on inverse les rows.
+    - joined_owners / took_the_floor_owners / released_the_floor_owners / left_owners
+      peuvent être des listes Python ou des strings séparées par "|".
     """
+
+    if isinstance(joined_owners, str):
+        joined_owners = [x.strip() for x in joined_owners.split("|") if x.strip()]
+
+    if isinstance(took_the_floor_owners, str):
+        took_the_floor_owners = [x.strip() for x in took_the_floor_owners.split("|") if x.strip()]
+
+    if isinstance(released_the_floor_owners, str):
+        released_the_floor_owners = [x.strip() for x in released_the_floor_owners.split("|") if x.strip()]
+
+    if isinstance(left_owners, str):
+        left_owners = [x.strip() for x in left_owners.split("|") if x.strip()]
 
     def _norm(value):
         return (value or "").strip()
@@ -54,18 +67,20 @@ def auditor_verify_late_entry(
             return "started"
         if t == "joined call":
             return "joined"
+        if t == "took the floor":
+            return "took_floor"
+        if t == "released the floor":
+            return "released_floor"
         if t == "left call":
             return "left"
         if t == "ended call":
             return "ended"
-        if t == "call rejected":
-            return "rejected"
         return "other"
 
     try:
         # 1) Attendre la table
         WebDriverWait(self.driver, 20).until(
-            EC.presence_of_element_located((By.XPATH, LATE_ENTRY_TABLE_XPATH))
+            EC.presence_of_element_located((By.XPATH, GROUP_CALL_TABLE_XPATH))
         )
 
         # 2) Attendre des lignes peuplées
@@ -74,12 +89,12 @@ def auditor_verify_late_entry(
         last_table_html = None
 
         while time.monotonic() < end_time:
-            rows = self.driver.find_elements(By.XPATH, LATE_ENTRY_ROWS_XPATH)
+            rows = self.driver.find_elements(By.XPATH, GROUP_CALL_ROWS_XPATH)
             valid_rows = []
 
             for row in rows:
                 try:
-                    call_uuid = _norm(row.find_element(By.XPATH, LATE_ENTRY_CALL_UUID_XPATH).text)
+                    call_uuid = _norm(row.find_element(By.XPATH, GROUP_CALL_CALL_UUID_XPATH).text)
                     if call_uuid:
                         valid_rows.append(row)
                 except Exception:
@@ -89,7 +104,7 @@ def auditor_verify_late_entry(
                 break
 
             try:
-                last_table_html = self.driver.find_element(By.XPATH, LATE_ENTRY_TABLE_XPATH).get_attribute("outerHTML")
+                last_table_html = self.driver.find_element(By.XPATH, GROUP_CALL_TABLE_XPATH).get_attribute("outerHTML")
             except Exception:
                 last_table_html = None
 
@@ -97,8 +112,8 @@ def auditor_verify_late_entry(
 
         if not valid_rows:
             if last_table_html:
-                robot.api.logger.info(f"[auditor_verify_late_entry] table html: {last_table_html}")
-            log_screenshot_web_global(self.driver, title="auditor_verify_late_entry FAILED - no populated rows")
+                robot.api.logger.info(f"[auditor_verify_group_call] table html: {last_table_html}")
+            log_screenshot_web_global(self.driver, title="auditor_verify_group_call FAILED - no populated rows")
             raise Exception("No populated rows found (UI async not finished)")
 
         # 3) Parser les rows
@@ -106,13 +121,13 @@ def auditor_verify_late_entry(
         call_uuids = set()
 
         for row in valid_rows:
-            owner = _norm(row.find_element(By.XPATH, LATE_ENTRY_OWNER_XPATH).text)
-            etype = _norm(row.find_element(By.XPATH, LATE_ENTRY_TYPE_XPATH).text)
-            edate = _norm(row.find_element(By.XPATH, LATE_ENTRY_DATE_XPATH).text)
-            call_uuid = _norm(row.find_element(By.XPATH, LATE_ENTRY_CALL_UUID_XPATH).text)
+            owner = _norm(row.find_element(By.XPATH, GROUP_CALL_OWNER_XPATH).text)
+            etype = _norm(row.find_element(By.XPATH, GROUP_CALL_TYPE_XPATH).text)
+            edate = _norm(row.find_element(By.XPATH, GROUP_CALL_DATE_XPATH).text)
+            call_uuid = _norm(row.find_element(By.XPATH, GROUP_CALL_CALL_UUID_XPATH).text)
 
             try:
-                additional_info = _norm(row.find_element(By.XPATH, LATE_ENTRY_ADDITIONAL_INFO_XPATH).text)
+                additional_info = _norm(row.find_element(By.XPATH, GROUP_CALL_ADDITIONAL_INFO_XPATH).text)
             except Exception:
                 additional_info = ""
 
@@ -133,27 +148,33 @@ def auditor_verify_late_entry(
             raise Exception(f"Expected exactly 1 CallUuid across rows, got {len(call_uuids)}: {call_uuids}")
 
         call_uuid = next(iter(call_uuids))
-        robot.api.logger.info(f"[auditor_verify_late_entry] detected call_uuid={call_uuid}")
+        robot.api.logger.info(f"[auditor_verify_group_call] detected call_uuid={call_uuid}")
 
         # 4) La table UI est du plus récent au plus ancien, donc on inverse
         chrono = list(reversed(parsed))
 
         # 5) Séquence attendue
-        expected_sequence = [
-            ("started", started_owner),
-            ("joined", first_joined_owner),
-            ("rejected", rejected_owner),
-            ("joined", second_joined_owner),
-            ("left", None),
-            ("left", None),
-            ("ended", ended_owner),
-        ]
+        expected_sequence = [("started", started_owner)]
+
+        for owner in joined_owners:
+            expected_sequence.append(("joined", owner))
+
+        for owner in took_the_floor_owners:
+            expected_sequence.append(("took_floor", owner))
+
+        for owner in released_the_floor_owners:
+            expected_sequence.append(("released_floor", owner))
+
+        for owner in left_owners:
+            expected_sequence.append(("left", owner))
+
+        expected_sequence.append(("ended", ended_owner))
 
         # 6) Séquence observée
         observed_sequence = [
             (event["etype_key"], event["owner"])
             for event in chrono
-            if event["etype_key"] in ("started", "joined", "rejected", "left", "ended")
+            if event["etype_key"] in ("started", "joined", "took_floor", "released_floor", "left", "ended")
         ]
 
         errors = []
@@ -166,72 +187,49 @@ def auditor_verify_late_entry(
 
         # 8) Vérif stricte position par position
         for index, (expected_item, observed_item) in enumerate(zip(expected_sequence, observed_sequence), start=1):
-            exp_type, exp_owner = expected_item
-            obs_type, obs_owner = observed_item
-
-            if exp_type != obs_type:
-                errors.append(f"Mismatch at pos {index}: expected type '{exp_type}', got '{obs_type}'")
-
-            if exp_owner is not None and exp_owner != obs_owner:
-                errors.append(f"Mismatch at pos {index}: expected owner '{exp_owner}', got '{obs_owner}'")
-
-        # 9) Vérif spécifique du Call rejected
-        rejected_event = next((event for event in chrono if event["etype_key"] == "rejected"), None)
-        if not rejected_event:
-            errors.append("Missing rejected event")
-        else:
-            if rejected_event["owner"] != rejected_owner:
-                errors.append(
-                    f"Rejected owner mismatch: expected '{rejected_owner}', got '{rejected_event['owner']}'"
-                )
-
-            if rejected_info is not None and rejected_event["additional_info"] != rejected_info:
-                errors.append(
-                    f"Rejected additional info mismatch: expected '{rejected_info}', got '{rejected_event['additional_info']}'"
-                )
+            if expected_item != observed_item:
+                errors.append(f"Mismatch at pos {index}: expected {expected_item}, got {observed_item}")
 
         if errors:
-            html = self.driver.find_element(By.XPATH, LATE_ENTRY_TABLE_XPATH).get_attribute("outerHTML")
-            robot.api.logger.info(f"[auditor_verify_late_entry] table html: {html}")
-            robot.api.logger.info(f"[auditor_verify_late_entry] expected={expected_sequence}")
-            robot.api.logger.info(f"[auditor_verify_late_entry] observed={observed_sequence}")
-            log_screenshot_web_global(self.driver, title="auditor_verify_late_entry FAILED")
+            html = self.driver.find_element(By.XPATH, GROUP_CALL_TABLE_XPATH).get_attribute("outerHTML")
+            robot.api.logger.info(f"[auditor_verify_group_call] table html: {html}")
+            robot.api.logger.info(f"[auditor_verify_group_call] expected={expected_sequence}")
+            robot.api.logger.info(f"[auditor_verify_group_call] observed={observed_sequence}")
+            log_screenshot_web_global(self.driver, title="auditor_verify_group_call FAILED")
             raise Exception(" | ".join(errors))
 
-        robot.api.logger.info("[auditor_verify_late_entry] SUCCESS")
+        robot.api.logger.info("[auditor_verify_group_call] SUCCESS")
         return call_uuid
 
     except Exception as e:
-        log_screenshot_web_global(self.driver, title=f"auditor_verify_late_entry FAILED - {str(e)}")
+        log_screenshot_web_global(self.driver, title=f"auditor_verify_group_call FAILED - {str(e)}")
         try:
-            html = self.driver.find_element(By.XPATH, LATE_ENTRY_TABLE_XPATH).get_attribute("outerHTML")
-            robot.api.logger.info(f"[auditor_verify_late_entry] table html: {html}")
+            html = self.driver.find_element(By.XPATH, GROUP_CALL_TABLE_XPATH).get_attribute("outerHTML")
+            robot.api.logger.info(f"[auditor_verify_group_call] table html: {html}")
         except Exception:
             pass
         raise
 
 
 
+${STARTED_OWNER}=                 Set Variable    Dispatcher_Christ Dispatcher_Christ
+${JOINED_OWNERS}=                 Set Variable    Christ1 Christ1|Christ2 Christ2|Christ3 Christ3
+${TOOK_THE_FLOOR_OWNERS}=         Set Variable    Christ1 Christ1|Christ2 Christ2|Christ3 Christ3|Dispatcher_Christ Dispatcher_Christ
+${RELEASED_THE_FLOOR_OWNERS}=     Set Variable    Christ1 Christ1|Christ2 Christ2|Christ3 Christ3|Dispatcher_Christ Dispatcher_Christ
+${LEFT_OWNERS}=                   Set Variable    Christ1 Christ1|Christ2 Christ2|Christ3 Christ3
+${ENDED_OWNER}=                   Set Variable    Dispatcher_Christ Dispatcher_Christ
+${TIMEOUT}=                       Set Variable    120
+${POLL_INTERVAL}=                 Set Variable    2
 
-${STARTED_OWNER}=         Set Variable    Christ1 Christ1
-${FIRST_JOINED_OWNER}=    Set Variable    Christ2 Christ2
-${REJECTED_OWNER}=        Set Variable    Christ3 Christ3
-${SECOND_JOINED_OWNER}=   Set Variable    Christ3 Christ3
-${ENDED_OWNER}=           Set Variable    Christ1 Christ1
-${REJECTED_INFO}=         Set Variable    Declined
-${TIMEOUT}=               Set Variable    120
-${POLL_INTERVAL}=         Set Variable    2
-
-auditor_verify_late_entry
+auditor_verify_group_call
 ...    started_owner=${STARTED_OWNER}
-...    first_joined_owner=${FIRST_JOINED_OWNER}
-...    rejected_owner=${REJECTED_OWNER}
-...    second_joined_owner=${SECOND_JOINED_OWNER}
+...    joined_owners=${JOINED_OWNERS}
+...    took_the_floor_owners=${TOOK_THE_FLOOR_OWNERS}
+...    released_the_floor_owners=${RELEASED_THE_FLOOR_OWNERS}
+...    left_owners=${LEFT_OWNERS}
 ...    ended_owner=${ENDED_OWNER}
-...    rejected_info=${REJECTED_INFO}
 ...    timeout=${TIMEOUT}
 ...    poll_interval=${POLL_INTERVAL}
-
 
 
 
