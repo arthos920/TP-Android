@@ -1,4 +1,22 @@
+=========================
+# LOCATORS
+# =========================
 
+CONFERENCE_CALL_TABLE_XPATH = "//table[contains(@class,'reports-table') and @data-report-type='audio-calls-conferencecall']"
+CONFERENCE_CALL_ROWS_XPATH = CONFERENCE_CALL_TABLE_XPATH + "//tbody//tr[@data-role='row-template']"
+
+CONFERENCE_CALL_OWNER_XPATH = ".//td[@data-role='EventOwner']"
+CONFERENCE_CALL_DATE_XPATH = ".//td[@data-role='EventDate']"
+CONFERENCE_CALL_TYPE_XPATH = ".//td[@data-role='EventType']"
+CONFERENCE_CALL_STATE_XPATH = ".//td[@data-role='CallState']"
+CONFERENCE_CALL_RECORDING_XPATH = ".//td[@data-role='SessionRecording']"
+CONFERENCE_CALL_INITIATOR_XPATH = ".//td[@data-role='Initiator']"
+CONFERENCE_CALL_PARTICIPANT_XPATH = ".//td[@data-role='Participant']"
+CONFERENCE_CALL_UUID_XPATH = ".//td[@data-role='CallUuid']"
+
+CONFERENCE_CALL_PLAY_XPATH = ".//*[@data-role='play' or contains(@class,'play-main') or contains(@class,'play')]"
+CONFERENCE_CALL_DURATION_XPATH = ".//*[@data-role='Duration']"
+CONFERENCE_CALL_DOWNLOAD_XPATH = ".//span[contains(@class,'download-link')]"
     
 def auditor_verify_conference_call(
     self,
