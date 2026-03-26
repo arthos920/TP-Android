@@ -1,12 +1,15 @@
 
     
-def auditor_verify_group_call_minimal(
+def auditor_verify_conference_call(
     self,
     started_owner,
     joined_owners,
     ended_owner,
+    initiator_name,
     timeout=120,
     poll_interval=2,
+    expected_call_result="Success",
+    require_recording_controls=True,
 ):
 
     if isinstance(joined_owners, str):
@@ -27,19 +30,19 @@ def auditor_verify_group_call_minimal(
 
     try:
         WebDriverWait(self.driver, 20).until(
-            EC.presence_of_element_located((By.XPATH, GROUP_CALL_TABLE_XPATH))
+            EC.presence_of_element_located((By.XPATH, CONFERENCE_CALL_TABLE_XPATH))
         )
 
         end_time = time.monotonic() + timeout
         valid_rows = []
 
         while time.monotonic() < end_time:
-            rows = self.driver.find_elements(By.XPATH, GROUP_CALL_ROWS_XPATH)
+            rows = self.driver.find_elements(By.XPATH, CONFERENCE_CALL_ROWS_XPATH)
             valid_rows = []
 
             for row in rows:
                 try:
-                    uuid = _norm(row.find_element(By.XPATH, GROUP_CALL_CALL_UUID_XPATH).text)
+                    uuid = _norm(row.find_element(By.XPATH, CONFERENCE_CALL_UUID_XPATH).text)
                     if uuid:
                         valid_rows.append(row)
                 except:
@@ -51,23 +54,28 @@ def auditor_verify_group_call_minimal(
             time.sleep(poll_interval)
 
         if not valid_rows:
-            log_screenshot_web_global(self.driver, title="group_call_minimal FAILED - no rows")
+            log_screenshot_web_global(self.driver, title="conference_call FAILED - no rows")
             raise Exception("No populated rows")
 
         parsed = []
         call_uuids = set()
 
         for row in valid_rows:
-            owner = _norm(row.find_element(By.XPATH, GROUP_CALL_OWNER_XPATH).text)
-            etype = _norm(row.find_element(By.XPATH, GROUP_CALL_TYPE_XPATH).text)
-            uuid = _norm(row.find_element(By.XPATH, GROUP_CALL_CALL_UUID_XPATH).text)
+            owner = _norm(row.find_element(By.XPATH, CONFERENCE_CALL_OWNER_XPATH).text)
+            etype = _norm(row.find_element(By.XPATH, CONFERENCE_CALL_TYPE_XPATH).text)
+            state = _norm(row.find_element(By.XPATH, CONFERENCE_CALL_STATE_XPATH).text)
+            initiator = _norm(row.find_element(By.XPATH, CONFERENCE_CALL_INITIATOR_XPATH).text)
+            uuid = _norm(row.find_element(By.XPATH, CONFERENCE_CALL_UUID_XPATH).text)
 
             if uuid:
                 call_uuids.add(uuid)
 
             parsed.append({
+                "row": row,
                 "owner": owner,
-                "etype_key": _etype_key(etype)
+                "etype_key": _etype_key(etype),
+                "state": state,
+                "initiator": initiator
             })
 
         if len(call_uuids) != 1:
@@ -75,17 +83,15 @@ def auditor_verify_group_call_minimal(
 
         call_uuid = list(call_uuids)[0]
 
-        # UI = reverse
         chrono = list(reversed(parsed))
 
-        # 🔥 On garde uniquement les events utiles
+        # 🔥 on ignore LEFT automatiquement
         filtered = [
-            (e["etype_key"], e["owner"])
-            for e in chrono
+            e for e in chrono
             if e["etype_key"] in ("started", "joined", "ended")
         ]
 
-        # Expected strict
+        # Expected
         expected = [("started", started_owner)]
 
         for o in joined_owners:
@@ -93,47 +99,76 @@ def auditor_verify_group_call_minimal(
 
         expected.append(("ended", ended_owner))
 
+        observed = [(e["etype_key"], e["owner"]) for e in filtered]
+
         errors = []
 
-        if len(filtered) != len(expected):
-            errors.append(f"Length mismatch: expected {len(expected)}, got {len(filtered)}")
+        if len(observed) != len(expected):
+            errors.append(f"Length mismatch: expected {len(expected)}, got {len(observed)}")
 
-        for i, (exp, obs) in enumerate(zip(expected, filtered), start=1):
+        for i, (exp, obs) in enumerate(zip(expected, observed), start=1):
             if exp != obs:
                 errors.append(f"Mismatch pos {i}: expected {exp}, got {obs}")
 
+        # Vérif state + initiator
+        for e in filtered:
+            if expected_call_result and e["state"] != expected_call_result:
+                errors.append(f"Bad state for {e['owner']}: {e['state']}")
+
+            if initiator_name and e["initiator"] != initiator_name:
+                errors.append(f"Bad initiator for {e['owner']}: {e['initiator']}")
+
+        # Vérif recording sur ended
+        ended_event = next((e for e in filtered if e["etype_key"] == "ended"), None)
+
+        if ended_event:
+            rec_td = ended_event["row"].find_element(By.XPATH, CONFERENCE_CALL_RECORDING_XPATH)
+
+            if require_recording_controls:
+                if not rec_td.find_elements(By.XPATH, CONFERENCE_CALL_PLAY_XPATH):
+                    errors.append("Missing play button")
+
+                if not rec_td.find_elements(By.XPATH, CONFERENCE_CALL_DOWNLOAD_XPATH):
+                    errors.append("Missing download button")
+
+            try:
+                duration = rec_td.find_element(By.XPATH, CONFERENCE_CALL_DURATION_XPATH).text.strip()
+                if not duration or duration == "00:00:00":
+                    errors.append("Invalid recording duration")
+            except:
+                errors.append("No duration found")
+
         if errors:
-            html = self.driver.find_element(By.XPATH, GROUP_CALL_TABLE_XPATH).get_attribute("outerHTML")
-            robot.api.logger.info(f"[group_call_minimal] HTML: {html}")
-            robot.api.logger.info(f"[group_call_minimal] expected={expected}")
-            robot.api.logger.info(f"[group_call_minimal] observed={filtered}")
-            log_screenshot_web_global(self.driver, title="group_call_minimal FAILED")
+            html = self.driver.find_element(By.XPATH, CONFERENCE_CALL_TABLE_XPATH).get_attribute("outerHTML")
+            robot.api.logger.info(f"expected={expected}")
+            robot.api.logger.info(f"observed={observed}")
+            robot.api.logger.info(html)
+            log_screenshot_web_global(self.driver, title="conference_call FAILED")
             raise Exception(" | ".join(errors))
 
-        robot.api.logger.info("[group_call_minimal] SUCCESS")
+        robot.api.logger.info("conference_call SUCCESS")
         return call_uuid
 
     except Exception as e:
-        log_screenshot_web_global(self.driver, title=f"group_call_minimal FAILED - {str(e)}")
+        log_screenshot_web_global(self.driver, title=f"conference_call FAILED - {str(e)}")
         raise
-        
-        
-        
 
-${STARTED_OWNER}=     Set Variable    Dispatcher_Christ Dispatcher_Christ
-${JOINED_OWNERS}=     Set Variable    Christ1 Christ1|Christ2 Christ2|Christ3 Christ3
-${ENDED_OWNER}=       Set Variable    Dispatcher_Christ Dispatcher_Christ
-${TIMEOUT}=           Set Variable    120
-${POLL_INTERVAL}=     Set Variable    2
 
-auditor_verify_group_call_minimal
+
+${STARTED_OWNER}=      Set Variable    Christ1 Christ1
+${JOINED_OWNERS}=      Set Variable    Christ2 Christ2|Christ3 Christ3|Dispatcher_Christ Dispatcher_Christ
+${ENDED_OWNER}=        Set Variable    Dispatcher_Christ Dispatcher_Christ
+${INITIATOR_NAME}=     Set Variable    Christ1 Christ1
+${TIMEOUT}=            Set Variable    120
+${POLL_INTERVAL}=      Set Variable    2
+
+auditor_verify_conference_call
 ...    started_owner=${STARTED_OWNER}
 ...    joined_owners=${JOINED_OWNERS}
 ...    ended_owner=${ENDED_OWNER}
+...    initiator_name=${INITIATOR_NAME}
 ...    timeout=${TIMEOUT}
 ...    poll_interval=${POLL_INTERVAL}
-
-
 --------------------------------111-1111111
 
 def stop_adb_screenrecord(self) -> None:
