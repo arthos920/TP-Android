@@ -1,4 +1,132 @@
 
+from typing import Tuple, List, Dict, Optional
+
+def build_gitlab_messages_for_step(
+    step: int,
+    *,
+    project_id: str,
+    ref: str,
+    jira_summary: Optional[str] = None,
+    tree_preview: Optional[List[str]] = None,
+) -> Tuple[str, List[Dict[str, str]]]:
+
+    if step == 1:
+        tool = "get_project"
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Tu dois appeler EXACTEMENT le tool get_project.\n"
+                    "Arguments attendus:\n"
+                    "- project_id (string)\n"
+                    "Ne fais rien d'autre."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"Appelle get_project avec project_id='{project_id}'.",
+            },
+        ]
+        return tool, messages
+
+    if step == 2:
+        tool = "get_repository_tree"
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Tu dois appeler EXACTEMENT le tool get_repository_tree.\n"
+                    "Arguments attendus:\n"
+                    "- project_id (string)\n"
+                    "- ref (string)\n"
+                    "- path (string)\n"
+                    "- recursive (boolean)\n"
+                    "Ne fais rien d'autre."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Appelle get_repository_tree avec project_id='{project_id}', "
+                    f"ref='{ref}', path='', recursive=true."
+                ),
+            },
+        ]
+        return tool, messages
+
+    if step == 3:
+        tool = "get_file_contents"
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Tu dois appeler EXACTEMENT le tool get_file_contents.\n"
+                    "Arguments attendus:\n"
+                    "- project_id (string)\n"
+                    "- ref (string)\n"
+                    "- file_path (string)\n"
+                    "Lis en priorité doc/convention.md. "
+                    "Si absent, essaye docs/convention.md puis convention.md.\n"
+                    "Ne fais rien d'autre."
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Appelle get_file_contents avec project_id='{project_id}', "
+                    f"ref='{ref}', file_path='doc/convention.md'."
+                ),
+            },
+        ]
+        return tool, messages
+
+    if step == 4:
+        tree_hint = ""
+        if tree_preview:
+            tree_hint = "\nAperçu tree:\n- " + "\n- ".join(tree_preview[:80])
+
+        tool = "TOOL_LOOP"
+        messages = [
+            {
+                "role": "system",
+                "content": (
+                    "Tu es un agent GitLab pour analyser un framework Robot Framework.\n"
+                    "Tu peux utiliser UNIQUEMENT ces tools:\n"
+                    "- get_project\n"
+                    "- get_repository_tree\n"
+                    "- get_file_contents\n\n"
+                    "Objectif:\n"
+                    "1) Utiliser le résumé Jira pour déterminer les fichiers pertinents.\n"
+                    "2) Explorer le repo et lire les fichiers utiles.\n"
+                    "3) Si un fichier n'existe pas, ignore l'erreur et continue.\n"
+                    "4) Ne relis pas plusieurs fois le même fichier.\n"
+                    "5) Quand tu as assez d'informations, ou après la limite d'appels, "
+                    "donne la meilleure synthèse possible pour générer un test Robot.\n\n"
+                    "Important:\n"
+                    "- Pour get_file_contents, utilise file_path, pas path.\n"
+                    "- Pour get_repository_tree, path est un chemin dans le repo.\n"
+                    "- N'appelle get_file_contents QUE sur des fichiers vus dans le tree.\n"
+                ),
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Résumé Jira:\n{jira_summary or '(non fourni)'}\n\n"
+                    f"Repo:\n- project_id='{project_id}'\n- ref='{ref}'\n"
+                    f"{tree_hint}\n\n"
+                    "Analyse maintenant le repo, lis les fichiers pertinents, "
+                    "puis donne la meilleure synthèse possible pour écrire la feuille Robot."
+                ),
+            },
+        ]
+        return tool, messages
+
+    raise ValueError("step doit être 1, 2, 3 ou 4.")
+
+
+
+
+
 
 async def gitlab_run_step4_tool_loop(
     llm,
