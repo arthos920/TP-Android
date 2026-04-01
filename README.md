@@ -1,3 +1,232 @@
+
+
+async def gitlab_run_step4_tool_loop(
+    llm,
+    gitlab,
+    openai_tools,
+    *,
+    project_id: str,
+    ref: str,
+    jira_summary: str,
+    tree_preview=None,
+    max_rounds: int = 12,
+    max_tool_calls: int = 20,
+):
+    expected_tool, messages = build_gitlab_messages_for_step(
+        4,
+        project_id=project_id,
+        ref=ref,
+        jira_summary=jira_summary,
+        tree_preview=tree_preview,
+    )
+
+    allowed_tools = {
+        "get_project",
+        "get_repository_tree",
+        "get_file_contents",
+    }
+
+    traces = []
+    seen_calls = set()
+    tool_calls_count = 0
+
+    for i in range(1, max_rounds + 1):
+        # Si budget atteint avant même un nouveau round, on force la conclusion
+        if tool_calls_count >= max_tool_calls:
+            break
+
+        resp = await llm.chat.completions.create(
+            model=LLM_MODEL,
+            messages=messages,
+            tools=openai_tools,
+            tool_choice="auto",
+            temperature=0.0,
+        )
+
+        msg = resp.choices[0].message
+
+        # Réponse finale normale
+        if not msg.tool_calls:
+            final_text = msg.content or ""
+            messages.append({"role": "assistant", "content": final_text})
+
+            files_read = [
+                t["args"].get("file_path")
+                for t in traces
+                if t["tool"] == "get_file_contents"
+                and t["args"].get("file_path")
+            ]
+
+            return {
+                "final_synthesis": final_text,
+                "tool_traces": traces,
+                "files_read": files_read,
+                "tool_calls_count": tool_calls_count,
+                "stopped_reason": "model_finished",
+            }
+
+        messages.append({"role": "assistant", "content": msg.content or ""})
+
+        for tc in msg.tool_calls:
+            # stop si budget atteint
+            if tool_calls_count >= max_tool_calls:
+                break
+
+            name = tc.function.name
+            args = json.loads(tc.function.arguments or "{}")
+
+            if name not in allowed_tools:
+                # au lieu de raise, on informe le modèle
+                norm = {
+                    "error": True,
+                    "tool": name,
+                    "message": f"Tool non autorisé: {name}",
+                    "args": args,
+                }
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "name": name,
+                        "content": json.dumps(norm, ensure_ascii=False),
+                    }
+                )
+                traces.append(
+                    {
+                        "loop": i,
+                        "tool": name,
+                        "args": args,
+                        "error": f"Tool non autorisé: {name}",
+                        "result": norm,
+                    }
+                )
+                continue
+
+            # anti-boucle
+            call_sig = (name, json.dumps(args, sort_keys=True, ensure_ascii=False))
+            if call_sig in seen_calls:
+                print(f"[STEP4] ⏭️ Skip duplicate call -> {name} {args}")
+                norm = {
+                    "error": True,
+                    "tool": name,
+                    "message": "Duplicate call skipped",
+                    "args": args,
+                }
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "name": name,
+                        "content": json.dumps(norm, ensure_ascii=False),
+                    }
+                )
+                traces.append(
+                    {
+                        "loop": i,
+                        "tool": name,
+                        "args": args,
+                        "error": "Duplicate call skipped",
+                        "result": norm,
+                    }
+                )
+                continue
+
+            seen_calls.add(call_sig)
+            tool_calls_count += 1
+
+            print(f"\n[STEP4] TOOL_CALL #{tool_calls_count}/{max_tool_calls} loop={i} -> {name} args={args}")
+
+            try:
+                result = await gitlab.call_tool(name, args)
+                norm = normalize(result)
+                tool_error = None
+            except Exception as e:
+                print(f"[STEP4][WARN] Tool failed: {name} -> {e}")
+                norm = {
+                    "error": True,
+                    "tool": name,
+                    "message": str(e),
+                    "args": args,
+                }
+                tool_error = str(e)
+
+            traces.append(
+                {
+                    "loop": i,
+                    "tool": name,
+                    "args": args,
+                    "error": tool_error,
+                    "result": norm,
+                }
+            )
+
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tc.id,
+                    "name": name,
+                    "content": json.dumps(norm, ensure_ascii=False),
+                }
+            )
+
+        # si budget atteint en fin de loop interne
+        if tool_calls_count >= max_tool_calls:
+            break
+
+    # ------------------------------------------------------------------
+    # FIN GRACIEUSE : on ne raise pas, on demande une conclusion
+    # ------------------------------------------------------------------
+    messages.append(
+        {
+            "role": "user",
+            "content": (
+                f"Tu as atteint la limite maximale de {max_tool_calls} appels d'outils "
+                "ou la limite de rounds. "
+                "Tu ne dois plus appeler d'outil maintenant. "
+                "À partir des informations déjà collectées, donne la meilleure synthèse possible "
+                "pour écrire le test Robot Framework. "
+                "Indique aussi les fichiers lus, les keywords probables à réutiliser, "
+                "et le meilleur squelette de test possible."
+            ),
+        }
+    )
+
+    final_resp = await llm.chat.completions.create(
+        model=LLM_MODEL,
+        messages=messages,
+        temperature=0.2,
+    )
+
+    final_text = final_resp.choices[0].message.content or ""
+
+    files_read = [
+        t["args"].get("file_path")
+        for t in traces
+        if t["tool"] == "get_file_contents"
+        and t["args"].get("file_path")
+    ]
+
+    return {
+        "final_synthesis": final_text,
+        "tool_traces": traces,
+        "files_read": files_read,
+        "tool_calls_count": tool_calls_count,
+        "stopped_reason": "budget_reached",
+    }
+
+
+
+
+
+
+
+
+
+
+
+
+
+
 =========================
 # LOCATORS
 # =========================
