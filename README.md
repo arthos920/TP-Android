@@ -1,4 +1,25 @@
 
+@echo off
+:: Vérifie si le script est lancé en admin
+net session >nul 2>&1
+if %errorLevel% neq 0 (
+    echo Demande des droits administrateur...
+    powershell -Command "Start-Process cmd -ArgumentList '/c %~s0' -Verb runAs"
+    exit /b
+)
+
+echo Lancement du script PowerShell...
+
+powershell -ExecutionPolicy Bypass -File "C:\chemin\vers\ton_script.ps1"
+
+pause
+
+
+
+
+
+
+
 from typing import Tuple, List, Dict, Optional
 
 def build_gitlab_messages_for_step(
