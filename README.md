@@ -1,3 +1,142 @@
+def build_gitlab_messages_for_step(
+    step: int,
+    *,
+    project_id: str,
+    ref: str,
+    jira_summary: Optional[str] = None,
+    tree_preview: Optional[List[str]] = None,
+    ranked_files: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[str, List[Dict[str, str]]]:
+
+    if step == 1:
+        return "get_project", [
+            {
+                "role": "system",
+                "content": "Tu dois appeler EXACTEMENT le tool get_project.",
+            },
+            {
+                "role": "user",
+                "content": f"Appelle get_project avec project_id='{project_id}'.",
+            },
+        ]
+
+    if step == 2:
+        return "get_repository_tree", [
+            {
+                "role": "system",
+                "content": "Tu dois appeler EXACTEMENT le tool get_repository_tree.",
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Appelle get_repository_tree avec project_id='{project_id}', "
+                    f"ref='{ref}', path='', recursive=true."
+                ),
+            },
+        ]
+
+    # private_call keywords
+    if step == 3:
+        return "get_file_contents", [
+            {
+                "role": "system",
+                "content": "Tu dois appeler EXACTEMENT le tool get_file_contents.",
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Appelle get_file_contents avec project_id='{project_id}', "
+                    f"ref='{ref}', file_path='keywords/private_call.robot'."
+                ),
+            },
+        ]
+
+    # video_call keywords
+    if step == 4:
+        return "get_file_contents", [
+            {
+                "role": "system",
+                "content": "Tu dois appeler EXACTEMENT le tool get_file_contents.",
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Appelle get_file_contents avec project_id='{project_id}', "
+                    f"ref='{ref}', file_path='keywords/video_call.robot'."
+                ),
+            },
+        ]
+
+    # conference_call keywords
+    if step == 5:
+        return "get_file_contents", [
+            {
+                "role": "system",
+                "content": "Tu dois appeler EXACTEMENT le tool get_file_contents.",
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Appelle get_file_contents avec project_id='{project_id}', "
+                    f"ref='{ref}', file_path='keywords/conference_call.robot'."
+                ),
+            },
+        ]
+
+    # group_call keywords
+    if step == 6:
+        return "get_file_contents", [
+            {
+                "role": "system",
+                "content": "Tu dois appeler EXACTEMENT le tool get_file_contents.",
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Appelle get_file_contents avec project_id='{project_id}', "
+                    f"ref='{ref}', file_path='keywords/group_call.robot'."
+                ),
+            },
+        ]
+
+    # incoming_call
+    if step == 7:
+        return "get_file_contents", [
+            {
+                "role": "system",
+                "content": "Tu dois appeler EXACTEMENT le tool get_file_contents.",
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Appelle get_file_contents avec project_id='{project_id}', "
+                    f"ref='{ref}', file_path='keywords/incoming_call.robot'."
+                ),
+            },
+        ]
+
+    # outgoing_call
+    if step == 8:
+        return "get_file_contents", [
+            {
+                "role": "system",
+                "content": "Tu dois appeler EXACTEMENT le tool get_file_contents.",
+            },
+            {
+                "role": "user",
+                "content": (
+                    f"Appelle get_file_contents avec project_id='{project_id}', "
+                    f"ref='{ref}', file_path='keywords/outgoing_call.robot'."
+                ),
+            },
+        ]
+
+    raise ValueError("step inconnu")
+
+
+
+
+
 async def gitlab_run_step_forced_one_tool(
     llm,
     mcp,
