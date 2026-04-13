@@ -1,3 +1,38 @@
+
+"user": (
+    "IMPORTANT:\n"
+    "- N'utilise QUE des keywords présents dans les fichiers.\n"
+    "- Si un keyword n'est pas visible, ne l'invente pas.\n"
+    "- Cite toujours le fichier source du keyword.\n\n"
+    + json.dumps(payload, ...)
+)
+
+
+n"
+
+    "RÈGLE CRITIQUE:\n"
+    "- Tu ne dois JAMAIS inventer de keywords.\n"
+    "- Tu dois UNIQUEMENT utiliser des keywords présents dans les fichiers fournis.\n"
+    "- Si un keyword n'est pas visible dans les fichiers, tu dois dire 'keyword non trouvé'.\n"
+    "- Ne devine jamais.\n\n"
+
+
+
+
+"content": (
+    "Tu dois appeler EXACTEMENT le tool get_file_contents.\n"
+
+    "IMPORTANT:\n"
+    "- Tu ne dois PAS inventer de contenu.\n"
+    "- Tu dois uniquement récupérer le fichier demandé.\n"
+
+    "Ne fais rien d'autre."
+)
+
+
+
+
+
 def build_gitlab_messages_for_step(
     step: int,
     *,
