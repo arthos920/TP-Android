@@ -1,3 +1,65 @@
+async def gitlab_run_step_forced_one_tool(
+    llm,
+    mcp,
+    openai_tools,
+    *,
+    step: int,
+    project_id: str,
+    ref: str,
+):
+    # 1. Build prompt + tool attendu
+    expected_tool, messages = build_gitlab_messages_for_step(
+        step,
+        project_id=project_id,
+        ref=ref,
+    )
+
+    # 2. Appel LLM
+    resp = await llm.chat.completions.create(
+        model=LLM_MODEL,
+        messages=messages,
+        tools=openai_tools,
+        tool_choice="auto",   # le modèle doit appeler un tool
+        temperature=0.0,
+    )
+
+    msg = resp.choices[0].message
+
+    # 3. Vérifier qu’un tool est appelé
+    if not msg.tool_calls:
+        raise RuntimeError(f"Step {step}: aucun tool_call généré")
+
+    tc = msg.tool_calls[0]
+    name = tc.function.name
+    args = json.loads(tc.function.arguments or "{}")
+
+    print(f"[STEP {step}] TOOL_CALL -> {name} args={args}")
+
+    # 4. Vérifier que c’est le bon tool
+    if name != expected_tool:
+        raise RuntimeError(
+            f"Step {step}: mauvais tool appelé ({name}) au lieu de {expected_tool}"
+        )
+
+    # 5. Exécuter le tool MCP
+    try:
+        result = await mcp.call_tool(name, args)
+        norm = normalize(result)
+    except Exception as e:
+        print(f"[STEP {step}] ERROR: {e}")
+        raise
+
+    return {
+        "step": step,
+        "tool": name,
+        "args": args,
+        "result": norm,
+    }
+
+
+
+
+
 TEST_TYPES = {
     "private_call",
     "video_call",
