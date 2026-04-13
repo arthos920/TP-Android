@@ -1,934 +1,267 @@
+TEST_TYPES = {
+    "private_call",
+    "video_call",
+    "conference_call",
+    "group_call",
+    "incoming_call",
+    "outgoing_call",
+    "unknown",
+}
 
-@echo off
-:: Vérifie si le script est lancé en admin
-net session >nul 2>&1
-if %errorLevel% neq 0 (
-    echo Demande des droits administrateur...
-    powershell -Command "Start-Process cmd -ArgumentList '/c %~s0' -Verb runAs"
-    exit /b
-)
-
-echo Lancement du script PowerShell...
-
-powershell -ExecutionPolicy Bypass -File "C:\chemin\vers\ton_script.ps1"
-
-pause
-
-
-
-
-
-
-
-from typing import Tuple, List, Dict, Optional
-
-def build_gitlab_messages_for_step(
-    step: int,
-    *,
-    project_id: str,
-    ref: str,
-    jira_summary: Optional[str] = None,
-    tree_preview: Optional[List[str]] = None,
-) -> Tuple[str, List[Dict[str, str]]]:
-
-    if step == 1:
-        tool = "get_project"
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "Tu dois appeler EXACTEMENT le tool get_project.\n"
-                    "Arguments attendus:\n"
-                    "- project_id (string)\n"
-                    "Ne fais rien d'autre."
-                ),
-            },
-            {
-                "role": "user",
-                "content": f"Appelle get_project avec project_id='{project_id}'.",
-            },
-        ]
-        return tool, messages
-
-    if step == 2:
-        tool = "get_repository_tree"
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "Tu dois appeler EXACTEMENT le tool get_repository_tree.\n"
-                    "Arguments attendus:\n"
-                    "- project_id (string)\n"
-                    "- ref (string)\n"
-                    "- path (string)\n"
-                    "- recursive (boolean)\n"
-                    "Ne fais rien d'autre."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Appelle get_repository_tree avec project_id='{project_id}', "
-                    f"ref='{ref}', path='', recursive=true."
-                ),
-            },
-        ]
-        return tool, messages
-
-    if step == 3:
-        tool = "get_file_contents"
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "Tu dois appeler EXACTEMENT le tool get_file_contents.\n"
-                    "Arguments attendus:\n"
-                    "- project_id (string)\n"
-                    "- ref (string)\n"
-                    "- file_path (string)\n"
-                    "Lis en priorité doc/convention.md. "
-                    "Si absent, essaye docs/convention.md puis convention.md.\n"
-                    "Ne fais rien d'autre."
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Appelle get_file_contents avec project_id='{project_id}', "
-                    f"ref='{ref}', file_path='doc/convention.md'."
-                ),
-            },
-        ]
-        return tool, messages
-
-    if step == 4:
-        tree_hint = ""
-        if tree_preview:
-            tree_hint = "\nAperçu tree:\n- " + "\n- ".join(tree_preview[:80])
-
-        tool = "TOOL_LOOP"
-        messages = [
-            {
-                "role": "system",
-                "content": (
-                    "Tu es un agent GitLab pour analyser un framework Robot Framework.\n"
-                    "Tu peux utiliser UNIQUEMENT ces tools:\n"
-                    "- get_project\n"
-                    "- get_repository_tree\n"
-                    "- get_file_contents\n\n"
-                    "Objectif:\n"
-                    "1) Utiliser le résumé Jira pour déterminer les fichiers pertinents.\n"
-                    "2) Explorer le repo et lire les fichiers utiles.\n"
-                    "3) Si un fichier n'existe pas, ignore l'erreur et continue.\n"
-                    "4) Ne relis pas plusieurs fois le même fichier.\n"
-                    "5) Quand tu as assez d'informations, ou après la limite d'appels, "
-                    "donne la meilleure synthèse possible pour générer un test Robot.\n\n"
-                    "Important:\n"
-                    "- Pour get_file_contents, utilise file_path, pas path.\n"
-                    "- Pour get_repository_tree, path est un chemin dans le repo.\n"
-                    "- N'appelle get_file_contents QUE sur des fichiers vus dans le tree.\n"
-                ),
-            },
-            {
-                "role": "user",
-                "content": (
-                    f"Résumé Jira:\n{jira_summary or '(non fourni)'}\n\n"
-                    f"Repo:\n- project_id='{project_id}'\n- ref='{ref}'\n"
-                    f"{tree_hint}\n\n"
-                    "Analyse maintenant le repo, lis les fichiers pertinents, "
-                    "puis donne la meilleure synthèse possible pour écrire la feuille Robot."
-                ),
-            },
-        ]
-        return tool, messages
-
-    raise ValueError("step doit être 1, 2, 3 ou 4.")
+TEST_TYPE_TO_STEPS = {
+    "private_call": [3],
+    "video_call": [4],
+    "conference_call": [5],
+    "group_call": [6],
+    "incoming_call": [7],
+    "outgoing_call": [8],
+    "unknown": [3, 4, 5],
+}
 
 
 
+---------/-
+
+async def classify_jira_test_type(llm, jira_summary: str) -> Dict[str, Any]:
+    system = (
+        "Tu es un classificateur de tickets Jira pour tests Robot Framework.\n"
+        "À partir du résumé du ticket, détermine le type de test parmi cette liste fermée:\n"
+        "- private_call\n"
+        "- video_call\n"
+        "- conference_call\n"
+        "- group_call\n"
+        "- incoming_call\n"
+        "- outgoing_call\n"
+        "- unknown\n\n"
+        "Réponds UNIQUEMENT avec un JSON valide de cette forme:\n"
+        "{\n"
+        '  "test_type": "private_call|video_call|conference_call|group_call|incoming_call|outgoing_call|unknown",\n'
+        '  "confidence": 0.0,\n'
+        '  "reason": "explication courte"\n'
+        "}\n"
+        "Ne mets aucun markdown."
+    )
+
+    user = f"Résumé Jira:\n{jira_summary}"
+
+    resp = await llm.chat.completions.create(
+        model=LLM_MODEL,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+        temperature=0.0,
+        max_tokens=300,
+    )
+
+    content = (resp.choices[0].message.content or "").strip()
+
+    try:
+        data = json.loads(content)
+    except Exception:
+        data = {
+            "test_type": "unknown",
+            "confidence": 0.0,
+            "reason": f"JSON non parsable: {content[:300]}",
+        }
+
+    test_type = data.get("test_type", "unknown")
+    if test_type not in TEST_TYPES:
+        data["test_type"] = "unknown"
+
+    try:
+        data["confidence"] = float(data.get("confidence", 0.0))
+    except Exception:
+        data["confidence"] = 0.0
+
+    data["reason"] = str(data.get("reason", ""))
+
+    return data
+
+
+def select_gitlab_steps_from_test_type(test_type: str) -> List[int]:
+    return TEST_TYPE_TO_STEPS.get(test_type, TEST_TYPE_TO_STEPS["unknown"])
 
 
 
-async def gitlab_run_step4_tool_loop(
+async def run_selected_gitlab_steps(
     llm,
     gitlab,
     openai_tools,
     *,
+    selected_steps: List[int],
     project_id: str,
     ref: str,
+) -> List[Dict[str, Any]]:
+    results = []
+
+    for step_id in selected_steps:
+        try:
+            res = await gitlab_run_step_forced_one_tool(
+                llm,
+                gitlab,
+                openai_tools,
+                step=step_id,
+                project_id=project_id,
+                ref=ref,
+            )
+            results.append(
+                {
+                    "step": step_id,
+                    "ok": True,
+                    "result": res,
+                }
+            )
+        except Exception as e:
+            print(f"[WARN] Step {step_id} failed: {e}")
+            results.append(
+                {
+                    "step": step_id,
+                    "ok": False,
+                    "error": str(e),
+                }
+            )
+
+    return results
+
+
+
+async def recommend_keywords_from_selected_steps(
+    llm,
+    *,
     jira_summary: str,
-    tree_preview=None,
-    max_rounds: int = 12,
-    max_tool_calls: int = 20,
-):
-    expected_tool, messages = build_gitlab_messages_for_step(
-        4,
-        project_id=project_id,
-        ref=ref,
-        jira_summary=jira_summary,
-        tree_preview=tree_preview,
+    jira_classification: Dict[str, Any],
+    gitlab_results: List[Dict[str, Any]],
+) -> str:
+    system = (
+        "Tu es un expert Robot Framework.\n"
+        "À partir:\n"
+        "- du résumé Jira\n"
+        "- du type de test détecté\n"
+        "- des fichiers GitLab lus\n\n"
+        "Tu dois produire une sortie claire et exploitable:\n"
+        "1) Type de test retenu\n"
+        "2) Pourquoi ce type a été choisi\n"
+        "3) Quels fichiers du framework sont pertinents\n"
+        "4) Quels keywords/fonctions semblent devoir être réutilisés\n"
+        "5) Quel squelette de test Robot écrire\n"
+        "6) Quelles lectures supplémentaires seraient utiles ensuite\n"
     )
 
-    allowed_tools = {
-        "get_project",
-        "get_repository_tree",
-        "get_file_contents",
+    payload = {
+        "jira_summary": jira_summary,
+        "jira_classification": jira_classification,
+        "gitlab_results": gitlab_results,
     }
 
-    traces = []
-    seen_calls = set()
-    tool_calls_count = 0
-
-    for i in range(1, max_rounds + 1):
-        # Si budget atteint avant même un nouveau round, on force la conclusion
-        if tool_calls_count >= max_tool_calls:
-            break
-
-        resp = await llm.chat.completions.create(
-            model=LLM_MODEL,
-            messages=messages,
-            tools=openai_tools,
-            tool_choice="auto",
-            temperature=0.0,
-        )
-
-        msg = resp.choices[0].message
-
-        # Réponse finale normale
-        if not msg.tool_calls:
-            final_text = msg.content or ""
-            messages.append({"role": "assistant", "content": final_text})
-
-            files_read = [
-                t["args"].get("file_path")
-                for t in traces
-                if t["tool"] == "get_file_contents"
-                and t["args"].get("file_path")
-            ]
-
-            return {
-                "final_synthesis": final_text,
-                "tool_traces": traces,
-                "files_read": files_read,
-                "tool_calls_count": tool_calls_count,
-                "stopped_reason": "model_finished",
-            }
-
-        messages.append({"role": "assistant", "content": msg.content or ""})
-
-        for tc in msg.tool_calls:
-            # stop si budget atteint
-            if tool_calls_count >= max_tool_calls:
-                break
-
-            name = tc.function.name
-            args = json.loads(tc.function.arguments or "{}")
-
-            if name not in allowed_tools:
-                # au lieu de raise, on informe le modèle
-                norm = {
-                    "error": True,
-                    "tool": name,
-                    "message": f"Tool non autorisé: {name}",
-                    "args": args,
-                }
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "name": name,
-                        "content": json.dumps(norm, ensure_ascii=False),
-                    }
-                )
-                traces.append(
-                    {
-                        "loop": i,
-                        "tool": name,
-                        "args": args,
-                        "error": f"Tool non autorisé: {name}",
-                        "result": norm,
-                    }
-                )
-                continue
-
-            # anti-boucle
-            call_sig = (name, json.dumps(args, sort_keys=True, ensure_ascii=False))
-            if call_sig in seen_calls:
-                print(f"[STEP4] ⏭️ Skip duplicate call -> {name} {args}")
-                norm = {
-                    "error": True,
-                    "tool": name,
-                    "message": "Duplicate call skipped",
-                    "args": args,
-                }
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": tc.id,
-                        "name": name,
-                        "content": json.dumps(norm, ensure_ascii=False),
-                    }
-                )
-                traces.append(
-                    {
-                        "loop": i,
-                        "tool": name,
-                        "args": args,
-                        "error": "Duplicate call skipped",
-                        "result": norm,
-                    }
-                )
-                continue
-
-            seen_calls.add(call_sig)
-            tool_calls_count += 1
-
-            print(f"\n[STEP4] TOOL_CALL #{tool_calls_count}/{max_tool_calls} loop={i} -> {name} args={args}")
-
-            try:
-                result = await gitlab.call_tool(name, args)
-                norm = normalize(result)
-                tool_error = None
-            except Exception as e:
-                print(f"[STEP4][WARN] Tool failed: {name} -> {e}")
-                norm = {
-                    "error": True,
-                    "tool": name,
-                    "message": str(e),
-                    "args": args,
-                }
-                tool_error = str(e)
-
-            traces.append(
-                {
-                    "loop": i,
-                    "tool": name,
-                    "args": args,
-                    "error": tool_error,
-                    "result": norm,
-                }
-            )
-
-            messages.append(
-                {
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "name": name,
-                    "content": json.dumps(norm, ensure_ascii=False),
-                }
-            )
-
-        # si budget atteint en fin de loop interne
-        if tool_calls_count >= max_tool_calls:
-            break
-
-    # ------------------------------------------------------------------
-    # FIN GRACIEUSE : on ne raise pas, on demande une conclusion
-    # ------------------------------------------------------------------
-    messages.append(
-        {
-            "role": "user",
-            "content": (
-                f"Tu as atteint la limite maximale de {max_tool_calls} appels d'outils "
-                "ou la limite de rounds. "
-                "Tu ne dois plus appeler d'outil maintenant. "
-                "À partir des informations déjà collectées, donne la meilleure synthèse possible "
-                "pour écrire le test Robot Framework. "
-                "Indique aussi les fichiers lus, les keywords probables à réutiliser, "
-                "et le meilleur squelette de test possible."
-            ),
-        }
-    )
-
-    final_resp = await llm.chat.completions.create(
+    resp = await llm.chat.completions.create(
         model=LLM_MODEL,
-        messages=messages,
+        messages=[
+            {"role": "system", "content": system},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False, indent=2)},
+        ],
         temperature=0.2,
+        max_tokens=1200,
     )
 
-    final_text = final_resp.choices[0].message.content or ""
+    return (resp.choices[0].message.content or "").strip()
 
-    files_read = [
-        t["args"].get("file_path")
-        for t in traces
-        if t["tool"] == "get_file_contents"
-        and t["args"].get("file_path")
-    ]
 
-    return {
-        "final_synthesis": final_text,
-        "tool_traces": traces,
-        "files_read": files_read,
-        "tool_calls_count": tool_calls_count,
-        "stopped_reason": "budget_reached",
-    }
 
 
 
 
-
-
-
-
-
-
-
-
-
-
-=========================
-# LOCATORS
-# =========================
-
-CONFERENCE_CALL_TABLE_XPATH = "//table[contains(@class,'reports-table') and @data-report-type='audio-calls-conferencecall']"
-CONFERENCE_CALL_ROWS_XPATH = CONFERENCE_CALL_TABLE_XPATH + "//tbody//tr[@data-role='row-template']"
-
-CONFERENCE_CALL_OWNER_XPATH = ".//td[@data-role='EventOwner']"
-CONFERENCE_CALL_DATE_XPATH = ".//td[@data-role='EventDate']"
-CONFERENCE_CALL_TYPE_XPATH = ".//td[@data-role='EventType']"
-CONFERENCE_CALL_STATE_XPATH = ".//td[@data-role='CallState']"
-CONFERENCE_CALL_RECORDING_XPATH = ".//td[@data-role='SessionRecording']"
-CONFERENCE_CALL_INITIATOR_XPATH = ".//td[@data-role='Initiator']"
-CONFERENCE_CALL_PARTICIPANT_XPATH = ".//td[@data-role='Participant']"
-CONFERENCE_CALL_UUID_XPATH = ".//td[@data-role='CallUuid']"
-
-CONFERENCE_CALL_PLAY_XPATH = ".//*[@data-role='play' or contains(@class,'play-main') or contains(@class,'play')]"
-CONFERENCE_CALL_DURATION_XPATH = ".//*[@data-role='Duration']"
-CONFERENCE_CALL_DOWNLOAD_XPATH = ".//span[contains(@class,'download-link')]"
-    
-def auditor_verify_conference_call(
-    self,
-    started_owner,
-    joined_owners,
-    ended_owner,
-    initiator_name,
-    timeout=120,
-    poll_interval=2,
-    expected_call_result="Success",
-    require_recording_controls=True,
-):
-
-    if isinstance(joined_owners, str):
-        joined_owners = [x.strip() for x in joined_owners.split("|") if x.strip()]
-
-    def _norm(value):
-        return (value or "").strip()
-
-    def _etype_key(event_type_text):
-        t = _norm(event_type_text).lower()
-        if t == "started call":
-            return "started"
-        if t == "joined call":
-            return "joined"
-        if t == "ended call":
-            return "ended"
-        return "other"
-
-    try:
-        WebDriverWait(self.driver, 20).until(
-            EC.presence_of_element_located((By.XPATH, CONFERENCE_CALL_TABLE_XPATH))
-        )
-
-        end_time = time.monotonic() + timeout
-        valid_rows = []
-
-        while time.monotonic() < end_time:
-            rows = self.driver.find_elements(By.XPATH, CONFERENCE_CALL_ROWS_XPATH)
-            valid_rows = []
-
-            for row in rows:
-                try:
-                    uuid = _norm(row.find_element(By.XPATH, CONFERENCE_CALL_UUID_XPATH).text)
-                    if uuid:
-                        valid_rows.append(row)
-                except:
-                    continue
-
-            if valid_rows:
-                break
-
-            time.sleep(poll_interval)
-
-        if not valid_rows:
-            log_screenshot_web_global(self.driver, title="conference_call FAILED - no rows")
-            raise Exception("No populated rows")
-
-        parsed = []
-        call_uuids = set()
-
-        for row in valid_rows:
-            owner = _norm(row.find_element(By.XPATH, CONFERENCE_CALL_OWNER_XPATH).text)
-            etype = _norm(row.find_element(By.XPATH, CONFERENCE_CALL_TYPE_XPATH).text)
-            state = _norm(row.find_element(By.XPATH, CONFERENCE_CALL_STATE_XPATH).text)
-            initiator = _norm(row.find_element(By.XPATH, CONFERENCE_CALL_INITIATOR_XPATH).text)
-            uuid = _norm(row.find_element(By.XPATH, CONFERENCE_CALL_UUID_XPATH).text)
-
-            if uuid:
-                call_uuids.add(uuid)
-
-            parsed.append({
-                "row": row,
-                "owner": owner,
-                "etype_key": _etype_key(etype),
-                "state": state,
-                "initiator": initiator
-            })
-
-        if len(call_uuids) != 1:
-            raise Exception(f"Multiple CallUuid found: {call_uuids}")
-
-        call_uuid = list(call_uuids)[0]
-
-        chrono = list(reversed(parsed))
-
-        # 🔥 on ignore LEFT automatiquement
-        filtered = [
-            e for e in chrono
-            if e["etype_key"] in ("started", "joined", "ended")
-        ]
-
-        # Expected
-        expected = [("started", started_owner)]
-
-        for o in joined_owners:
-            expected.append(("joined", o))
-
-        expected.append(("ended", ended_owner))
-
-        observed = [(e["etype_key"], e["owner"]) for e in filtered]
-
-        errors = []
-
-        if len(observed) != len(expected):
-            errors.append(f"Length mismatch: expected {len(expected)}, got {len(observed)}")
-
-        for i, (exp, obs) in enumerate(zip(expected, observed), start=1):
-            if exp != obs:
-                errors.append(f"Mismatch pos {i}: expected {exp}, got {obs}")
-
-        # Vérif state + initiator
-        for e in filtered:
-            if expected_call_result and e["state"] != expected_call_result:
-                errors.append(f"Bad state for {e['owner']}: {e['state']}")
-
-            if initiator_name and e["initiator"] != initiator_name:
-                errors.append(f"Bad initiator for {e['owner']}: {e['initiator']}")
-
-        # Vérif recording sur ended
-        ended_event = next((e for e in filtered if e["etype_key"] == "ended"), None)
-
-        if ended_event:
-            rec_td = ended_event["row"].find_element(By.XPATH, CONFERENCE_CALL_RECORDING_XPATH)
-
-            if require_recording_controls:
-                if not rec_td.find_elements(By.XPATH, CONFERENCE_CALL_PLAY_XPATH):
-                    errors.append("Missing play button")
-
-                if not rec_td.find_elements(By.XPATH, CONFERENCE_CALL_DOWNLOAD_XPATH):
-                    errors.append("Missing download button")
-
-            try:
-                duration = rec_td.find_element(By.XPATH, CONFERENCE_CALL_DURATION_XPATH).text.strip()
-                if not duration or duration == "00:00:00":
-                    errors.append("Invalid recording duration")
-            except:
-                errors.append("No duration found")
-
-        if errors:
-            html = self.driver.find_element(By.XPATH, CONFERENCE_CALL_TABLE_XPATH).get_attribute("outerHTML")
-            robot.api.logger.info(f"expected={expected}")
-            robot.api.logger.info(f"observed={observed}")
-            robot.api.logger.info(html)
-            log_screenshot_web_global(self.driver, title="conference_call FAILED")
-            raise Exception(" | ".join(errors))
-
-        robot.api.logger.info("conference_call SUCCESS")
-        return call_uuid
-
-    except Exception as e:
-        log_screenshot_web_global(self.driver, title=f"conference_call FAILED - {str(e)}")
-        raise
-
-
-
-${STARTED_OWNER}=      Set Variable    Christ1 Christ1
-${JOINED_OWNERS}=      Set Variable    Christ2 Christ2|Christ3 Christ3|Dispatcher_Christ Dispatcher_Christ
-${ENDED_OWNER}=        Set Variable    Dispatcher_Christ Dispatcher_Christ
-${INITIATOR_NAME}=     Set Variable    Christ1 Christ1
-${TIMEOUT}=            Set Variable    120
-${POLL_INTERVAL}=      Set Variable    2
-
-auditor_verify_conference_call
-...    started_owner=${STARTED_OWNER}
-...    joined_owners=${JOINED_OWNERS}
-...    ended_owner=${ENDED_OWNER}
-...    initiator_name=${INITIATOR_NAME}
-...    timeout=${TIMEOUT}
-...    poll_interval=${POLL_INTERVAL}
---------------------------------111-1111111
-
-def stop_adb_screenrecord(self) -> None:
-    """
-    Stops adb screenrecord.
-    """
-    try:
-        for session in self.recording_sessions:
-            try:
-                session.terminate()
-                session.wait(timeout=5)
-            except Exception:
-                try:
-                    session.kill()
-                except Exception:
-                    pass
-    finally:
-        del self.recording_sessions[:]
-
-
-def restart_session(self, terminal):
-    """
-    Restart WebDriver session.
-    :param terminal: terminal where executed
-    """
-    try:
-        if getattr(terminal, "driver", None):
-            terminal.stop_session()
-    except Exception as e:
-        logger.warn(f"Failed to stop previous session for {terminal}: {e}")
-
-    if self._is_android_terminal(terminal):
-        force_stop(terminal.udid, "io.appium.uiautomator2.server")
-        force_stop(terminal.udid, "io.appium.uiautomator2.server.test")
-
-        self.terminal_assigned_ports.pop(terminal.udid, None)
-        self.assign_terminal_port(terminal)
-
-        logger.info(
-            f"Restarting Android session for {terminal.udid} with systemPort="
-            f"{getattr(terminal, 'session_port', None)}",
-            also_to_console=True
-        )
-
-        terminal.start_session(AppiumServer.get_appium_url())
-    else:
-        logger.info(
-            f"Restarting browser/desktop session for {terminal}",
-            also_to_console=True
-        )
-        terminal.start_session(AppiumServer.get_appium_url())
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-@property
-def serial(self):
-    """
-    Return terminal serial (Android: UDID).
-    Tries multiple fallbacks to ensure a usable value.
-    """
-    # 1. Priorité: udid
-    value = getattr(self, "udid", None)
-
-    # 2. Fallback: serial direct
-    if not value:
-        value = getattr(self, "_serial", None)
-
-    # 3. Fallback: capabilities (si présent)
-    if not value and hasattr(self, "capabilities"):
-        value = self.capabilities.get("udid") or self.capabilities.get("serial")
-
-    # 4. Fallback: data / metadata éventuelle
-    if not value and hasattr(self, "data"):
-        value = self.data.get("serial") or self.data.get("udid")
-
-    # 5. Nettoyage
-    if isinstance(value, str):
-        value = value.strip()
-        return value if value else None
-
-    return None
-
-
-@property
-def serial_short(self):
-    """
-    Return last 7 characters of terminal serial.
-    Always safe, never crashes.
-    """
-    serial = self.serial
-
-    # Cas 1: None / vide
-    if not serial:
-        return "unknown"
-
-    # Cas 2: pas une string (sécurité max)
-    if not isinstance(serial, str):
-        serial = str(serial)
-
-    serial = serial.strip()
-
-    # Cas 3: string vide après nettoyage
-    if not serial:
-        return "unknown"
-
-    # Cas 4: longueur < 7
-    if len(serial) <= 7:
-        return serial
-
-    # Cas normal
-    return serial[-7:]
-
-
-
-
-def start_session(self, command_executor) -> TerminalAppium:
-    """
-    Start WebDriver session
-    :param command_executor: Either a string representing URL of the Appium remote server
-        or a custom remote_connection.RemoteConnection object.
-    """
-    if not command_executor:
-        raise ValueError(
-            f"command_executor is empty for device {self.udid}. "
-            f"Cannot create Appium session."
-        )
-
-    try:
-        logger.info(
-            f"Creating Appium driver for device: {self.udid} "
-            f"with command_executor: {command_executor} "
-            f"and capabilities: {self.data}",
-            also_to_console=True
-        )
-
-        self.driver = webdriver.Remote(
-            command_executor,
-            options=UiAutomator2Options().load_capabilities(self.data)
-        )
-
-        logger.info(
-            f"Driver successfully created for device: {self.udid}",
-            also_to_console=True
-        )
-
-    except Exception as e:
-        logger.info(
-            f"Failed to instantiate driver for device: {self.udid}. "
-            f"Exception type: {type(e).__name__}. "
-            f"Exception message: {e}",
-            also_to_console=True
-        )
-        raise
-
-    return self
-
-
-
-
-
-
-
-@staticmethod
-def get_appium_url(port=None):
-    """
-    Get Appium server URL.
-    """
-    data = AppiumServerData()
-
-    if port is not None:
-        return f"http://127.0.0.1:{port}"
-
-    return data.appium_url
-
-
-
-
-@keyword
-def start_terminal_sessions(self, *terminals: Terminal):
-    """
-    Keyword to start WebDriver session and terminal.
-    NOTE! Appium removes application data by default on start.
-    :param terminals: terminals to execute on
-    """
-    handle_tag_based_suite_skip(self.suite_data, terminals)
-
-    tasks = []
-    for terminal in terminals:
-        self.assign_terminal_port(terminal)
-
-        command_executor = AppiumServer.get_appium_url(terminal.session_port)
-        if not command_executor:
-            raise ValueError(
-                f"No Appium URL for device {terminal.udid} "
-                f"(session_port={getattr(terminal, 'session_port', None)})"
-            )
-
-        logger.info(
-            f"Device {terminal.udid} -> Appium URL: {command_executor}",
-            also_to_console=True
-        )
-
-        tasks.append(
-            lambda terminal=terminal, command_executor=command_executor:
-                terminal.start_session(command_executor)
-        )
-
-    sessions = self.run_concurrently(tasks)
-
-    self.terminal_sessions.extend(sessions)
-    self.test_run_data.write_suite_terminals_metadata(self.terminal_sessions)
-    self.test_run_terminals.set_terminal_objects(*terminals)
-
-    self.start_log_and_screen_capture(self.suite_data, setup=True)
-
-
-
-def __init__(self, **capabilities):
-    # this device port is used to establish reverse port forwarding between host & device
-    self.reversePort = 35540
-
-    added_capabilities = {
-        "autoGrantPermissions": True,
-        "noReset": True,
-        "fullReset": False,
-        "noSign": True,
-        "skipServerInstallation": False,
-        "skipDeviceInitialization": False,
-        "clearDeviceLogsOnStart": True,
-        "androidInstallTimeout": 120000,
-        "appWaitForLaunch": False,
-        "skipLogcatCapture": False
-    }
-
-    capabilities.update(added_capabilities)
-
-    base_capabilities = {
-        "autoLaunch": False,
-        "platformName": self.platform_name,
-        "automationName": self.automation_name,
-        "adbExecTimeout": self.adb_exec_timeout,
-        "appWaitDuration": self.app_wait_duration,
-        "newCommandTimeout": self.new_command_timeout,
-        "uiautomator2ServerInstallTimeout": self.uiautomator_server_install_timeout,
-        "uiautomator2ServerLaunchTimeout": self.uiautomator_server_launch_timeout,
-        "androidInstallTimeout": 120000,
-        "clearSystemFiles": True,
-        "enforceAppInstall": True,
-        "unlockType": "pin",
-        "unlockKey": "1234",
-        "unlockStrategy": "uiautomator",
-        **capabilities
-    }
-
-    session_port = self.__dict__.get("session_port")
-    if session_port is not None:
-        base_capabilities["systemPort"] = session_port
-
-    super().__init__(**base_capabilities)
-
-    self.adb_screenrecord_logger = AdbScreenRecordLogger(
-        self.scr_rec_dim["width"],
-        self.scr_rec_dim["height"]
-    )
-
-
-def assign_terminal_port(self, terminal: Terminal):
-    port = find_free_port()
-    self.terminal_assigned_ports[terminal.udid] = port
-    terminal.assign_session_port(port)
-    logger.info(f"Assigned systemPort {port} to terminal {terminal.udid}")
-
-
-
-
-def restart_session(self, terminal):
-    """
-    Restart WebDriver session.
-    :param terminal: terminal where executed
-    """
-    for _ in range(10):
-        if terminal.udid in get_all_connected_device_serials()[0]:
-            break
-        time.sleep(2)
-    else:
-        logger.warn(
-            f"{terminal.udid} was not in connected devices when trying to restart session"
-        )
-
-    # Ferme proprement l'ancienne session si elle existe
-    try:
-        if getattr(terminal, "driver", None):
-            terminal.stop_session()
-    except Exception as e:
-        logger.warn(f"Failed to stop previous session for {terminal.udid}: {e}")
-
-    # Tue les restes côté device
-    force_stop(terminal.udid, "io.appium.uiautomator2.server")
-    force_stop(terminal.udid, "io.appium.uiautomator2.server.test")
-
-    # Libère l'ancien port mémorisé
-    self.terminal_assigned_ports.pop(terminal.udid, None)
-
-    # Réassigne un nouveau systemPort
-    self.assign_terminal_port(terminal)
-
-    logger.info(
-        f"Restarting session for {terminal.udid} with systemPort="
-        f"{getattr(terminal, 'session_port', None)}",
-        also_to_console=True
-    )
-
-    terminal.start_session(AppiumServer.get_appium_url())
-
-
-def assign_terminal_port(self, terminal: Terminal):
-    """
-    Assign port number for Appium UiAutomator2 systemPort.
-    :param terminal: Terminal getting port number assigned
-    """
-    port = find_free_port()
-    self.terminal_assigned_ports[terminal.udid] = port
-    terminal.assign_session_port(port)
-
-    logger.info(
-        f"Assigned systemPort {port} to terminal {terminal.udid}",
-        also_to_console=True
-    )
-
-
-
-@keyword
-def close_terminal_sessions(self):
-    """
-    Keyword to close all started WebDriver sessions.
-    """
-    try:
-        for terminal in self.terminal_sessions:
-            try:
-                terminal.stop_session()
-            finally:
-                self.terminal_assigned_ports.pop(terminal.udid, None)
-    finally:
-        self.terminal_sessions.clear()
-
-
-
-logger.info(
-    f"Creating Appium driver for {self.udid} "
-    f"with systemPort={self.data.get('systemPort')} "
-    f"and command_executor={command_executor}",
-    also_to_console=True
+# ------------------------------------------------------------------
+# Classification Jira -> type de test
+# ------------------------------------------------------------------
+jira_classification = await classify_jira_test_type(
+    llm,
+    jira_part["issue_summary"],
 )
+
+test_type = jira_classification["test_type"]
+selected_steps = select_gitlab_steps_from_test_type(test_type)
+
+print("\n=== JIRA CLASSIFICATION ===\n")
+print(json.dumps(jira_classification, ensure_ascii=False, indent=2))
+print("Steps sélectionnés:", selected_steps)
+
+
+
+
+
+
+
+transport_cm, gitlab = await open_mcp(GITLAB_MCP_URL)
+print("\n=== reading targeted code on gitlab ===\n")
+
+try:
+    tools_resp = await gitlab.list_tools()
+    openai_tools = mcp_tools_to_openai(tools_resp)
+    tool_names = [t["function"]["name"] for t in openai_tools]
+
+    # Vérif minimale
+    for required in ("get_project", "get_file_contents"):
+        if required not in tool_names:
+            raise RuntimeError(f"Tool GitLab manquant: {required}")
+
+    # Step 1 et 2 si tu veux toujours récupérer projet + tree global
+    project_res = await gitlab_run_step_forced_one_tool(
+        llm,
+        gitlab,
+        openai_tools,
+        step=1,
+        project_id=PROJECT_ID,
+        ref=GITLAB_REF,
+    )
+
+    tree_res = await gitlab_run_step_forced_one_tool(
+        llm,
+        gitlab,
+        openai_tools,
+        step=2,
+        project_id=PROJECT_ID,
+        ref=GITLAB_REF,
+    )
+
+    # Steps ciblés selon le type de ticket
+    targeted_results = await run_selected_gitlab_steps(
+        llm,
+        gitlab,
+        openai_tools,
+        selected_steps=selected_steps,
+        project_id=PROJECT_ID,
+        ref=GITLAB_REF,
+    )
+
+    print("\n=== TARGETED GITLAB RESULTS ===\n")
+    for item in targeted_results:
+        if item["ok"]:
+            print(f"[OK] step={item['step']}")
+        else:
+            print(f"[WARN] step={item['step']} failed -> {item['error']}")
+
+    # Synthèse ciblée
+    targeted_reco = await recommend_keywords_from_selected_steps(
+        llm,
+        jira_summary=jira_part["issue_summary"],
+        jira_classification=jira_classification,
+        gitlab_results=targeted_results,
+    )
+
+    print("\n=== TARGETED RECOMMENDATIONS ===\n")
+    print(targeted_reco)
+
+finally:
+    try:
+        await gitlab.__aexit__(None, None, None)
+    except Exception:
+        pass
+    try:
+        await transport_cm.__aexit__(None, None, None)
+    except Exception:
+        pass
+
+
+
+
