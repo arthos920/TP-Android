@@ -1,3 +1,11 @@
+
+Just to align with you — what would be most useful?
+
+
+I’ll start with a quick overview, then go into the script, and finish with an example.
+
+
+
 We run two Docker containers, one for Jira and one for GitLab, configured with personal access tokens.
 They expose MCP endpoints that the Python script uses to retrieve tickets and read the test framework.
 
