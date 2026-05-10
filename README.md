@@ -90,14 +90,21 @@ function Get-HttpResponse {
     if (Test-Path $curlPath) {
         $cmd = @(
             "-k",                                # ignorer la validation du certificat
+            "-sS",                               # silence la barre de progression mais garde les erreurs
+            "-L",                                # suit les redirects (JIRA renvoie un 307 pour poser le JSESSIONID)
+            "-b", "",                            # active le cookie engine (sinon le cookie de session n'est pas reposté)
             "-u", "${jiraUser}:${jiraPass}",
-            "-H", "Content-Type: application/json",
+            "-H", "Accept: application/json",
             "-X", "GET",
             "--proxy", $proxy,
             $testsApiUrl
         )
         Write-Output ">>> Executing curl : $curlPath $($cmd -join ' ')"
         $response = & $curlPath @cmd
+        $exitCode = $LASTEXITCODE
+        if ($exitCode -ne 0) {
+            throw "curl a échoué (exit code $exitCode). Réponse partielle : $response"
+        }
         return $response
     }
     else {
