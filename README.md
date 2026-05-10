@@ -35,9 +35,16 @@ function Get-HttpResponse {
         if (-not (Test-Path $responseFile)) {
             throw "Fichier de réponse curl introuvable : $responseFile"
         }
-        # Lecture en UTF-8 brute, en une seule chaîne
-        $response = Get-Content $responseFile -Raw -Encoding UTF8
+        # Lecture binaire pour pouvoir stripper le BOM UTF-8 si présent
+        $bytes = [System.IO.File]::ReadAllBytes($responseFile)
         Remove-Item $responseFile -Force
+        if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+            Write-Output ">>> BOM UTF-8 détecté en tête de réponse, on le retire"
+            $response = [System.Text.Encoding]::UTF8.GetString($bytes, 3, $bytes.Length - 3)
+        }
+        else {
+            $response = [System.Text.Encoding]::UTF8.GetString($bytes)
+        }
         return $response
     }
     else {
@@ -63,11 +70,24 @@ function Get-HttpResponse {
     }
 }
 
-# 5.4 - Récupération et journalisation brute
+
+
+
+
+# 5.5 - Conversion JSON (peut être un tableau ou un objet avec .tests)
 try {
-    $rawResponse = Get-HttpResponse
+    $decoded = $rawResponse | ConvertFrom-Json
 }
 catch {
-    Write-Error "Échec de la requête JIRA : $_"
+    # Diagnostic : dump des 32 premiers octets pour identifier un caractère invisible
+    $debugBytes = [System.Text.Encoding]::UTF8.GetBytes($rawResponse)
+    $previewLen = [Math]::Min(32, $debugBytes.Length)
+    $hexDump = ($debugBytes[0..($previewLen-1)] | ForEach-Object { "{0:X2}" -f $_ }) -join " "
+    Write-Output ">>> DEBUG premiers octets (hex) : $hexDump"
+    Write-Output ">>> DEBUG longueur totale : $($rawResponse.Length)"
+    Write-Error "Impossible de convertir la réponse en JSON : $_"
     exit 1
 }
+
+Write-Output "=== Objet JSON décodé ==="
+$decoded | Format-List -Force
