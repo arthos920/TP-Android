@@ -1,49 +1,3 @@
-# ==================================================================
-# fetch_tests.ps1
-# Récupère les tests d'une Test Execution JIRA, lance Robot Framework
-# dessus, puis publie résultats + statut sur JIRA.
-# ==================================================================
-
-param(
-    [Parameter(Mandatory=$true)][string] $ISSUE_KEY,
-    [Parameter(Mandatory=$true)][string] $LAB,
-    [Parameter(Mandatory=$true)][string] $URL,
-    [Parameter(Mandatory=$true)][string] $EMAIL
-)
-
-# --- Config labo ---
-$scriptDir  = Split-Path -Parent $MyInvocation.MyCommand.Path
-$configPath = Join-Path $scriptDir 'lab_config.json'
-
-if (-not (Test-Path $configPath)) {
-    Write-Error "Configuration file not found: $configPath"
-    exit 1
-}
-$config = Get-Content $configPath -Raw | ConvertFrom-Json
-if (-not ($config.PSObject.Properties.Name -contains $LAB)) {
-    Write-Error "Lab '$LAB' not found in $configPath"
-    exit 1
-}
-$labCfg           = $config.$LAB
-$robotCampaignDir = $labCfg.robotCampaignDirectory
-$curlPath         = $labCfg.curlPath
-$robotPath        = $labCfg.robotPath
-$listenerPath     = $labCfg.listenerPath
-
-# --- JIRA / proxy (TODO: passer le password en secret CI) ---
-$jiraUser    = ''
-$jiraPass    = ''
-$proxy       = ''
-$jiraBaseUrl = ''
-
-$outputFile = 'robot_arg.txt'
-$resultsDir = Join-Path (Get-Location) 'results'
-$zipPath    = Join-Path (Get-Location) 'results.zip'
-
-$jiraHooks = @{
-    'IVX'     = "$jiraBaseUrl/rest/cb-automation/latest/hooks/"
-    'AMCXSOL' = "$jiraBaseUrl/rest/cb-automation/latest/hooks/"
-}
 $prefix = $ISSUE_KEY.Split('-')[0]
 if (-not $jiraHooks.ContainsKey($prefix)) {
     Write-Error "Unrecognized ISSUE_KEY prefix: $prefix"
@@ -59,13 +13,13 @@ $testsApiUrl = "$jiraBaseUrl/rest/raven/1.0/api/testexec/$ISSUE_KEY/test"
 } | ConvertTo-Json -Depth 5 -Compress | Out-File (Join-Path $scriptDir 'data.json') -Encoding utf8
 
 # ==================================================================
-# Récupération des IDs de tests depuis JIRA
+# Recuperation des IDs de tests depuis JIRA
 # ==================================================================
 function Get-JiraTests {
     if (-not (Test-Path $curlPath)) {
-        throw "curl not found at $curlPath — required to query JIRA"
+        throw "curl not found at $curlPath - required to query JIRA"
     }
-    # cookie jar nécessaire pour conserver le JSESSIONID posé par le 307 JIRA
+    # cookie jar necessaire pour conserver le JSESSIONID pose par le 307 JIRA
     $cookieFile   = Join-Path $env:TEMP 'jira_session_cookies.txt'
     $responseFile = Join-Path $env:TEMP 'jira_response.json'
     Remove-Item $cookieFile, $responseFile -Force -ErrorAction SilentlyContinue
@@ -81,7 +35,7 @@ function Get-JiraTests {
         '--proxy', $proxy,
         $testsApiUrl
     )
-    # Write-Host obligatoire dans une fonction à valeur de retour (Write-Output pollue la sortie)
+    # Write-Host obligatoire dans une fonction a valeur de retour (Write-Output pollue la sortie)
     Write-Host ">>> curl GET $testsApiUrl"
     $httpInfo = & $curlPath @cmd
     Write-Host "curl exit=$LASTEXITCODE $httpInfo"
@@ -131,7 +85,7 @@ Write-Host "=== $outputFile ==="
 Get-Content $outputFile
 
 # ==================================================================
-# Exécution Robot Framework
+# Execution Robot Framework
 # ==================================================================
 if (-not (Test-Path $resultsDir)) { New-Item -ItemType Directory -Path $resultsDir | Out-Null }
 
@@ -156,7 +110,7 @@ if ($robotExitCode -ne 0) {
 }
 
 # ==================================================================
-# Compression des résultats
+# Compression des resultats
 # ==================================================================
 Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
 Compress-Archive -Path "$resultsDir\*" -DestinationPath $zipPath -Force
@@ -170,7 +124,7 @@ if (-not (Test-Path $zipPath)) {
 # ==================================================================
 Write-Host "JIRA: base=$jiraBaseUrl user=$jiraUser issue=$ISSUE_KEY proxy=$proxy"
 
-# Out-Host : on veut voir la sortie curl à l'écran mais sans la mélanger à la valeur de retour
+# Out-Host : on veut voir la sortie curl a l'ecran mais sans la melanger a la valeur de retour
 function Invoke-JiraCurl {
     param([string]$Label, [string[]]$CurlArgs)
     Write-Host ">>> $Label"
