@@ -1,3 +1,18 @@
-button = WebDriverWait(driver, 20).until(EC.element_to_be_clickable((By.XPATH, "//a[contains(@class,'x-btn') and contains(normalize-space(.),'Appliquer la configuration')]")))
+JS_ACTIVATE_LOGGING = """
+return (function() {
+    if (typeof window.webchatSDK === 'undefined') {
+        return false;
+    }
 
-button.click()
+    if (!window.webchatSDK.STWLogManager) {
+        return false;
+    }
+
+    if (typeof window.webchatSDK.STWLogManager.setActive !== 'function') {
+        return false;
+    }
+
+    window.webchatSDK.STWLogManager.setActive(true);
+    return true;
+})();
+"""
