@@ -1213,16 +1213,28 @@ async def tool_get_text(ctx: DriverContext, target_text: str) -> str:
     return json.dumps({"ok": False, "error": f"Element '{target_text}' not found"}, ensure_ascii=False)
 
 
-async def tool_ui_type(ctx: DriverContext, text: str) -> str:
+async def tool_ui_type(ctx: DriverContext, text: str, submit: bool = False) -> str:
+    """
+    Tape `text` dans le champ focused.
+    Si `submit=True` : envoie aussi "\\n" qui déclenche l'action IME Android
+    (équivalent Enter/Search/Go/Done selon le champ). Utilisé pour lancer une
+    recherche, soumettre un formulaire, valider une saisie.
+    """
     # focused field
     ok_find, out_find = await appium_find_element(ctx, "xpath", "//*[@focused='true']")
     el = _extract_element_uuid(out_find)
     if not ok_find or not el:
-        return json.dumps({"ok": False, "error": "No focused field. Use ui_click on input first."}, ensure_ascii=False)
+        return json.dumps({"ok": False,
+                           "error": "No focused field. Use ui_click on input first."},
+                          ensure_ascii=False)
 
-    ok_set, out_set = await appium_set_value_uuid(ctx, el, text)
-    await _save_screenshot(ctx, f"type_{_safe_slug(text, 20)}")
-    return json.dumps({"ok": ok_set, "elementUUID": el, "output": (out_set or "")[:300]}, ensure_ascii=False)
+    text_to_send = text + ("\n" if submit else "")
+    ok_set, out_set = await appium_set_value_uuid(ctx, el, text_to_send)
+    label_suffix = "_submit" if submit else ""
+    await _save_screenshot(ctx, f"type_{_safe_slug(text, 20)}{label_suffix}")
+    return json.dumps({"ok": ok_set, "elementUUID": el, "submitted": submit,
+                       "output": (out_set or "")[:300]},
+                      ensure_ascii=False)
 
 
 async def tool_ui_swipe(ctx: DriverContext, direction: str = "down") -> str:
@@ -1296,7 +1308,15 @@ def build_tools() -> List[Dict[str, Any]]:
         _t("launch_app", "Lance / ramène l'app au premier plan", {"packageName": {"type": "string"}}, []),
         _t("terminate_app", "Ferme l'app", {"packageName": {"type": "string"}}, []),
         _t("ui_click", "Clique un élément par texte", {"target_text": {"type": "string"}}, ["target_text"]),
-        _t("ui_type", "Tape dans le champ focus", {"text": {"type": "string"}}, ["text"]),
+        _t("ui_type",
+           "Tape `text` dans le champ focus (barre URL, formulaire). "
+           "Si tu veux VALIDER la saisie (lancer la recherche, soumettre le "
+           "formulaire, déclencher l'action du clavier), passe submit=true : "
+           "ça équivaut à appuyer sur Enter/Search/Go/Done sur Android.",
+           {"text":   {"type": "string"},
+            "submit": {"type": "boolean",
+                       "description": "true pour valider après la saisie (Enter)"}},
+           ["text"]),
         _t("ui_swipe", "Swipe/scroll", {"direction": {"type": "string", "enum": ["up", "down", "left", "right"]}}, []),
         _t("scroll_to_element", "Scroll jusqu'à voir l'élément", {"target_text": {"type": "string"}}, ["target_text"]),
         _t("get_text", "Lit le texte d'un élément", {"target_text": {"type": "string"}}, ["target_text"]),
@@ -1552,7 +1572,10 @@ async def run_react(ac: AsyncOpenAI, ctx: DriverContext, barrier: Barrier,
             return await tool_ui_click(ctx, _norm_target(args))
         if name == "ui_type":
             txt = args.get("text") or args.get("target_text") or args.get("value") or ""
-            return await tool_ui_type(ctx, str(txt))
+            # Tolère submit / press_enter / enter / validate comme alias
+            submit = bool(args.get("submit") or args.get("press_enter")
+                          or args.get("enter") or args.get("validate"))
+            return await tool_ui_type(ctx, str(txt), submit=submit)
         if name == "ui_swipe":
             return await tool_ui_swipe(ctx, args.get("direction", "down"))
         if name == "scroll_to_element":
@@ -1698,12 +1721,21 @@ async def run_react(ac: AsyncOpenAI, ctx: DriverContext, barrier: Barrier,
             or (_is_url_bar_target(last_click_target) and last_click_target != "")
         )
         if (last_tool_name == "observe" and clicked_input and text_to_type_from_plan):
+            # Détecte si le plan demande une VALIDATION après la saisie
+            # (recherche, soumettre, valider, lancer, send, search...)
+            submit_keywords = ("rechercher", "recherche google", "lance la recherche",
+                               "valid", "soumets", "submit", "search", "envoie", "send",
+                               "appui sur entr", "press enter", "press search", "go")
+            lower_summary = (summary or "").lower()
+            needs_submit = any(k in lower_summary for k in submit_keywords)
+            submit_hint = " et passe submit=true (le plan demande de valider/lancer)" \
+                          if needs_submit else ""
             msgs.append({
                 "role": "user",
                 "content": (
                     f"Tu viens de cliquer un champ de saisie ('{last_click_target}'). "
                     f"TON UNIQUE TOOL CALL POSSIBLE MAINTENANT est : "
-                    f'ui_type(text="{text_to_type_from_plan}"). '
+                    f'ui_type(text="{text_to_type_from_plan}"{submit_hint}). '
                     "Ne clique pas un autre élément. Ne fais pas finish. Tape ce texte EXACT."
                 ),
             })
@@ -2070,250 +2102,3 @@ async def main():
 
 if __name__ == "__main__":
     asyncio.run(main())
-
-
-
-
-____________________________________
-@echo off
-:: ============================================================
-:: docker_load_and_run.bat  (offline_kit_v2)
-:: A lancer sur la machine OFFLINE/online apres transfert de l'image
-:: ============================================================
-:: Prerequis sur la machine :
-::   - Docker Desktop installe et demarre
-::   - Appium server demarre sur le HOST (port 4723)
-::   - Telephones Android branches en USB + ADB autorise (adb devices)
-::   - LLM accessible (DAISE, Ollama, OpenAI...)
-::   - Jira MCP server sur HOST :9000 (optionnel : fallback resume par defaut)
-::
-:: Fichiers requis dans CE dossier :
-::   appium-mcp-runner.tar.gz        (image Docker)
-::   last_version_jira_appium.py     (runner Python a jour)
-::   capabilities.json               (capabilities Appium)
-:: ============================================================
-
-setlocal EnableDelayedExpansion
-pushd "%~dp0"
-
-:: =========================================================
-:: ADAPTER CES VALEURS AVANT DE LANCER
-:: =========================================================
-
-:: -- Devices (serial ADB) ----------------------------------
-:: Obtenir les serials avec : adb devices
-set DEVICE_1_ID=R5CX72QBCBR
-set DEVICE_2_ID=R5CX72QBS6J
-
-:: -- Appium (tourne sur le HOST Windows) -------------------
-set APPIUM_SERVER_URL=http://host.docker.internal:4723
-
-:: -- LLM (DAISE / Ollama / OpenAI) -------------------------
-:: Ollama local : http://host.docker.internal:11434/v1
-:: DAISE        : https://daise.../api/v1
-:: OpenAI       : https://api.openai.com/v1
-set LLM_BASE_URL=https://xxxxx/api/v1
-set LLM_MODEL=gemma-4-26b-a4b
-set LLM_API_KEY=
-
-:: -- Jira MCP (optionnel) ----------------------------------
-:: Si non disponible, le script utilise un resume par defaut
-set JIRA_MCP_URL=http://host.docker.internal:9000/mcp
-set TICKET_KEY=
-
-:: -- Proxy HTTP (optionnel, laisser vide si aucun) ---------
-set PROXY_URL=http:/
-
-:: -- Application a tester ----------------------------------
-:: SOURCE UNIQUE pour le package : modifier ICI uniquement.
-::
-::   GLOBAL_PACKAGE  = meme app sur les 2 devices (cas le plus courant)
-::   DRIVER1_PACKAGE = override device 1 (laisse vide si GLOBAL suffit)
-::   DRIVER2_PACKAGE = override device 2 (laisse vide si GLOBAL suffit)
-::   APP_ACTIVITY    = activity de lancement (ex: .MainActivity)
-::
-:: Trouver le package : adb shell pm list packages | findstr <mot>
-:: Trouver l'activity : adb shell cmd package resolve-activity --brief <PACKAGE>
-set GLOBAL_PACKAGE=
-set DRIVER1_PACKAGE=
-set DRIVER2_PACKAGE=
-set APP_ACTIVITY=
-
-:: -- Script a executer -------------------------------------
-:: last_version_jira_appium.py  -> runner generique (a jour, recommande)
-set SCRIPT=last_version_jira_appium.py
-
-:: -- Tuning ReAct ------------------------------------------
-set MAX_TURNS_PER_DRIVER=25
-set TOOL_TIMEOUT_S=90
-set TOOL_ATTEMPTS=3
-
-:: -- Debug (1 = affiche les TURN/KB/CACHE/AUTO-FINISH) -----
-set DEBUG_TOOLS=1
-
-:: -- Rate limiting LLM (preventif cote client) -------------
-:: Pour DAISE : 30 req/min, 120s de penalite apres 429.
-:: Marge securite : 28/30. Ne pas mettre 30 (laisse de la place pour autres clients).
-set LLM_RATE_LIMIT_MAX=28
-set LLM_RATE_LIMIT_PERIOD_S=60
-set LLM_RATE_LIMIT_PENALTY_S=120
-
-:: -- Cache idempotent LLM (extract / classify / generate_plan)
-:: Cache un dict JSON par hash de l'input. Reduit le nb de requetes sur runs repetes.
-set LLM_CACHE_ENABLED=1
-:: LLM_CACHE_DIR : chemin DANS le container. Le dossier sur le HOST est monte ci-dessous.
-set LLM_CACHE_DIR=/app/knowledge_base/llm_cache
-
-:: -- Knowledge Base (apprentissage cross-runs) -------------
-:: Persiste les runs reussis pour les reinjecter en few-shot sur des tests similaires.
-set KB_DIR=/app/knowledge_base
-set KB_FEWSHOT_K=2
-:: Types de tests utilises pour la classification. Surcharge avec ta liste metier si besoin.
-:: Format : valeurs separees par virgule. Exemple pour telephonie :
-:: set JIRA_TEST_TYPES=semi-duplex call (ptt call),video_call,conference_call,group_call,incoming_call,outgoing_call,unknown
-set JIRA_TEST_TYPES=
-
-:: -- Validation visuelle (sujet E, opt-in) -----------------
-:: Active un check LLM vision (qwen2.5vl / llava / gemma3-vision) sur les screenshots.
-:: Necessite le modele pull dans Ollama (cf. doc README).
-set VISION_ENABLED=0
-set VISION_MODEL=qwen2.5vl:7b
-
-:: =========================================================
-:: VERIFICATIONS + LANCEMENT
-:: =========================================================
-
-echo ===================================================
-echo  1/3  Import de l'image Docker (si pas encore fait)
-echo ===================================================
-docker image inspect appium-mcp-runner:latest >nul 2>&1
-if %ERRORLEVEL% neq 0 (
-    if not exist appium-mcp-runner.tar.gz (
-        if not exist appium-mcp-runner.tar (
-            echo [ERREUR] Fichier appium-mcp-runner.tar(.gz) introuvable dans ce dossier.
-            pause
-            exit /b 1
-        )
-        echo Chargement de l'image depuis appium-mcp-runner.tar...
-        docker load -i appium-mcp-runner.tar || goto :error
-    ) else (
-        echo Chargement de l'image depuis appium-mcp-runner.tar.gz...
-        docker load -i appium-mcp-runner.tar.gz || goto :error
-    )
-    echo Image chargee.
-) else (
-    echo Image deja presente, skip load.
-)
-
-echo.
-echo ===================================================
-echo  2/3  Verification Appium server sur HOST :4723
-echo ===================================================
-curl -s --max-time 3 http://localhost:4723/status >nul 2>&1
-if %ERRORLEVEL% neq 0 (
-    echo [WARN] Appium server non detecte sur :4723
-    echo        Lance Appium avant de continuer (ex: appium server --port 4723)
-    pause
-)
-
-echo.
-echo ===================================================
-echo  3/3  Lancement du container
-echo ===================================================
-echo Device 1     : %DEVICE_1_ID%
-echo Device 2     : %DEVICE_2_ID%
-echo LLM model    : %LLM_MODEL%
-echo Vision       : %VISION_ENABLED% (%VISION_MODEL%)
-echo Rate limit   : %LLM_RATE_LIMIT_MAX%/%LLM_RATE_LIMIT_PERIOD_S%s
-echo Cache LLM    : %LLM_CACHE_ENABLED%
-echo Ticket       : %TICKET_KEY%
-echo App package  : %GLOBAL_PACKAGE%
-echo Script       : %SCRIPT%
-echo.
-
-:: Creer les dossiers necessaires sur le HOST (montes en volume)
-if not exist screenshots mkdir screenshots
-if not exist knowledge_base mkdir knowledge_base
-
-docker run --rm ^
-    --add-host=host.docker.internal:host-gateway ^
-    -e DEVICE_1_ID=%DEVICE_1_ID% ^
-    -e DEVICE_2_ID=%DEVICE_2_ID% ^
-    -e APPIUM_SERVER_URL=%APPIUM_SERVER_URL% ^
-    -e LLM_API_KEY=%LLM_API_KEY% ^
-    -e LLM_BASE_URL=%LLM_BASE_URL% ^
-    -e LLM_MODEL=%LLM_MODEL% ^
-    -e JIRA_MCP_URL=%JIRA_MCP_URL% ^
-    -e TICKET_KEY=%TICKET_KEY% ^
-    -e PROXY_URL=%PROXY_URL% ^
-    -e GLOBAL_PACKAGE=%GLOBAL_PACKAGE% ^
-    -e DRIVER1_PACKAGE=%DRIVER1_PACKAGE% ^
-    -e DRIVER2_PACKAGE=%DRIVER2_PACKAGE% ^
-    -e APP_ACTIVITY=%APP_ACTIVITY% ^
-    -e MAX_TURNS_PER_DRIVER=%MAX_TURNS_PER_DRIVER% ^
-    -e TOOL_TIMEOUT_S=%TOOL_TIMEOUT_S% ^
-    -e TOOL_ATTEMPTS=%TOOL_ATTEMPTS% ^
-    -e DEBUG_TOOLS=%DEBUG_TOOLS% ^
-    -e LLM_RATE_LIMIT_MAX=%LLM_RATE_LIMIT_MAX% ^
-    -e LLM_RATE_LIMIT_PERIOD_S=%LLM_RATE_LIMIT_PERIOD_S% ^
-    -e LLM_RATE_LIMIT_PENALTY_S=%LLM_RATE_LIMIT_PENALTY_S% ^
-    -e LLM_CACHE_ENABLED=%LLM_CACHE_ENABLED% ^
-    -e LLM_CACHE_DIR=%LLM_CACHE_DIR% ^
-    -e KB_DIR=%KB_DIR% ^
-    -e KB_FEWSHOT_K=%KB_FEWSHOT_K% ^
-    -e JIRA_TEST_TYPES=%JIRA_TEST_TYPES% ^
-    -e VISION_ENABLED=%VISION_ENABLED% ^
-    -e VISION_MODEL=%VISION_MODEL% ^
-    -e NO_UI=1 ^
-    -v "%CD%\screenshots:/app/screenshots" ^
-    -v "%CD%\knowledge_base:/app/knowledge_base" ^
-    -v "%CD%\capabilities.json:/app/capabilities.json:ro" ^
-    -v "%CD%\last_version_jira_appium.py:/app/last_version_jira_appium.py:ro" ^
-    appium-mcp-runner:latest ^
-    python3 -u %SCRIPT%
-
-echo.
-echo Logs et screenshots dans : %CD%\screenshots
-echo Knowledge base persistee : %CD%\knowledge_base
-goto :end
-
-:error
-echo.
-echo [ERREUR] Code: %ERRORLEVEL%
-pause
-exit /b 1
-
-:end
-pause
-————————————-
-{
-  "_comment": "Ne PAS editer appPackage/appActivity ici. Definir GLOBAL_PACKAGE et APP_ACTIVITY dans docker_load_and_run.bat.",
-  "android": {
-    "appium:deviceName": "Android Device",
-    "appium:automationName": "UiAutomator2",
-    "appium:udid": "",
-    "appium:platformVersion": "",
-    "appium:app": "",
-    "appium:appPackage": "",
-    "appium:appActivity": "",
-    "appium:autoGrantPermissions": true,
-    "appium:newCommandTimeout": 300
-  },
-  "ios": {
-    "appium:deviceName": "iPhone 15 Pro",
-    "appium:automationName": "XCUITest",
-    "appium:udid": "",
-    "appium:platformVersion": "17.0",
-    "appium:app": "",
-    "appium:bundleId": "",
-    "appium:autoAcceptAlerts": true,
-    "appium:newCommandTimeout": 300
-  },
-  "general": {
-    "platformName": "Android",
-    "appium:automationName": "UiAutomator2"
-  }
-}
-
-
-    
