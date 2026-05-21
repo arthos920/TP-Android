@@ -779,6 +779,7 @@ class DriverContext:
     last_clicked_was_editable: bool = False  # True si dernier ui_click sur EditText/TextField
     last_locators_hash: str = ""              # hash de la dernière observation
     last_screen_was_static: bool = False      # True si dernier observe == observe précédent
+    session_id: str = ""                      # UUID Appium (extrait de create_session, utilisé par ui_back HTTP)
 
 
 # =============================================================================
@@ -1262,6 +1263,67 @@ async def tool_ui_type(ctx: DriverContext, text: str, submit: bool = False) -> s
                       ensure_ascii=False)
 
 
+async def tool_ui_back(ctx: DriverContext) -> str:
+    """
+    Bouton retour Android. Équivalent de `adb shell input keyevent 4`.
+    Stratégie en 2 temps :
+      1. POST HTTP direct sur Appium /session/<id>/back (équivalent keyevent 4 propre).
+         C'est plus fiable que chercher un bouton UI : marche TOUJOURS si la session est valide.
+      2. Fallback : cherche un bouton 'Back/Close/X' dans les locators et le clique
+         (utile si le HTTP back n'est pas accepté par l'app, ex: WebView).
+    Utile notamment pour fermer le clavier après ui_type avant de scroller/cliquer ailleurs.
+    """
+    # --- Stratégie 1 : HTTP direct au serveur Appium (keyevent 4 équivalent) ---
+    if ctx.session_id:
+        url = f"{APPIUM_SERVER_URL.rstrip('/')}/session/{ctx.session_id}/back"
+        try:
+            async with httpx.AsyncClient(verify=False, timeout=10.0) as client:
+                r = await client.post(url, json={})
+            if r.status_code in (200, 204):
+                await _save_screenshot(ctx, "back_appium_http")
+                return json.dumps(
+                    {"ok": True, "method": "appium HTTP /back (≈ keyevent 4)",
+                     "status_code": r.status_code},
+                    ensure_ascii=False,
+                )
+            if DEBUG_TOOLS:
+                print(f"  [ui_back] HTTP /back -> {r.status_code}, fallback to locators")
+        except Exception as e:
+            if DEBUG_TOOLS:
+                print(f"  [ui_back] HTTP /back exception: {e}, fallback to locators")
+
+    # --- Stratégie 2 : fallback chercher un bouton back dans les locators visibles ---
+    items = parse_generate_locators_payload(ctx.last_locators_raw)
+    BACK_TARGETS = (
+        "Navigate up", "Back", "Retour", "Close", "Fermer",
+        "Cancel", "Annuler", "Hide keyboard", "Dismiss",
+    )
+    async with ctx.lock:
+        for label in BACK_TARGETS:
+            uv = find_best_locator(items, label)
+            if not uv:
+                continue
+            using, value = uv
+            ok_find, out_find = await appium_find_element(ctx, using, value)
+            el = _extract_element_uuid(out_find)
+            if not (ok_find and el):
+                continue
+            ok_click, out_click = await appium_click_uuid(ctx, el)
+            await _save_screenshot(ctx, f"back_{_safe_slug(label, 20)}")
+            if ok_click:
+                return json.dumps(
+                    {"ok": True, "method": f"locator-click '{label}'",
+                     "output": (out_click or "")[:200]},
+                    ensure_ascii=False,
+                )
+    return json.dumps(
+        {"ok": False,
+         "error": "Back HTTP a échoué et aucun bouton retour visible. "
+                  "Tente ui_click sur une zone hors clavier (ex: la liste de résultats)."},
+        ensure_ascii=False,
+    )
+
+
 async def tool_ui_swipe(ctx: DriverContext, direction: str = "down") -> str:
     d = (direction or "down").strip().lower()
     async with ctx.lock:
@@ -1342,7 +1404,14 @@ def build_tools() -> List[Dict[str, Any]]:
             "submit": {"type": "boolean",
                        "description": "true pour valider après la saisie (Enter)"}},
            ["text"]),
-        _t("ui_swipe", "Swipe/scroll", {"direction": {"type": "string", "enum": ["up", "down", "left", "right"]}}, []),
+        _t("ui_swipe", "Swipe/scroll. ATTENTION : si un champ est focused (clavier visible), "
+           "le swipe peut taper des caractères parasites via glide-typing. Fais ui_back d'abord.",
+           {"direction": {"type": "string", "enum": ["up", "down", "left", "right"]}}, []),
+        _t("ui_back",
+           "Bouton retour Android (équivalent keyevent 4). Envoyé via Appium HTTP /back, "
+           "fallback sur un élément Back/Close/X visible. UTILE après ui_type pour fermer "
+           "le clavier avant de scroller, cliquer hors zone clavier, ou revenir d'un écran.",
+           {}, []),
         _t("scroll_to_element", "Scroll jusqu'à voir l'élément", {"target_text": {"type": "string"}}, ["target_text"]),
         _t("get_text", "Lit le texte d'un élément", {"target_text": {"type": "string"}}, ["target_text"]),
         _t("sync_barrier", "Synchronise 2 drivers", {}, []),
@@ -1535,6 +1604,12 @@ RÈGLES IMPÉRATIVES (à respecter sans exception) :
    ui_type(text="<texte du plan>"). Ne PAS cliquer sur autre chose entre temps.
    Ne PAS observe puis re-cliquer un autre élément.
 
+7-bis) APRÈS UN ui_type : le clavier reste ouvert. Si tu veux scroller, swiper ou cliquer
+   un élément hors zone clavier, appelle d'abord ui_back pour FERMER LE CLAVIER, sinon
+   le swipe peut taper des caractères parasites via le glide-typing Android.
+   PAR CONTRE, si la liste de résultats filtrée apparaît directement sous le champ
+   (cas typique Contacts / Suggestions), tu peux la ui_click DIRECTEMENT sans ui_back.
+
 8) FORMAT D'ARGUMENTS : pour ui_click utilise EXACTEMENT {"target_text": "..."}.
    Pour ui_type utilise EXACTEMENT {"text": "..."}.
    Pour observe utilise EXACTEMENT {} (objet vide, AUCUN argument).
@@ -1604,6 +1679,8 @@ async def run_react(ac: AsyncOpenAI, ctx: DriverContext, barrier: Barrier,
             return await tool_ui_type(ctx, str(txt), submit=submit)
         if name == "ui_swipe":
             return await tool_ui_swipe(ctx, args.get("direction", "down"))
+        if name == "ui_back":
+            return await tool_ui_back(ctx)
         if name == "scroll_to_element":
             return await tool_scroll_to_element(ctx, _norm_target(args))
         if name == "get_text":
@@ -1677,7 +1754,8 @@ async def run_react(ac: AsyncOpenAI, ctx: DriverContext, barrier: Barrier,
     plan_completed_hint = ""  # auto-finish : texte du expected matché dans le dernier observe
     current_step_index = 0  # step tracking : index de l'étape en cours dans le plan
     ACTION_TOOLS = {"ui_click", "ui_type", "ui_swipe", "scroll_to_element",
-                    "double_tap", "handle_alert", "launch_app", "terminate_app", "get_text"}
+                    "double_tap", "handle_alert", "launch_app", "terminate_app",
+                    "get_text", "ui_back"}
     URL_BAR_KEYWORDS = ("search or type", "search google", "address bar", "url",
                         "type url", "search box", "rechercher", "taper", "type web")
 
@@ -2089,7 +2167,8 @@ async def main():
             if len(devices) > 1:
                 pairs.append((mcp2, devices[1], resolved[1]))
 
-            # create_session per device
+            # create_session per device — on capture le session_id pour ui_back HTTP
+            session_ids: List[str] = []
             for mcp, dev, rinfo in pairs:
                 caps = {
                     "platformName": "Android",
@@ -2112,7 +2191,13 @@ async def main():
                     {"platform": "android", "remoteServerUrl": APPIUM_SERVER_URL, "capabilities": caps},
                     attempts=2,
                 )
-                print(f"    [{dev}] create_session: {'OK' if ok else 'FAIL'} — {trunc(out)[:140]}")
+                # Extraire l'UUID de session depuis la réponse "...session created successfully with ID: <uuid>"
+                sid = ""
+                m = re.search(r"\b([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})\b", out or "", re.I)
+                if m:
+                    sid = m.group(1)
+                session_ids.append(sid)
+                print(f"    [{dev}] create_session: {'OK' if ok else 'FAIL'} — sid={sid[:8] if sid else 'N/A'}... — {trunc(out)[:120]}")
 
             ctxs: List[DriverContext] = []
             for i, dev in enumerate(devices):
@@ -2126,6 +2211,7 @@ async def main():
                         mcp=[mcp1, mcp2][i] if len(devices) > 1 else mcp1,
                         lock=asyncio.Lock(),
                         session_dir=session_dirs[i],
+                        session_id=session_ids[i] if i < len(session_ids) else "",
                     )
                 )
 
