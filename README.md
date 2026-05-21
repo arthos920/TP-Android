@@ -86,6 +86,11 @@ PROXY_URL = os.getenv("PROXY_URL", "")
 DEVICE_1_ID = os.getenv("DEVICE_1_ID", "").strip()
 DEVICE_2_ID = os.getenv("DEVICE_2_ID", "").strip()
 
+# Noms d'utilisateur applicatifs (tels que vus dans l'app, ex: "test_1", "alice").
+# Utilisés pour aider le LLM à savoir QUI il est dans un test multi-device.
+DEVICE_1_USER = os.getenv("DEVICE_1_USER", "").strip()
+DEVICE_2_USER = os.getenv("DEVICE_2_USER", "").strip()
+
 GLOBAL_PACKAGE = os.getenv("GLOBAL_PACKAGE", "").strip()
 DRIVER1_PACKAGE = os.getenv("DRIVER1_PACKAGE", "").strip()
 DRIVER2_PACKAGE = os.getenv("DRIVER2_PACKAGE", "").strip()
@@ -655,30 +660,49 @@ def resolve_app_info(llm_info: Dict[str, str], driver_index: int = 1) -> Dict[st
 # PLANNER (LLM) + fallback
 # =============================================================================
 
-_PLANNER_PROMPT = """Tu es un agent QA mobile expert.
+_PLANNER_PROMPT_TMPL = """Tu es un agent QA mobile expert.
 À partir du résumé Jira ci-dessous, génère un plan de test COURT et ACTIONNABLE en JSON strict :
-{
+{{
   "plan": [
-    {"step": 1, "intent": "Lancer l'app", "expected": "Écran principal visible"},
-    {"step": 2, "intent": "Cliquer sur Notifications", "expected": "Page Notifications ouverte"}
+    {{"step": 1, "intent": "Lancer l'app", "expected": "Écran principal visible"}},
+    {{"step": 2, "intent": "Cliquer sur Notifications", "expected": "Page Notifications ouverte"}}
   ]
-}
+}}
 Règles :
 - 3 à 8 étapes max.
 - intent = action humaine simple.
 - expected = élément/texte attendu visible après l'action.
 - Réponds UNIQUEMENT avec le JSON.
-""".strip()
+{role_hint}""".strip()
 
 
-async def generate_plan(summary: str, ac: AsyncOpenAI) -> List[Dict[str, str]]:
+async def generate_plan(summary: str, ac: AsyncOpenAI,
+                        my_user_name: str = "", peer_user_name: str = "") -> List[Dict[str, str]]:
+    """
+    Si my_user_name est fourni, génère un plan SPÉCIFIQUE à cet utilisateur :
+    le LLM ne garde que les actions exécutées PAR cet utilisateur (utile pour tests multi-device).
+    """
+    role_hint = ""
+    if my_user_name:
+        role_hint = (
+            f"\nCONTEXTE MULTI-DEVICE :\n"
+            f"- Tu génères le plan pour l'utilisateur '{my_user_name}' UNIQUEMENT.\n"
+            f"- L'autre utilisateur du test s'appelle '{peer_user_name}' (sur l'autre device, "
+            f"il a son propre plan).\n"
+            f"- N'inclus QUE les actions exécutées PAR '{my_user_name}' dans le scénario du résumé.\n"
+            f"- Les actions de '{peer_user_name}' sont gérées par l'autre driver, ne les inclus PAS.\n"
+            f"- Si une action de '{my_user_name}' dépend de '{peer_user_name}' (ex: attendre une "
+            f"notification), inclus une étape \"attendre que <X>\" dans son intent.\n"
+        )
+
     async def _do() -> List[Dict[str, str]]:
+        prompt = _PLANNER_PROMPT_TMPL.format(role_hint=role_hint)
         resp = await safe_chat(
             ac,
             model=MODEL,
             temperature=0.1,
             messages=[
-                {"role": "system", "content": _PLANNER_PROMPT},
+                {"role": "system", "content": prompt},
                 {"role": "user", "content": summary},
             ],
         )
@@ -689,7 +713,8 @@ async def generate_plan(summary: str, ac: AsyncOpenAI) -> List[Dict[str, str]]:
         if isinstance(plan, list) and plan:
             return plan
         return [{"step": 1, "intent": "Ouvrir l'app", "expected": ""}]
-    return await cached_call("generate_plan", [MODEL, summary], _do)
+    # Cache key inclut my_user_name pour différencier les plans par device
+    return await cached_call("generate_plan", [MODEL, summary, my_user_name], _do)
 
 
 # =============================================================================
@@ -1531,7 +1556,8 @@ les `elements` retournés par observe, qui correspondent au plan de TON ticket.
 
 
 async def run_react(ac: AsyncOpenAI, ctx: DriverContext, barrier: Barrier,
-                    summary: str, test_type: str = "unknown") -> Dict[str, Any]:
+                    summary: str, test_type: str = "unknown",
+                    my_user_name: str = "", peer_user_name: str = "") -> Dict[str, Any]:
     tools = build_tools()
 
     # ── Knowledge Base : charger les few-shots pour ce test_type ──────────────
@@ -1591,7 +1617,7 @@ async def run_react(ac: AsyncOpenAI, ctx: DriverContext, barrier: Barrier,
     # plan
     plan: List[Dict[str, str]]
     try:
-        plan = await generate_plan(summary, ac)
+        plan = await generate_plan(summary, ac, my_user_name, peer_user_name)
     except Exception as e:
         print(f"[WARN] LLM plan non dispo ({e}). Plan fallback.")
         plan = [
@@ -1615,12 +1641,30 @@ async def run_react(ac: AsyncOpenAI, ctx: DriverContext, barrier: Barrier,
     if fewshot_block:
         enriched_system = SYSTEM_REACT + "\n\n" + fewshot_block
 
+    # Bloc identité multi-device (si DEVICE_n_USER fournis)
+    identity_block = ""
+    if my_user_name:
+        identity_block = (
+            f"🎭 TON IDENTITÉ DANS L'APP\n"
+            f"Tu es l'utilisateur '{my_user_name}' sur le device {ctx.device_id}.\n"
+        )
+        if peer_user_name:
+            identity_block += (
+                f"L'autre device est piloté par l'utilisateur '{peer_user_name}'.\n"
+                f"Le résumé Jira mentionne 'U1', 'U2', ou des rôles abstraits — identifie LE TIEN "
+                f"en faisant correspondre ton nom '{my_user_name}' avec ce que dit le résumé.\n"
+                f"N'exécute QUE les actions attribuées à '{my_user_name}' dans le scénario. "
+                f"Les actions de '{peer_user_name}' sont gérées par l'autre driver — ignore-les.\n"
+            )
+        identity_block += "\n"
+
     msgs: List[Dict[str, Any]] = [
         {"role": "system", "content": enriched_system},
         {"role": "user", "content": (
             f"Résumé Jira:\n{summary}\n\n"
+            f"{identity_block}"
             f"Driver: {ctx.name} | Device: {ctx.device_id} | App: {ctx.app_name} ({ctx.app_package})\n\n"
-            f"PLAN:\n{plan_txt}\n\n"
+            f"PLAN (spécifique à toi) :\n{plan_txt}\n\n"
             "Commence par observe."
         )},
     ]
@@ -1720,25 +1764,33 @@ async def run_react(ac: AsyncOpenAI, ctx: DriverContext, barrier: Barrier,
             ctx.last_clicked_was_editable
             or (_is_url_bar_target(last_click_target) and last_click_target != "")
         )
-        if (last_tool_name == "observe" and clicked_input and text_to_type_from_plan):
+        if last_tool_name == "observe" and clicked_input:
             # Détecte si le plan demande une VALIDATION après la saisie
-            # (recherche, soumettre, valider, lancer, send, search...)
             submit_keywords = ("rechercher", "recherche google", "lance la recherche",
                                "valid", "soumets", "submit", "search", "envoie", "send",
                                "appui sur entr", "press enter", "press search", "go")
             lower_summary = (summary or "").lower()
             needs_submit = any(k in lower_summary for k in submit_keywords)
-            submit_hint = " et passe submit=true (le plan demande de valider/lancer)" \
-                          if needs_submit else ""
-            msgs.append({
-                "role": "user",
-                "content": (
+            submit_hint = " (avec submit=true pour valider/lancer)" if needs_submit else ""
+            # Si on a extrait un texte clair depuis le résumé, on le suggère.
+            # Sinon (cas multi-step / multi-device), on demande au LLM de lire son plan.
+            if text_to_type_from_plan:
+                content = (
                     f"Tu viens de cliquer un champ de saisie ('{last_click_target}'). "
                     f"TON UNIQUE TOOL CALL POSSIBLE MAINTENANT est : "
                     f'ui_type(text="{text_to_type_from_plan}"{submit_hint}). '
-                    "Ne clique pas un autre élément. Ne fais pas finish. Tape ce texte EXACT."
-                ),
-            })
+                    "Ne clique pas un autre élément. Ne fais pas finish."
+                )
+            else:
+                content = (
+                    f"Tu viens de cliquer un champ de saisie ('{last_click_target}'). "
+                    f"TON UNIQUE TOOL CALL POSSIBLE MAINTENANT est ui_type{submit_hint}. "
+                    f"Regarde TON plan et le résumé pour savoir QUOI taper : "
+                    f"si le scénario demande de chercher un contact, utilise le nom du peer ; "
+                    f"si c'est une URL/recherche, utilise le texte mentionné dans le plan. "
+                    "Ne clique pas un autre élément. Ne fais pas finish."
+                )
+            msgs.append({"role": "user", "content": content})
             # consommé : reset des deux signaux pour ne pas reboucler
             last_click_target = ""
             ctx.last_clicked_was_editable = False
@@ -2079,7 +2131,15 @@ async def main():
 
             try:
                 print("\n(4) ReAct en parallèle...")
-                results = await asyncio.gather(*[run_react(ac, ctx, barrier, summary, test_type) for ctx in ctxs], return_exceptions=True)
+                # Mapping driver_index → (my_user, peer_user) pour les tests multi-device.
+                user_names = [DEVICE_1_USER, DEVICE_2_USER]
+                react_coros = []
+                for i, ctx in enumerate(ctxs):
+                    my = user_names[i] if i < len(user_names) else ""
+                    peer = user_names[1 - i] if len(ctxs) > 1 and i < 2 else ""
+                    react_coros.append(run_react(ac, ctx, barrier, summary, test_type,
+                                                 my_user_name=my, peer_user_name=peer))
+                results = await asyncio.gather(*react_coros, return_exceptions=True)
             finally:
                 for mcp in ([mcp1, mcp2] if len(devices) > 1 else [mcp1]):
                     await mcp.call("delete_session", {})
