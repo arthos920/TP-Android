@@ -1,194 +1,84 @@
-# Compatible PowerShell 5.1+
+# GitLab Pipeline Schedules - Utilitaire PowerShell
 
-$token  = "TON_TOKEN"
-$projId = 316
+Utilitaire complet pour gérer les **pipeline schedules** d'un projet GitLab :
+lister, créer, modifier, supprimer, activer/désactiver, lancer, surveiller,
+prendre l'ownership et gérer les **variables** des schedules.
 
-$baseUrl = "https://gitlab.com/api/v4/projects/$projId/pipeline_schedules"
+Compatible **PowerShell 5.1+** (Windows PowerShell) et **PowerShell 7+** (Linux/macOS/Windows).
 
-$headers = @{
-    "PRIVATE-TOKEN" = $token
-}
+## Installation
 
-function Get-TimeLeft {
-    param ([string]$NextRunAt)
+Aucune dépendance. Récupère simplement le fichier `Manage-PipelineSchedules.ps1`.
 
-    if (-not $NextRunAt) {
-        return "N/A"
-    }
+## Configuration
 
-    $nextRunDate = [datetime]$NextRunAt
-    $remaining = $nextRunDate.ToUniversalTime() - (Get-Date).ToUniversalTime()
+Ouvre `Manage-PipelineSchedules.ps1` et édite la section *Configuration* en haut :
 
-    if ($remaining.TotalSeconds -lt 0) {
-        return "Déjà passé"
-    }
+```powershell
+$DefaultToken     = "TON_TOKEN"
+$DefaultProjectId = "316"
+$DefaultGitLabUrl = "https://gitlab.com"
+```
 
-    return "{0}j {1}h {2}m" -f `
-        $remaining.Days, `
-        $remaining.Hours, `
-        $remaining.Minutes
-}
+Tu peux aussi surcharger via variables d'environnement (`GITLAB_TOKEN`,
+`GITLAB_PROJECT_ID`, `GITLAB_URL`) ou via paramètres CLI (`-Token`,
+`-ProjectId`, `-GitLabUrl`). Ordre de priorité : **CLI > env var > script**.
 
-function Get-LastSchedulePipelineStatus {
-    param (
-        [int]$ScheduleId
-    )
+## Utilisation
 
-    try {
-        $pipelines = Invoke-RestMethod `
-            -Uri "$baseUrl/$ScheduleId/pipelines" `
-            -Method Get `
-            -Headers $headers
+### Mode interactif (menu)
 
-        if ($pipelines.Count -gt 0) {
-            return $pipelines[0].status
-        }
+```powershell
+.\Manage-PipelineSchedules.ps1
+```
 
-        return "Aucun run"
-    }
-    catch {
-        return "Erreur"
-    }
-}
+Menu avec : lister, détailler, créer, modifier, activer/désactiver,
+play, supprimer, take ownership, gérer les variables, surveiller un pipeline.
 
-function Watch-Pipeline {
-    param (
-        [int]$ProjectId,
-        [int]$PipelineId,
-        [hashtable]$Headers
-    )
+### Mode CLI
 
-    Write-Host "`nSurveillance du pipeline $PipelineId..." -ForegroundColor Cyan
+| Action            | Exemple                                                                       |
+| ----------------- | ----------------------------------------------------------------------------- |
+| Lister            | `.\Manage-PipelineSchedules.ps1 -Action list`                                 |
+| Filtrer           | `.\Manage-PipelineSchedules.ps1 -Action list -Status active -Filter "nightly"`|
+| Détails           | `.\Manage-PipelineSchedules.ps1 -Action show -ScheduleId 42`                  |
+| Créer             | `.\Manage-PipelineSchedules.ps1 -Action create -Description "Nightly" -Ref main -Cron "0 2 * * *"` |
+| Modifier          | `.\Manage-PipelineSchedules.ps1 -Action update -ScheduleId 42 -Cron "30 3 * * *"` |
+| Activer           | `.\Manage-PipelineSchedules.ps1 -Action activate -ScheduleId 42`              |
+| Désactiver        | `.\Manage-PipelineSchedules.ps1 -Action deactivate -ScheduleId 42`            |
+| Lancer maintenant | `.\Manage-PipelineSchedules.ps1 -Action play -ScheduleId 42 -Watch`           |
+| Supprimer         | `.\Manage-PipelineSchedules.ps1 -Action delete -ScheduleId 42`                |
+| Take ownership    | `.\Manage-PipelineSchedules.ps1 -Action take-ownership -ScheduleId 42`        |
+| Surveiller        | `.\Manage-PipelineSchedules.ps1 -Action watch -PipelineId 12345`              |
+| Lister variables  | `.\Manage-PipelineSchedules.ps1 -Action vars -ScheduleId 42`                  |
+| Ajouter variable  | `.\Manage-PipelineSchedules.ps1 -Action var-add -ScheduleId 42 -VariableKey FOO -VariableValue bar` |
+| Modifier variable | `.\Manage-PipelineSchedules.ps1 -Action var-set -ScheduleId 42 -VariableKey FOO -VariableValue baz` |
+| Supprimer var     | `.\Manage-PipelineSchedules.ps1 -Action var-del -ScheduleId 42 -VariableKey FOO` |
 
-    while ($true) {
-        Start-Sleep -Seconds 5
+### Options utiles
 
-        $pipeline = Invoke-RestMethod `
-            -Uri "https://gitlab.com/api/v4/projects/$ProjectId/pipelines/$PipelineId" `
-            -Method Get `
-            -Headers $Headers
+- `-DryRun` : affiche ce qui serait fait sans appeler l'API mutante.
+- `-WatchTimeoutSeconds 3600` : timeout du watch (défaut 1800s).
+- `-WatchIntervalSeconds 10` : période de polling du watch (défaut 5s).
+- `-NoColor` : sortie sans couleurs (utile pour CI).
+- `-Verbose` : trace des retries, des appels HTTP, etc.
 
-        $status = $pipeline.status
+## Améliorations vs script initial
 
-        Write-Host "Etat actuel : $status"
+- CRUD complet (create / update / delete) en plus de l'activate/play
+- Gestion des **variables** de schedule (list / add / set / del)
+- **Take ownership** d'un schedule
+- **Pagination** automatique
+- **Retry** exponentiel sur erreurs 5xx / 429 / réseau
+- Watch avec **timeout** et changement de couleur selon le statut
+- **DryRun**, validation cron, validation des paramètres
+- Mode **CLI scriptable** (CI/CD) en plus du menu interactif
+- Affichage en tableau avec `Format-Table`
+- Confirmation pour opérations destructives (`-Confirm`, `ShouldProcess`)
+- Compatible PowerShell 5.1 et 7+
 
-        switch ($status) {
-            "success" {
-                Write-Host "`nPipeline terminé avec succès." -ForegroundColor Green
-                Write-Host "URL : $($pipeline.web_url)"
-                return
-            }
+## Aide intégrée
 
-            "failed" {
-                Write-Host "`nPipeline échoué." -ForegroundColor Red
-                Write-Host "URL : $($pipeline.web_url)"
-                return
-            }
-
-            "canceled" {
-                Write-Host "`nPipeline annulé." -ForegroundColor Yellow
-                Write-Host "URL : $($pipeline.web_url)"
-                return
-            }
-
-            "skipped" {
-                Write-Host "`nPipeline skipped." -ForegroundColor Yellow
-                Write-Host "URL : $($pipeline.web_url)"
-                return
-            }
-        }
-    }
-}
-
-$schedules = Invoke-RestMethod `
-    -Uri $baseUrl `
-    -Method Get `
-    -Headers $headers
-
-Write-Host "`nSchedules GitLab :" -ForegroundColor Cyan
-
-$schedules | ForEach-Object {
-
-    $pipelineStatus = Get-LastSchedulePipelineStatus -ScheduleId $_.id
-
-    if ($_.active -eq $true) {
-        $timeLeft = Get-TimeLeft -NextRunAt $_.next_run_at
-
-        Write-Host "ID: $($_.id) | Description: $($_.description) | Active: $($_.active) | Last status: $pipelineStatus | Next run: $($_.next_run_at) | Dans: $timeLeft"
-    }
-    else {
-        Write-Host "ID: $($_.id) | Description: $($_.description) | Active: $($_.active) | Last status: $pipelineStatus"
-    }
-}
-
-$scheduleId = Read-Host "`nEntre l'ID du schedule à modifier"
-
-$selectedSchedule = $schedules | Where-Object { $_.id -eq [int]$scheduleId }
-
-if (-not $selectedSchedule) {
-    Write-Host "Schedule introuvable." -ForegroundColor Red
-    exit 1
-}
-
-$choice = Read-Host "`nTape A pour activer, D pour désactiver"
-
-switch ($choice.ToUpper()) {
-    "A" { $activeValue = "true" }
-    "D" { $activeValue = "false" }
-    default {
-        Write-Host "Choix invalide. Utilise A ou D." -ForegroundColor Red
-        exit 1
-    }
-}
-
-$headersUpdate = @{
-    "PRIVATE-TOKEN" = $token
-    "Content-Type"  = "application/x-www-form-urlencoded"
-}
-
-$body = "active=$activeValue"
-
-$result = Invoke-RestMethod `
-    -Uri "$baseUrl/$scheduleId" `
-    -Method Put `
-    -Headers $headersUpdate `
-    -Body $body
-
-Write-Host "`nSchedule mis à jour :" -ForegroundColor Green
-Write-Host "ID: $($result.id)"
-Write-Host "Description: $($result.description)"
-Write-Host "Active: $($result.active)"
-
-if ($result.active -eq $true) {
-    $timeLeft = Get-TimeLeft -NextRunAt $result.next_run_at
-    $pipelineStatus = Get-LastSchedulePipelineStatus -ScheduleId $scheduleId
-
-    Write-Host "Last status: $pipelineStatus"
-    Write-Host "Next run: $($result.next_run_at)"
-    Write-Host "Dans: $timeLeft"
-
-    $runNow = Read-Host "`nTu veux lancer ce schedule maintenant ? Tape O pour oui, N pour non"
-
-    if ($runNow.ToUpper() -eq "O") {
-        $runResult = Invoke-RestMethod `
-            -Uri "$baseUrl/$scheduleId/play" `
-            -Method Post `
-            -Headers $headers
-
-        $pipelineId = $runResult.id
-
-        Write-Host "`nPipeline lancé directement." -ForegroundColor Green
-        Write-Host "Pipeline ID: $pipelineId"
-        Write-Host "Etat initial : $($runResult.status)"
-        Write-Host "URL : $($runResult.web_url)"
-
-        $watch = Read-Host "`nTu veux surveiller son état ? Tape O pour oui, N pour non"
-
-        if ($watch.ToUpper() -eq "O") {
-            Watch-Pipeline `
-                -ProjectId $projId `
-                -PipelineId $pipelineId `
-                -Headers $headers
-        }
-    }
-}
+```powershell
+Get-Help .\Manage-PipelineSchedules.ps1 -Detailed
+```
