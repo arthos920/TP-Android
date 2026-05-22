@@ -10,9 +10,7 @@ $headers = @{
 }
 
 function Get-TimeLeft {
-    param (
-        [string]$NextRunAt
-    )
+    param ([string]$NextRunAt)
 
     if (-not $NextRunAt) {
         return "N/A"
@@ -31,7 +29,77 @@ function Get-TimeLeft {
         $remaining.Minutes
 }
 
-# 1. Récupérer les schedules
+function Get-LastSchedulePipelineStatus {
+    param (
+        [int]$ScheduleId
+    )
+
+    try {
+        $pipelines = Invoke-RestMethod `
+            -Uri "$baseUrl/$ScheduleId/pipelines" `
+            -Method Get `
+            -Headers $headers
+
+        if ($pipelines.Count -gt 0) {
+            return $pipelines[0].status
+        }
+
+        return "Aucun run"
+    }
+    catch {
+        return "Erreur"
+    }
+}
+
+function Watch-Pipeline {
+    param (
+        [int]$ProjectId,
+        [int]$PipelineId,
+        [hashtable]$Headers
+    )
+
+    Write-Host "`nSurveillance du pipeline $PipelineId..." -ForegroundColor Cyan
+
+    while ($true) {
+        Start-Sleep -Seconds 5
+
+        $pipeline = Invoke-RestMethod `
+            -Uri "https://gitlab.com/api/v4/projects/$ProjectId/pipelines/$PipelineId" `
+            -Method Get `
+            -Headers $Headers
+
+        $status = $pipeline.status
+
+        Write-Host "Etat actuel : $status"
+
+        switch ($status) {
+            "success" {
+                Write-Host "`nPipeline terminé avec succès." -ForegroundColor Green
+                Write-Host "URL : $($pipeline.web_url)"
+                return
+            }
+
+            "failed" {
+                Write-Host "`nPipeline échoué." -ForegroundColor Red
+                Write-Host "URL : $($pipeline.web_url)"
+                return
+            }
+
+            "canceled" {
+                Write-Host "`nPipeline annulé." -ForegroundColor Yellow
+                Write-Host "URL : $($pipeline.web_url)"
+                return
+            }
+
+            "skipped" {
+                Write-Host "`nPipeline skipped." -ForegroundColor Yellow
+                Write-Host "URL : $($pipeline.web_url)"
+                return
+            }
+        }
+    }
+}
+
 $schedules = Invoke-RestMethod `
     -Uri $baseUrl `
     -Method Get `
@@ -40,16 +108,19 @@ $schedules = Invoke-RestMethod `
 Write-Host "`nSchedules GitLab :" -ForegroundColor Cyan
 
 $schedules | ForEach-Object {
+
+    $pipelineStatus = Get-LastSchedulePipelineStatus -ScheduleId $_.id
+
     if ($_.active -eq $true) {
         $timeLeft = Get-TimeLeft -NextRunAt $_.next_run_at
-        Write-Host "ID: $($_.id) | Description: $($_.description) | Active: $($_.active) | Next run: $($_.next_run_at) | Dans: $timeLeft"
+
+        Write-Host "ID: $($_.id) | Description: $($_.description) | Active: $($_.active) | Last status: $pipelineStatus | Next run: $($_.next_run_at) | Dans: $timeLeft"
     }
     else {
-        Write-Host "ID: $($_.id) | Description: $($_.description) | Active: $($_.active)"
+        Write-Host "ID: $($_.id) | Description: $($_.description) | Active: $($_.active) | Last status: $pipelineStatus"
     }
 }
 
-# 2. Choisir un schedule
 $scheduleId = Read-Host "`nEntre l'ID du schedule à modifier"
 
 $selectedSchedule = $schedules | Where-Object { $_.id -eq [int]$scheduleId }
@@ -59,7 +130,6 @@ if (-not $selectedSchedule) {
     exit 1
 }
 
-# 3. Activer ou désactiver
 $choice = Read-Host "`nTape A pour activer, D pour désactiver"
 
 switch ($choice.ToUpper()) {
@@ -91,6 +161,9 @@ Write-Host "Active: $($result.active)"
 
 if ($result.active -eq $true) {
     $timeLeft = Get-TimeLeft -NextRunAt $result.next_run_at
+    $pipelineStatus = Get-LastSchedulePipelineStatus -ScheduleId $scheduleId
+
+    Write-Host "Last status: $pipelineStatus"
     Write-Host "Next run: $($result.next_run_at)"
     Write-Host "Dans: $timeLeft"
 
@@ -102,9 +175,20 @@ if ($result.active -eq $true) {
             -Method Post `
             -Headers $headers
 
+        $pipelineId = $runResult.id
+
         Write-Host "`nPipeline lancé directement." -ForegroundColor Green
-        Write-Host "Pipeline ID: $($runResult.id)"
-        Write-Host "Status: $($runResult.status)"
-        Write-Host "Web URL: $($runResult.web_url)"
+        Write-Host "Pipeline ID: $pipelineId"
+        Write-Host "Etat initial : $($runResult.status)"
+        Write-Host "URL : $($runResult.web_url)"
+
+        $watch = Read-Host "`nTu veux surveiller son état ? Tape O pour oui, N pour non"
+
+        if ($watch.ToUpper() -eq "O") {
+            Watch-Pipeline `
+                -ProjectId $projId `
+                -PipelineId $pipelineId `
+                -Headers $headers
+        }
     }
 }
