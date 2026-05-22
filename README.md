@@ -9,7 +9,29 @@ $headers = @{
     "PRIVATE-TOKEN" = $token
 }
 
-# 1. Récupérer la liste des schedules
+function Get-TimeLeft {
+    param (
+        [string]$NextRunAt
+    )
+
+    if (-not $NextRunAt) {
+        return "N/A"
+    }
+
+    $nextRunDate = [datetime]$NextRunAt
+    $remaining = $nextRunDate.ToUniversalTime() - (Get-Date).ToUniversalTime()
+
+    if ($remaining.TotalSeconds -lt 0) {
+        return "Déjà passé"
+    }
+
+    return "{0}j {1}h {2}m" -f `
+        $remaining.Days, `
+        $remaining.Hours, `
+        $remaining.Minutes
+}
+
+# 1. Récupérer les schedules
 $schedules = Invoke-RestMethod `
     -Uri $baseUrl `
     -Method Get `
@@ -18,10 +40,16 @@ $schedules = Invoke-RestMethod `
 Write-Host "`nSchedules GitLab :" -ForegroundColor Cyan
 
 $schedules | ForEach-Object {
-    Write-Host "ID: $($_.id) | Description: $($_.description) | Active: $($_.active)"
+    if ($_.active -eq $true) {
+        $timeLeft = Get-TimeLeft -NextRunAt $_.next_run_at
+        Write-Host "ID: $($_.id) | Description: $($_.description) | Active: $($_.active) | Next run: $($_.next_run_at) | Dans: $timeLeft"
+    }
+    else {
+        Write-Host "ID: $($_.id) | Description: $($_.description) | Active: $($_.active)"
+    }
 }
 
-# 2. Demander le schedule à modifier
+# 2. Choisir un schedule
 $scheduleId = Read-Host "`nEntre l'ID du schedule à modifier"
 
 $selectedSchedule = $schedules | Where-Object { $_.id -eq [int]$scheduleId }
@@ -31,13 +59,8 @@ if (-not $selectedSchedule) {
     exit 1
 }
 
-Write-Host "`nSchedule sélectionné :"
-Write-Host "ID: $($selectedSchedule.id)"
-Write-Host "Description: $($selectedSchedule.description)"
-Write-Host "État actuel Active: $($selectedSchedule.active)"
-
-# 3. Demander activation ou désactivation
-$choice = Read-Host "`nTu veux l'activer ou le désactiver ? Tape A pour activer, D pour désactiver"
+# 3. Activer ou désactiver
+$choice = Read-Host "`nTape A pour activer, D pour désactiver"
 
 switch ($choice.ToUpper()) {
     "A" { $activeValue = "true" }
@@ -48,14 +71,13 @@ switch ($choice.ToUpper()) {
     }
 }
 
-$body = "active=$activeValue"
-
 $headersUpdate = @{
     "PRIVATE-TOKEN" = $token
     "Content-Type"  = "application/x-www-form-urlencoded"
 }
 
-# 4. Modifier le schedule
+$body = "active=$activeValue"
+
 $result = Invoke-RestMethod `
     -Uri "$baseUrl/$scheduleId" `
     -Method Put `
@@ -66,3 +88,23 @@ Write-Host "`nSchedule mis à jour :" -ForegroundColor Green
 Write-Host "ID: $($result.id)"
 Write-Host "Description: $($result.description)"
 Write-Host "Active: $($result.active)"
+
+if ($result.active -eq $true) {
+    $timeLeft = Get-TimeLeft -NextRunAt $result.next_run_at
+    Write-Host "Next run: $($result.next_run_at)"
+    Write-Host "Dans: $timeLeft"
+
+    $runNow = Read-Host "`nTu veux lancer ce schedule maintenant ? Tape O pour oui, N pour non"
+
+    if ($runNow.ToUpper() -eq "O") {
+        $runResult = Invoke-RestMethod `
+            -Uri "$baseUrl/$scheduleId/play" `
+            -Method Post `
+            -Headers $headers
+
+        Write-Host "`nPipeline lancé directement." -ForegroundColor Green
+        Write-Host "Pipeline ID: $($runResult.id)"
+        Write-Host "Status: $($runResult.status)"
+        Write-Host "Web URL: $($runResult.web_url)"
+    }
+}
