@@ -1,0 +1,46 @@
+# Future Winner Score — stack MVP
+# Usage : docker compose up --build
+services:
+
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    environment:
+      DATABASE_URL: postgresql+psycopg2://fws:fws@postgres:5432/fws
+      REDIS_URL: redis://redis:6379/0
+      # Clés à fournir en V2 (jamais committées) :
+      # ANTHROPIC_API_KEY, SEC_USER_AGENT, FMP_API_KEY, ALPHAVANTAGE_API_KEY,
+      # POLYGON_API_KEY, TELEGRAM_BOT_TOKEN, DISCORD_WEBHOOK_URL
+    depends_on:
+      - postgres
+      - redis
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: fws
+      POSTGRES_PASSWORD: fws
+      POSTGRES_DB: fws
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+
+  # Workers Celery + scheduler (V2 : câbler les jobs d'ingestion/scoring)
+  # worker:
+  #   build: .
+  #   command: celery -A app.tasks worker -l info
+  #   depends_on: [redis, postgres]
+  # beat:
+  #   build: .
+  #   command: celery -A app.tasks beat -l info   # un seul scheduler !
+  #   depends_on: [redis, postgres]
+
+volumes:
+  pgdata:
