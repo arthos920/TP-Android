@@ -1,34 +1,24 @@
-# ------------------------------------------------------------
-# Lancer Robot Framework
-# ------------------------------------------------------------
+from selenium.webdriver.common.actions.action_builder import ActionBuilder
+from selenium.webdriver.common.actions.pointer_input import PointerInput
+from selenium.webdriver.common.actions import interaction
 
-$robotExitCode = 1
+def ptt_press(self):
+    ptt_button = self.driver.find_element(By.ID, PTT_BTN_ID)
 
-while ($robotExitCode -ne 0) {
+    rect = ptt_button.rect
+    x = rect["x"] + rect["width"] // 2
+    y = rect["y"] + rect["height"] // 2
 
-    Write-Output "Launching Robot Framework..."
+    finger = PointerInput(interaction.POINTER_TOUCH, "finger")
+    actions = ActionBuilder(self.driver, mouse=finger)
 
-    & $robotPath `
-        -L debug `
-        --outputdir $RESULTS_DIR `
-        --output check_actors.xml `
-        --log log_actors.html `
-        --report report_actors.html `
-        $checkActorFile
+    actions.pointer_action.move_to_location(x, y)
+    actions.pointer_action.pointer_down()
+    actions.perform()
 
-    $robotExitCode = $LASTEXITCODE
+    robot.api.logger.info("PTT pressed")
 
-    Write-Output "Robot exit code: $robotExitCode"
 
-    if ($robotExitCode -ne 0) {
-        Write-Output "Robot failed. Retrying in 5 seconds..."
-        Start-Sleep -Seconds 5
-    }
-}
-
-# ------------------------------------------------------------
-# Propager le résultat vers GitLab
-# ------------------------------------------------------------
-
-Write-Output "Robot tests PASSED"
-exit 0
+def ptt_release(self):
+    self.driver.release_actions()
+    robot.api.logger.info("PTT released")
