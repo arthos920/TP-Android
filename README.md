@@ -1,29 +1,34 @@
-services:
+{
+  "keyword_name": "Start Semi Duplex PTT Call",
+  "keyword": "",
+  "file": "/xxx/xxxx",
+  "scenario": "semi_duplex_ptt_call",
+  "tags": [
+    "ptt",
+    "semi_duplex",
+    "call",
+    "voice"
+  ]
+}
 
-  elasticsearch:
-    image: 
 
-    environment:
-      discovery.type: single-node
-      xpack.security.enabled: "false"
-
-    ports:
-      - "127.0.0.1:9200:9200"
-
-    volumes:
-      - elasticsearch-data:/usr/share/elasticsearch/data
-
-    restart: unless-stopped
-
-    networks:
-      - dev-network
-
-networks:
-  dev-network:
-
-volumes:
-  elasticsearch-data:
+curl -X POST "http://localhost:9200/robot-keywords/_doc" ^
+-H "Content-Type: application/json" ^
+-d @ptt-keyword.json
 
 
 
-curl -X PUT "http://localhost:9200/robot-keywords" -H "Content-Type: application/json" -d @robot-keywords-mapping.json
+recherche 
+
+
+{
+  "query": {
+    "match": {
+      "keyword": "semi duplex ptt"
+    }
+  }
+}
+
+curl -X GET "http://localhost:9200/robot-keywords/_search?pretty" ^
+-H "Content-Type: application/json" ^
+-d @search.json
