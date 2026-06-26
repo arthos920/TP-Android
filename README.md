@@ -1,5 +1,2 @@
-# 1er toggle
-"(//div[@data-id='record']//div[@data-id='toggle-menu-button'])[1]"
-
-# 2e toggle
-"(//div[@data-id='record']//div[@data-id='toggle-menu-button'])[2]"
+//div[@data-id='record' and .//div[@data-id='summary-title-info-left']//span[@data-id='usergroup-user' and contains(., 'Christ1 Christ1')]]
+//div[@data-id='toggle-menu-button']
