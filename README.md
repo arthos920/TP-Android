@@ -1,2 +1,12 @@
-//div[@data-id='record' and .//div[@data-id='summary-title-info-left']//span[@data-id='usergroup-user' and contains(., 'Christ1 Christ1')]]
-//div[@data-id='toggle-menu-button']
+xpath = (
+
+    f"//div[@data-id='record' "
+
+    f"and .//span[@data-id='usergroup-user' "
+
+    f"and contains(normalize-space(.), '{user_name}')]]"
+
+    f"//div[@data-id='toggle-menu-button']"
+
+)
+
