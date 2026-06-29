@@ -1,4 +1,3 @@
-self.assert_component_exists(
-    By.XPATH,
-    "//div[@data-id='player-progress-bar']//div[contains(@class,'ProgressBar_InnerBar') and contains(@style,'width: 100%')]"
-)
+//span[@data-id='usergroup-user' and normalize-space(.)='Christ1 Christ1']
+
+xpath = f"//span[@data-id='usergroup-user' and normalize-space(.)='{expected_user}']"
