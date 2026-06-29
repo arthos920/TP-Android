@@ -1,7 +1,13 @@
-xpath = (
-    f"//div[@data-id='record'"
-    f" and .//div[@data-id='summary-title-info-left']"
-    f"//span[@data-id='usergroup-user'"
-    f" and contains(normalize-space(.), '{user_name}')]]"
-    f"//div[@data-id='toggle-menu-button']"
-)
+def play_audio(self):
+    """
+    This function is used to press play button on UI.
+    """
+
+    self.click_component(By.XPATH, PLAY_AUDIO)
+
+    self.assert_component_with_attribute_exists(
+        By.XPATH,
+        "//div[@data-id='player-progress-bar']//div[contains(@class,'ProgressBar_InnerBar')]",
+        "style",
+        "width: 100%"
+    )
