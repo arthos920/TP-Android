@@ -1,6 +1,6 @@
-//div[@data-id='target-list']//span[@data-id='usergroup-user' and normalize-space(.)='Christ1 Christ1']
-
-xpath = (
-    f"//div[@data-id='target-list']"
-    f"//span[@data-id='usergroup-user' and normalize-space(.)='{expected_user}']"
-)
+echo "export GNOME_SHELL_SESSION_MODE=ubuntu" > ~/.xsession
+echo "export XDG_CURRENT_DESKTOP=ubuntu:GNOME" >> ~/.xsession
+echo "export XDG_SESSION_TYPE=x11" >> ~/.xsession
+echo "exec gnome-session --session=ubuntu" >> ~/.xsession
+chmod +x ~/.xsession
+sudo systemctl restart xrdp
