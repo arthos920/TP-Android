@@ -1,5 +1,6 @@
 ${timeout}=    Convert Time    ${PTT_duration}
 ${start}=      Get Time    epoch
+
 ${driver1_ok_count}=      Set Variable    0
 ${driver2_ok_count}=      Set Variable    0
 ${driver1_fail_count}=    Set Variable    0
@@ -21,6 +22,7 @@ WHILE    ${True}
 
     ${driver1_ok}=    Run Keyword And Return Status    driver1.use_ptt_release
     Sleep    1s
+
     ${driver2_ok}=    Run Keyword And Return Status    driver2.use_ptt_release
     Sleep    1s
 
@@ -36,12 +38,14 @@ WHILE    ${True}
         ${driver2_fail_count}=    Evaluate    ${driver2_fail_count} + 1
     END
 
-    ${total_ok}=          Evaluate    ${driver1_ok_count} + ${driver2_ok_count}
-    ${total_fail}=        Evaluate    ${driver1_fail_count} + ${driver2_fail_count}
-    ${total_attempts}=    Evaluate    ${total_ok} + ${total_fail}
-    ${elapsed_minutes}=   Evaluate    max(${elapsed} / 60.0, 1/60.0)
-    ${avg_ptt}=           Evaluate    round(${total_ok} / ${elapsed_minutes}, 2)
-    ${fail_rate}=         Evaluate    round((${total_fail} / max(${total_attempts}, 1)) * 100, 2)
+    ${now}=              Get Time    epoch
+    ${elapsed}=          Evaluate    ${now} - ${start}
+    ${total_ok}=         Evaluate    ${driver1_ok_count} + ${driver2_ok_count}
+    ${total_fail}=       Evaluate    ${driver1_fail_count} + ${driver2_fail_count}
+    ${total_attempts}=   Evaluate    ${total_ok} + ${total_fail}
+    ${elapsed_minutes}=  Evaluate    ${elapsed} / 60.0
+    ${avg_ptt}=          Evaluate    round(${total_ok} / max(${elapsed_minutes}, 0.01), 2)
+    ${fail_rate}=        Evaluate    round((${total_fail} / max(${total_attempts}, 1)) * 100, 2)
 
-    Log To Console    [ENDURANCE] Driver1=${driver1_ok_count} | Driver2=${driver2_ok_count} | Total=${total_ok} | Avg=${avg_ptt} PTT/min | Fail=${total_fail} (${fail_rate}%)
+    Log To Console    [ENDURANCE] Driver1=${driver1_ok_count} | Driver2=${driver2_ok_count} | Total=${total_ok} | Elapsed=${elapsed}s | Avg=${avg_ptt} PTT/min | Fail=${total_fail} (${fail_rate}%)
 END
