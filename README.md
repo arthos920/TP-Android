@@ -3,7 +3,8 @@ def filter_by_user(self, user_name):
         user_name,
         By.XPATH,
         self.build_xpath()
-            .element(class_word="row with-selector", role="users-selector-section")
-            .element(class_word="ui selection dropdown optgroup search multiple")
+            .element(data_role="users-selector-section")
+            .element(tag="*", data_role="users-selector")
+            .following_sibling()
             .element(tag="input", class_word="search")
     )
