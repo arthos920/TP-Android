@@ -1,91 +1,55 @@
-# ============================================================
-# AUDIO SELECTORS
-# ============================================================
+def filter_by_date_range(self):
+    """
+    Filters communications using a default time range.
+    """
+    target_dt = datetime.now() - timedelta(hours=2, minutes=3)
+    target_dt_end = datetime.now() - timedelta(hours=1, minutes=58)
 
-def _select_audio(self):
-    """Open the audio type dropdown."""
-    self.click_component(By.XPATH, _TYPE_SELECT_AUDIO)
+    start_date = target_dt.strftime("%m/%d/%Y")
+    start_time = target_dt.strftime("%I:%M %p")
+    end_date = target_dt_end.strftime("%m/%d/%Y")
+    end_time = target_dt_end.strftime("%I:%M %p")
 
+    element = self.driver.find_element(
+        By.XPATH,
+        self.build_xpath()
+            .element(data_id=SR_SELECT_START_DATE)
+            .descendant()
+            .element(tag="input")
+    )
+    self.driver.execute_script("arguments[0].removeAttribute('readonly');", element)
+    element.clear()
+    element.send_keys(start_date)
 
-def _select_audio_type_call(self):
-    """Select the 'Call' audio type."""
-    self._select_audio()
-    self.click_component(By.XPATH, _TYPE_AUDIO_RADIO_CALL)
+    element = self.driver.find_element(
+        By.XPATH,
+        self.build_xpath()
+            .element(data_id=SR_SELECT_START_TIME)
+            .descendant()
+            .element(tag="input")
+    )
+    self.driver.execute_script("arguments[0].removeAttribute('readonly');", element)
+    element.clear()
+    element.send_keys(start_time)
 
+    element = self.driver.find_element(
+        By.XPATH,
+        self.build_xpath()
+            .element(data_id=SR_SELECT_END_DATE)
+            .descendant()
+            .element(tag="input")
+    )
+    self.driver.execute_script("arguments[0].removeAttribute('readonly');", element)
+    element.clear()
+    element.send_keys(end_date)
 
-def _select_audio_type_conference(self):
-    """Select the 'Conference' audio type."""
-    self._select_audio()
-    self.click_component(By.XPATH, _TYPE_AUDIO_RADIO_CONF)
-
-
-def _select_audio_type_talk(self):
-    """Select the 'Talk' audio type."""
-    self._select_audio()
-    self.click_component(By.XPATH, _TYPE_AUDIO_RADIO_TALK)
-
-
-def _select_audio_type_ptt(self):
-    """Select the 'PTT' audio type."""
-    self._select_audio()
-    self.click_component(By.XPATH, _TYPE_AUDIO_RADIO_PTT)
-
-
-def _select_audio_type_emergency(self):
-    """Select the 'Emergency' audio type."""
-    self._select_audio()
-    self.click_component(By.XPATH, _TYPE_AUDIO_RADIO_EMERGENCY)
-
-
-def _select_audio_type_broadcast(self):
-    """Select the 'Broadcast' audio type."""
-    self._select_audio()
-    self.click_component(By.XPATH, _TYPE_AUDIO_RADIO_BROADCAST)
-
-
-# ============================================================
-# VIDEO SELECTORS
-# ============================================================
-
-def _select_video(self):
-    """Open the video type dropdown."""
-    self.click_component(By.XPATH, _TYPE_SELECT_VIDEO)
-
-
-def _select_video_type_call(self):
-    """Select the 'Call' video type."""
-    self._select_video()
-    self.click_component(By.XPATH, _TYPE_VIDEO_RADIO_CALL)
-
-
-def _select_video_type_streaming(self):
-    """Select the 'Streaming' video type."""
-    self._select_video()
-    self.click_component(By.XPATH, _TYPE_VIDEO_RADIO_STREAM)
-
-
-# ============================================================
-# MEDIA SELECTORS
-# ============================================================
-
-def _select_media(self):
-    """Open the media type dropdown."""
-    self.click_component(By.XPATH, _TYPE_OPEN_SELECT)
-
-
-def _select_media_type_message(self):
-    """Select 'Message' media."""
-    self._select_media()
-    self.click_component(By.XPATH, _CHECKBOX_MESSAGE)
-
-
-def _select_media_type_audio(self):
-    """Select 'Audio' media."""
-    self._select_media()
-    self.click_component(By.XPATH, _CHECKBOX_AUDIO)
-
-
-def _select_media_type_video(self):
-    """Select 'Video' media."""
-    self._select_media()
-    self.click_component(By.XPATH, _CHECKBOX_VIDEO)
+    element = self.driver.find_element(
+        By.XPATH,
+        self.build_xpath()
+            .element(data_id=SR_SELECT_END_TIME)
+            .descendant()
+            .element(tag="input")
+    )
+    self.driver.execute_script("arguments[0].removeAttribute('readonly');", element)
+    element.clear()
+    element.send_keys(end_time)
