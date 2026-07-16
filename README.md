@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
+import base64
+import json
 import re
 import sys
-from datetime import datetime
+from datetime import datetime, timedelta
 from html import escape, unescape
 
 import requests
@@ -43,6 +45,14 @@ XRAY_STATS_CUSTOM_FIELD = "customfield_11527"
 
 # Le tableau par Test Execution conserve au maximum 7 journées enregistrées.
 MAX_TEST_EXECUTION_HISTORY_DAYS = 7
+
+# Décalage utilisé uniquement pour tester plusieurs journées.
+# 0 = aujourd'hui, 1 = J+1, 2 = J+2...
+TEST_DAY_OFFSET = 0
+
+# Préfixe des anchors invisibles qui mémorisent les pourcentages par journée.
+# Cela évite de dépendre de la manière dont Confluence réécrit le HTML du tableau.
+EXECUTION_HISTORY_METADATA_PREFIX = "night-run-exec-history-"
 
 # Seuils de couleur du pourcentage PASS par Test Execution.
 # >= 90 % : vert
@@ -735,39 +745,191 @@ def parse_existing_history(page_body):
 # }
 # ---------------------------------------------------------------------------
 
-def parse_execution_history_table(page_body):
+def encode_execution_history_metadata(day, day_results):
+    """
+    Stocke les valeurs d'une journée dans une Anchor Confluence invisible.
+
+    Exemple logique :
+    {
+        "d": "2026-07-16",
+        "v": {
+            "PROJ-123": 96.50,
+            "PROJ-456": 82.00
+        }
+    }
+
+    Cette donnée persiste même si Confluence réorganise les balises
+    <thead>, <tbody> ou les styles du tableau.
+    """
+
+    payload = {
+        "d": day,
+        "v": {
+            execution_key: round(
+                float(result["pass_percent"]),
+                2,
+            )
+            for execution_key, result in day_results.items()
+        },
+    }
+
+    raw_payload = json.dumps(
+        payload,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+
+    encoded_payload = base64.urlsafe_b64encode(
+        raw_payload
+    ).decode("ascii").rstrip("=")
+
+    anchor_name = (
+        EXECUTION_HISTORY_METADATA_PREFIX
+        + encoded_payload
+    )
+
+    return build_anchor_macro(anchor_name)
+
+
+def parse_execution_history_metadata(page_body):
+    """
+    Relit les snapshots invisibles écrits par
+    encode_execution_history_metadata().
+    """
+
     history = {}
 
-    blocks = executions_block_pattern().findall(page_body)
+    anchor_value_pattern = re.compile(
+        r'<ac:parameter\b[^>]*\bac:name=""[^>]*>\s*'
+        + re.escape(EXECUTION_HISTORY_METADATA_PREFIX)
+        + r"([A-Za-z0-9_-]+)\s*"
+        r"</ac:parameter>",
+        flags=re.DOTALL | re.IGNORECASE,
+    )
 
-    for block in blocks:
+    for match in anchor_value_pattern.finditer(page_body):
+        encoded_payload = match.group(1)
+
+        padding = "=" * (
+            (-len(encoded_payload)) % 4
+        )
+
+        try:
+            decoded_payload = base64.urlsafe_b64decode(
+                encoded_payload + padding
+            ).decode("utf-8")
+
+            payload = json.loads(decoded_payload)
+            day = payload["d"]
+            values = payload["v"]
+
+            datetime.strptime(day, "%Y-%m-%d")
+
+            history.setdefault(day, {})
+
+            for execution_key, pass_percent in values.items():
+                execution_key = str(execution_key).upper()
+
+                if not ISSUE_KEY_PATTERN.match(execution_key):
+                    continue
+
+                history[day][execution_key] = {
+                    "summary": execution_key,
+                    "pass_percent": float(pass_percent),
+                }
+
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
+            # Une ancienne Anchor incorrecte ne doit pas faire échouer le job.
+            continue
+
+    return history
+
+
+def find_execution_history_tables(page_body):
+    """
+    Recherche le tableau même si Confluence a modifié les balises
+    <thead>/<tbody> ou les attributs des macros.
+    """
+
+    tables = []
+
+    # Méthode principale : bloc entre les deux anchors dédiées.
+    for block in executions_block_pattern().findall(page_body):
         table_match = re.search(
             r"<table\b.*?</table>",
             block,
             flags=re.DOTALL | re.IGNORECASE,
         )
 
-        if not table_match:
-            continue
+        if table_match:
+            tables.append(table_match.group(0))
 
-        table_html = table_match.group(0)
+    # Solution de secours : recherche depuis le titre du tableau.
+    if not tables:
+        fallback_matches = re.findall(
+            r"<h2[^>]*>\s*"
+            r"Pourcentage PASS par Test Execution"
+            r".*?</h2>"
+            r".*?"
+            r"(<table\b.*?</table>)",
+            page_body,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
 
-        header_row_match = re.search(
-            r"<thead>.*?<tr>(.*?)</tr>.*?</thead>",
+        tables.extend(fallback_matches)
+
+    return tables
+
+
+def parse_execution_history_table(page_body):
+    """
+    Récupère l'historique du tableau des Test Executions.
+
+    Priorité :
+    1. métadonnées invisibles et persistantes ;
+    2. lecture du tableau HTML existant pour compatibilité.
+    """
+
+    history = parse_execution_history_metadata(
+        page_body
+    )
+
+    for table_html in find_execution_history_tables(page_body):
+        all_rows = re.findall(
+            r"<tr\b[^>]*>(.*?)</tr>",
             table_html,
             flags=re.DOTALL | re.IGNORECASE,
         )
 
-        if not header_row_match:
-            continue
+        header_index = None
+        header_cells = []
 
-        header_cells = re.findall(
-            r"<th[^>]*>(.*?)</th>",
-            header_row_match.group(1),
-            flags=re.DOTALL | re.IGNORECASE,
-        )
+        # Confluence peut supprimer <thead>.
+        # On cherche donc la première ligne dont la première cellule
+        # contient "Test Execution".
+        for index, row_html in enumerate(all_rows):
+            cells = re.findall(
+                r"<t[hd]\b[^>]*>(.*?)</t[hd]>",
+                row_html,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
 
-        if len(header_cells) < 2:
+            if len(cells) < 2:
+                continue
+
+            first_header = html_to_text(cells[0]).lower()
+
+            if "test execution" in first_header:
+                header_index = index
+                header_cells = cells
+                break
+
+        if header_index is None:
             continue
 
         days = []
@@ -785,32 +947,18 @@ def parse_execution_history_table(page_body):
 
             days.append(day_iso)
 
-        tbody_match = re.search(
-            r"<tbody>(.*?)</tbody>",
-            table_html,
-            flags=re.DOTALL | re.IGNORECASE,
-        )
-
-        if not tbody_match:
-            continue
-
-        row_html_list = re.findall(
-            r"<tr>(.*?)</tr>",
-            tbody_match.group(1),
-            flags=re.DOTALL | re.IGNORECASE,
-        )
-
-        for row_html in row_html_list:
+        for row_html in all_rows[header_index + 1:]:
             cells = re.findall(
-                r"<td[^>]*>(.*?)</td>",
+                r"<td\b[^>]*>(.*?)</td>",
                 row_html,
                 flags=re.DOTALL | re.IGNORECASE,
             )
 
-            if not cells:
+            if len(cells) < 2:
                 continue
 
             first_cell_text = html_to_text(cells[0])
+
             key_match = re.search(
                 r"\b([A-Z][A-Z0-9_]*-\d+)\b",
                 first_cell_text,
@@ -821,6 +969,7 @@ def parse_execution_history_table(page_body):
                 continue
 
             execution_key = key_match.group(1).upper()
+
             summary = first_cell_text.replace(
                 key_match.group(1),
                 "",
@@ -830,8 +979,11 @@ def parse_execution_history_table(page_body):
             if not summary:
                 summary = execution_key
 
-            for index, cell in enumerate(cells[1:]):
-                if index >= len(days) or not days[index]:
+            for cell_index, cell in enumerate(cells[1:]):
+                if (
+                    cell_index >= len(days)
+                    or not days[cell_index]
+                ):
                     continue
 
                 value_text = html_to_text(cell)
@@ -851,13 +1003,21 @@ def parse_execution_history_table(page_body):
                     percent_match.group(1).replace(",", ".")
                 )
 
-                history.setdefault(
-                    days[index],
-                    {},
-                )[execution_key] = {
+                day = days[cell_index]
+
+                # Les valeurs du tableau complètent les métadonnées,
+                # notamment avec le résumé de la Test Execution.
+                history.setdefault(day, {})[
+                    execution_key
+                ] = {
                     "summary": summary,
                     "pass_percent": pass_percent,
                 }
+
+    print(
+        "📚 Historique Test Executions relu : "
+        f"{len(history)} journée(s)"
+    )
 
     return history
 
@@ -897,6 +1057,15 @@ def build_execution_history_table(history):
         return "<p>Aucune donnée de Test Execution disponible.</p>"
 
     ordered_days = sorted(history)
+
+    # Une Anchor invisible par journée conserve les valeurs de manière robuste.
+    metadata_anchors = "\n".join(
+        encode_execution_history_metadata(
+            day,
+            history[day],
+        )
+        for day in ordered_days
+    )
 
     execution_metadata = {}
 
@@ -980,6 +1149,8 @@ def build_execution_history_table(history):
 
     return f"""
 {start_anchor}
+
+{metadata_anchors}
 
 <h2>Pourcentage PASS par Test Execution — 7 derniers jours</h2>
 
@@ -1141,7 +1312,11 @@ def build_dashboard_html(
         pass_rate = 0.0
 
     now = datetime.now().astimezone()
-    today_iso = now.strftime("%Y-%m-%d")
+    snapshot_date = now + timedelta(
+        days=TEST_DAY_OFFSET
+    )
+
+    today_iso = snapshot_date.strftime("%Y-%m-%d")
     last_update = now.strftime("%d/%m/%Y à %H:%M")
 
     # Historique général.
