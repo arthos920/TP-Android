@@ -492,9 +492,9 @@ def html_to_text(value):
     return re.sub(r"\s+", " ", value).strip()
 
 
-def build_pass_rate_badge(pass_percent):
+def get_pass_rate_cell_style(pass_percent):
     """
-    Retourne une valeur colorée pour le tableau des Test Executions.
+    Retourne le style de toute la cellule selon le pourcentage PASS.
 
     Vert   : taux >= PASS_RATE_GREEN_MIN
     Orange : taux >= PASS_RATE_ORANGE_MIN
@@ -504,28 +504,19 @@ def build_pass_rate_badge(pass_percent):
     if pass_percent >= PASS_RATE_GREEN_MIN:
         background_color = "#E3FCEF"
         text_color = "#006644"
-        label = "VERT"
     elif pass_percent >= PASS_RATE_ORANGE_MIN:
         background_color = "#FFF0B3"
         text_color = "#974F0C"
-        label = "ORANGE"
     else:
         background_color = "#FFEBE6"
         text_color = "#BF2600"
-        label = "ROUGE"
 
     return (
-        f'<span title="{label}" '
-        f'style="display:inline-block;'
-        f'min-width:72px;'
-        f'padding:3px 8px;'
-        f'border-radius:12px;'
-        f'background-color:{background_color};'
-        f'color:{text_color};'
-        f'font-weight:bold;'
-        f'text-align:center;">'
-        f'{pass_percent:.2f} %'
-        f'</span>'
+        f"padding:8px;"
+        f"text-align:center;"
+        f"background-color:{background_color};"
+        f"color:{text_color};"
+        f"font-weight:bold;"
     )
 
 
@@ -1118,13 +1109,13 @@ def build_execution_history_table(history):
                 )
             else:
                 pass_percent = float(result["pass_percent"])
-                pass_rate_badge = build_pass_rate_badge(
+                cell_style = get_pass_rate_cell_style(
                     pass_percent
                 )
 
                 value_cells.append(
-                    '<td style="padding:8px;text-align:center;">'
-                    f"{pass_rate_badge}"
+                    f'<td style="{cell_style}">'
+                    f"{pass_percent:.2f} %"
                     "</td>"
                 )
 
