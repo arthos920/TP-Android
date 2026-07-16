@@ -44,6 +44,13 @@ XRAY_STATS_CUSTOM_FIELD = "customfield_11527"
 # Le tableau par Test Execution conserve au maximum 7 journées enregistrées.
 MAX_TEST_EXECUTION_HISTORY_DAYS = 7
 
+# Seuils de couleur du pourcentage PASS par Test Execution.
+# >= 90 % : vert
+# >= 75 % et < 90 % : orange
+# < 75 % : rouge
+PASS_RATE_GREEN_MIN = 90.0
+PASS_RATE_ORANGE_MIN = 75.0
+
 # Anchors persistantes du dashboard principal.
 START_ANCHOR_NAME = "night-run-dashboard-start"
 END_ANCHOR_NAME = "night-run-dashboard-end"
@@ -475,6 +482,43 @@ def html_to_text(value):
     return re.sub(r"\s+", " ", value).strip()
 
 
+def build_pass_rate_badge(pass_percent):
+    """
+    Retourne une valeur colorée pour le tableau des Test Executions.
+
+    Vert   : taux >= PASS_RATE_GREEN_MIN
+    Orange : taux >= PASS_RATE_ORANGE_MIN
+    Rouge  : taux < PASS_RATE_ORANGE_MIN
+    """
+
+    if pass_percent >= PASS_RATE_GREEN_MIN:
+        background_color = "#E3FCEF"
+        text_color = "#006644"
+        label = "VERT"
+    elif pass_percent >= PASS_RATE_ORANGE_MIN:
+        background_color = "#FFF0B3"
+        text_color = "#974F0C"
+        label = "ORANGE"
+    else:
+        background_color = "#FFEBE6"
+        text_color = "#BF2600"
+        label = "ROUGE"
+
+    return (
+        f'<span title="{label}" '
+        f'style="display:inline-block;'
+        f'min-width:72px;'
+        f'padding:3px 8px;'
+        f'border-radius:12px;'
+        f'background-color:{background_color};'
+        f'color:{text_color};'
+        f'font-weight:bold;'
+        f'text-align:center;">'
+        f'{pass_percent:.2f} %'
+        f'</span>'
+    )
+
+
 # ---------------------------------------------------------------------------
 # PERSISTENT ANCHORS
 # ---------------------------------------------------------------------------
@@ -904,9 +948,14 @@ def build_execution_history_table(history):
                     '<td style="padding:8px;text-align:center;">—</td>'
                 )
             else:
+                pass_percent = float(result["pass_percent"])
+                pass_rate_badge = build_pass_rate_badge(
+                    pass_percent
+                )
+
                 value_cells.append(
                     '<td style="padding:8px;text-align:center;">'
-                    f'{result["pass_percent"]:.2f} %'
+                    f"{pass_rate_badge}"
                     "</td>"
                 )
 
