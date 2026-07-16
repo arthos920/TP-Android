@@ -5,7 +5,6 @@ import re
 import sys
 from datetime import datetime
 from html import escape
-from zoneinfo import ZoneInfo
 
 import requests
 import urllib3
@@ -16,7 +15,7 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 # ---------------------------------------------------------------------------
 # GLOBAL SETTINGS
-# Garde ici tes valeurs actuelles de connexion.
+# Remets ici exactement tes valeurs actuelles.
 # ---------------------------------------------------------------------------
 
 # ---------- JIRA ----------
@@ -35,13 +34,11 @@ PROXY_URL = ""
 TEST_PLAN_KEY = ""
 CONFLUENCE_PAGE_TITLE = "Dashboard night run automation"
 CONFLUENCE_SPACE_KEY = "TEI"
-TIMEZONE = "Europe/Paris"
 
-# Champ Jira/Xray qui contient les statistiques du Test Plan.
+# Champ Xray contenant les statistiques consolidées du Test Plan.
 XRAY_STATS_CUSTOM_FIELD = "customfield_11527"
 
-# Marqueurs utilisés pour remplacer uniquement le dashboard géré par ce script.
-# Tout ce qui se trouve en dehors de ces marqueurs reste intact.
+# Le script ne modifie que le contenu placé entre ces deux marqueurs.
 DASHBOARD_START = "<!-- NIGHT_RUN_DASHBOARD_START -->"
 DASHBOARD_END = "<!-- NIGHT_RUN_DASHBOARD_END -->"
 
@@ -74,7 +71,7 @@ def make_session():
 
 # ---------------------------------------------------------------------------
 # JIRA - STATS
-# Cette fonction conserve la logique montrée dans ton code.
+# Logique de récupération Jira conservée.
 # ---------------------------------------------------------------------------
 
 def get_jira_stats(issue_key):
@@ -116,7 +113,7 @@ def get_jira_stats(issue_key):
 
 # ---------------------------------------------------------------------------
 # CONFLUENCE - SEARCH PAGE
-# Cette fonction conserve la logique montrée dans ton code.
+# Logique de recherche de la page conservée.
 # ---------------------------------------------------------------------------
 
 def find_page_id(sess):
@@ -155,7 +152,7 @@ def find_page_id(sess):
 
 # ---------------------------------------------------------------------------
 # CONFLUENCE - PAGE INFO
-# Cette fonction conserve la logique montrée dans ton code.
+# Logique de récupération de la page conservée.
 # ---------------------------------------------------------------------------
 
 def get_page_info(sess, page_id):
@@ -181,8 +178,8 @@ def get_page_info(sess, page_id):
 
 
 # ---------------------------------------------------------------------------
-# CONFLUENCE - GET CURRENT BODY
-# Nécessaire pour conserver les autres tableaux et contenus de la page.
+# CONFLUENCE - CURRENT BODY
+# Sert uniquement à préserver les autres tableaux de la page.
 # ---------------------------------------------------------------------------
 
 def get_page_body(sess, page_id):
@@ -211,7 +208,7 @@ def get_page_body(sess, page_id):
 
 
 # ---------------------------------------------------------------------------
-# HELPERS - VALUES
+# VALUE HELPERS
 # ---------------------------------------------------------------------------
 
 def to_int(value):
@@ -244,7 +241,7 @@ def get_status(stats, status_name):
 
 
 # ---------------------------------------------------------------------------
-# HISTORY - READ EXISTING DAILY SNAPSHOTS
+# HISTORY - READ EXISTING SNAPSHOTS
 # ---------------------------------------------------------------------------
 
 def extract_managed_dashboard(page_body):
@@ -265,17 +262,11 @@ def extract_managed_dashboard(page_body):
 
 def parse_existing_history(page_body):
     """
-    Lit uniquement les lignes historiques ajoutées par ce script.
+    Récupère les résultats des jours précédents.
 
-    Retour :
-    {
-        "2026-07-16": {
-            "pass": 120,
-            "fail": 4,
-            "todo": 2,
-            "pass_rate": 96.77
-        }
-    }
+    La fonction sait lire :
+    - le nouveau format avec NIGHT_RUN_SNAPSHOT ;
+    - l'ancien tableau historique créé par la version précédente.
     """
 
     managed_dashboard = extract_managed_dashboard(page_body)
@@ -285,7 +276,29 @@ def parse_existing_history(page_body):
 
     history = {}
 
-    row_pattern = re.compile(
+    # Nouveau format : commentaire technique placé avant chaque tableau journalier.
+    snapshot_pattern = re.compile(
+        r"<!--\s*NIGHT_RUN_SNAPSHOT\s+"
+        r"date=(\d{4}-\d{2}-\d{2})\s+"
+        r"pass=(\d+)\s+"
+        r"fail=(\d+)\s+"
+        r"todo=(\d+)\s+"
+        r"rate=([\d.,]+)\s*-->",
+        flags=re.IGNORECASE,
+    )
+
+    for match in snapshot_pattern.finditer(managed_dashboard):
+        day, pass_count, fail_count, todo_count, pass_rate = match.groups()
+
+        history[day] = {
+            "pass": int(pass_count),
+            "fail": int(fail_count),
+            "todo": int(todo_count),
+            "pass_rate": float(pass_rate.replace(",", ".")),
+        }
+
+    # Compatibilité avec le tableau historique de la version précédente.
+    old_row_pattern = re.compile(
         r'<tr data-night-run-day="([^"]+)">\s*'
         r'<td[^>]*>.*?</td>\s*'
         r'<td[^>]*>(\d+)</td>\s*'
@@ -296,97 +309,80 @@ def parse_existing_history(page_body):
         flags=re.DOTALL,
     )
 
-    for match in row_pattern.finditer(managed_dashboard):
+    for match in old_row_pattern.finditer(managed_dashboard):
         day, pass_count, fail_count, todo_count, pass_rate = match.groups()
 
-        history[day] = {
-            "pass": int(pass_count),
-            "fail": int(fail_count),
-            "todo": int(todo_count),
-            "pass_rate": float(pass_rate.replace(",", ".")),
-        }
+        if day not in history:
+            history[day] = {
+                "pass": int(pass_count),
+                "fail": int(fail_count),
+                "todo": int(todo_count),
+                "pass_rate": float(pass_rate.replace(",", ".")),
+            }
 
     return history
 
 
 # ---------------------------------------------------------------------------
-# HTML - HISTORY TABLE
+# CHART
+# Un seul graphique, avec deux séries : PASS et FAIL.
+# Les dates deviennent les catégories de l'axe horizontal.
 # ---------------------------------------------------------------------------
-
-def build_history_rows(history):
-    rows = []
-
-    for day in sorted(history):
-        result = history[day]
-
-        display_day = datetime.strptime(
-            day,
-            "%Y-%m-%d",
-        ).strftime("%d/%m/%Y")
-
-        rows.append(
-            f"""
-<tr data-night-run-day="{escape(day)}">
-    <td style="padding:8px;">{escape(display_day)}</td>
-    <td style="padding:8px;text-align:center;">{result["pass"]}</td>
-    <td style="padding:8px;text-align:center;">{result["fail"]}</td>
-    <td style="padding:8px;text-align:center;">{result["todo"]}</td>
-    <td style="padding:8px;text-align:center;">{result["pass_rate"]:.2f} %</td>
-</tr>
-""".strip()
-        )
-
-    return "\n".join(rows)
-
-
-# ---------------------------------------------------------------------------
-# HTML - CHART DATA
-# Le tableau placé dans la macro Chart ne contient que Date / PASS / FAIL.
-# ---------------------------------------------------------------------------
-
-def build_chart_rows(history):
-    rows = []
-
-    for day in sorted(history):
-        result = history[day]
-
-        display_day = datetime.strptime(
-            day,
-            "%Y-%m-%d",
-        ).strftime("%d/%m/%Y")
-
-        rows.append(
-            f"""
-<tr>
-    <td>{escape(display_day)}</td>
-    <td>{result["pass"]}</td>
-    <td>{result["fail"]}</td>
-</tr>
-""".strip()
-        )
-
-    return "\n".join(rows)
-
 
 def build_chart_macro(history):
-    chart_rows = build_chart_rows(history)
+    ordered_days = sorted(history)
+
+    if not ordered_days:
+        return "<p>Aucune donnée disponible pour le graphique.</p>"
+
+    date_headers = []
+    pass_values = []
+    fail_values = []
+
+    for day in ordered_days:
+        display_day = datetime.strptime(
+            day,
+            "%Y-%m-%d",
+        ).strftime("%d/%m/%Y")
+
+        date_headers.append(
+            f"<th>{escape(display_day)}</th>"
+        )
+        pass_values.append(
+            f"<td>{history[day]['pass']}</td>"
+        )
+        fail_values.append(
+            f"<td>{history[day]['fail']}</td>"
+        )
 
     return f"""
 <ac:structured-macro ac:name="chart" ac:schema-version="1">
     <ac:parameter ac:name="type">line</ac:parameter>
     <ac:parameter ac:name="title">Évolution quotidienne des tests PASS / FAIL</ac:parameter>
     <ac:parameter ac:name="legend">true</ac:parameter>
-    <ac:parameter ac:name="displayData">false</ac:parameter>
+    <ac:parameter ac:name="dataOrientation">horizontal</ac:parameter>
+    <ac:parameter ac:name="dataDisplay">false</ac:parameter>
     <ac:parameter ac:name="showShapes">true</ac:parameter>
+    <ac:parameter ac:name="width">1100</ac:parameter>
+    <ac:parameter ac:name="height">420</ac:parameter>
+    <ac:parameter ac:name="xLabel">Date</ac:parameter>
+    <ac:parameter ac:name="yLabel">Nombre de tests</ac:parameter>
+    <ac:parameter ac:name="categoryLabelPosition">down45</ac:parameter>
     <ac:rich-text-body>
         <table>
             <tbody>
                 <tr>
-                    <th>Date</th>
-                    <th>PASS</th>
-                    <th>FAIL</th>
+                    <th>Statut</th>
+                    {''.join(date_headers)}
                 </tr>
-                {chart_rows}
+                <tr>
+                    <th>PASS</th>
+                    {''.join(pass_values)}
+                </tr>
+                <tr>
+                    <th>FAIL</th>
+                    {''.join(fail_values)}
+                </tr>
             </tbody>
         </table>
     </ac:rich-text-body>
@@ -395,17 +391,77 @@ def build_chart_macro(history):
 
 
 # ---------------------------------------------------------------------------
-# HTML - BUILD MANAGED DASHBOARD
+# DAILY TABLES
+# Un tableau séparé par journée, du plus récent au plus ancien.
+# ---------------------------------------------------------------------------
+
+def build_daily_tables(history):
+    blocks = []
+
+    for day in sorted(history, reverse=True):
+        result = history[day]
+
+        display_day = datetime.strptime(
+            day,
+            "%Y-%m-%d",
+        ).strftime("%d/%m/%Y")
+
+        snapshot = (
+            f"<!-- NIGHT_RUN_SNAPSHOT "
+            f"date={day} "
+            f"pass={result['pass']} "
+            f"fail={result['fail']} "
+            f"todo={result['todo']} "
+            f"rate={result['pass_rate']:.2f} -->"
+        )
+
+        blocks.append(
+            f"""
+{snapshot}
+
+<h3>Night run du {escape(display_day)}</h3>
+
+<table border="1" style="width:100%;border-collapse:collapse;">
+    <thead>
+        <tr>
+            <th style="padding:8px;">Statut</th>
+            <th style="padding:8px;text-align:center;">Nombre</th>
+        </tr>
+    </thead>
+    <tbody>
+        <tr>
+            <td style="padding:8px;">PASS</td>
+            <td style="padding:8px;text-align:center;">{result["pass"]}</td>
+        </tr>
+        <tr>
+            <td style="padding:8px;">FAIL</td>
+            <td style="padding:8px;text-align:center;">{result["fail"]}</td>
+        </tr>
+        <tr>
+            <td style="padding:8px;">TODO</td>
+            <td style="padding:8px;text-align:center;">{result["todo"]}</td>
+        </tr>
+        <tr>
+            <td style="padding:8px;"><strong>Taux de réussite</strong></td>
+            <td style="padding:8px;text-align:center;">
+                <strong>{result["pass_rate"]:.2f} %</strong>
+            </td>
+        </tr>
+    </tbody>
+</table>
+""".strip()
+        )
+
+    return "\n<p><br /></p>\n".join(blocks)
+
+
+# ---------------------------------------------------------------------------
+# BUILD DASHBOARD
+# En haut : le graphique général.
+# En dessous : uniquement les tableaux journaliers.
 # ---------------------------------------------------------------------------
 
 def build_dashboard_html(summary, stats, page_body):
-    """
-    Construit uniquement le bloc géré par le script.
-
-    Les autres tableaux et contenus de la page sont conservés par
-    merge_dashboard_into_page().
-    """
-
     pass_status = get_status(stats, "PASS")
     fail_status = get_status(stats, "FAIL")
     todo_status = get_status(stats, "TODO")
@@ -424,17 +480,17 @@ def build_dashboard_html(summary, stats, page_body):
     else:
         pass_rate = 0.0
 
-    now = datetime.now(
-        ZoneInfo(TIMEZONE)
-    )
+    # Utilise directement le fuseau horaire configuré sur Windows / le runner.
+    # Cela évite l'erreur ZoneInfo "No time zone found".
+    now = datetime.now().astimezone()
 
     today_iso = now.strftime("%Y-%m-%d")
     last_update = now.strftime("%d/%m/%Y à %H:%M")
 
     history = parse_existing_history(page_body)
 
-    # Une seule entrée par jour :
-    # si le script est relancé le même jour, l'état du jour est remplacé.
+    # Une seule valeur par journée :
+    # un nouveau lancement le même jour remplace l'état de cette journée.
     history[today_iso] = {
         "pass": pass_count,
         "fail": fail_count,
@@ -442,11 +498,12 @@ def build_dashboard_html(summary, stats, page_body):
         "pass_rate": pass_rate,
     }
 
-    history_rows = build_history_rows(history)
     chart_macro = build_chart_macro(history)
+    daily_tables = build_daily_tables(history)
 
     safe_summary = escape(str(summary))
     safe_test_plan_key = escape(str(TEST_PLAN_KEY))
+    safe_jira_url = escape(str(JIRA_URL).rstrip("/"))
 
     return f"""
 {DASHBOARD_START}
@@ -456,87 +513,38 @@ def build_dashboard_html(summary, stats, page_body):
 <p>
     <strong>Test Plan :</strong>
     {safe_summary}
-    (<a href="{escape(JIRA_URL)}/browse/{safe_test_plan_key}">
-        <code>{safe_test_plan_key}</code>
-    </a>)
+    (
+        <a href="{safe_jira_url}/browse/{safe_test_plan_key}">
+            <code>{safe_test_plan_key}</code>
+        </a>
+    )
 </p>
-
-<h2>État actuel du banc de test</h2>
-
-<table border="1" style="width:100%;border-collapse:collapse;">
-    <thead>
-        <tr>
-            <th style="padding:8px;">Statut</th>
-            <th style="padding:8px;text-align:center;">Nombre</th>
-            <th style="padding:8px;text-align:center;">Pourcentage Xray</th>
-        </tr>
-    </thead>
-    <tbody>
-        <tr>
-            <td style="padding:8px;">PASS</td>
-            <td style="padding:8px;text-align:center;">{pass_count}</td>
-            <td style="padding:8px;text-align:center;">{pass_status["percent"]:.2f} %</td>
-        </tr>
-        <tr>
-            <td style="padding:8px;">FAIL</td>
-            <td style="padding:8px;text-align:center;">{fail_count}</td>
-            <td style="padding:8px;text-align:center;">{fail_status["percent"]:.2f} %</td>
-        </tr>
-        <tr>
-            <td style="padding:8px;">TODO</td>
-            <td style="padding:8px;text-align:center;">{todo_count}</td>
-            <td style="padding:8px;text-align:center;">{todo_status["percent"]:.2f} %</td>
-        </tr>
-    </tbody>
-</table>
-
-<p>
-    <strong>Taux de réussite sur les tests terminés :</strong>
-    {pass_rate:.2f} %
-</p>
-
-<h2>Évolution dans le temps</h2>
-
-{chart_macro}
-
-<h2>Historique quotidien</h2>
-
-<table border="1" style="width:100%;border-collapse:collapse;">
-    <thead>
-        <tr>
-            <th style="padding:8px;">Date</th>
-            <th style="padding:8px;text-align:center;">PASS</th>
-            <th style="padding:8px;text-align:center;">FAIL</th>
-            <th style="padding:8px;text-align:center;">TODO</th>
-            <th style="padding:8px;text-align:center;">Taux de réussite</th>
-        </tr>
-    </thead>
-    <tbody>
-        {history_rows}
-    </tbody>
-</table>
 
 <p>
     <em>Dernière mise à jour automatique : {escape(last_update)}</em>
 </p>
+
+<h2>Évolution globale PASS / FAIL</h2>
+
+{chart_macro}
+
+<p><br /></p>
+
+<h2>Résultats journaliers</h2>
+
+{daily_tables}
 
 {DASHBOARD_END}
 """.strip()
 
 
 # ---------------------------------------------------------------------------
-# MERGE - PRESERVE OTHER TABLES AND CONTENT
+# MERGE
+# Le dashboard est toujours replacé au début de la page.
+# Les autres tableaux/contenus sont conservés en dessous.
 # ---------------------------------------------------------------------------
 
 def merge_dashboard_into_page(existing_body, dashboard_html):
-    """
-    Si le bloc existe déjà, il est remplacé.
-
-    Sinon, il est ajouté à la fin de la page.
-
-    Aucun autre tableau ou contenu Confluence n'est supprimé.
-    """
-
     pattern = re.compile(
         re.escape(DASHBOARD_START)
         + r".*?"
@@ -544,16 +552,21 @@ def merge_dashboard_into_page(existing_body, dashboard_html):
         flags=re.DOTALL,
     )
 
-    if pattern.search(existing_body):
-        return pattern.sub(
-            dashboard_html,
-            existing_body,
-            count=1,
-        )
+    # Retire uniquement l'ancienne version du dashboard.
+    body_without_dashboard = pattern.sub(
+        "",
+        existing_body,
+        count=1,
+    ).strip()
 
-    separator = "<p><br /></p>" if existing_body.strip() else ""
+    if not body_without_dashboard:
+        return dashboard_html
 
-    return existing_body + separator + dashboard_html
+    return (
+        dashboard_html
+        + "<p><br /></p>"
+        + body_without_dashboard
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -614,7 +627,7 @@ if __name__ == "__main__":
     sess = make_session()
 
     try:
-        # 1. JIRA - récupération de l'état consolidé du Test Plan
+        # 1. JIRA - stats du Test Plan
         print("🚀 Extraction des statistiques JIRA ...")
 
         jira_info = get_jira_stats(TEST_PLAN_KEY)
@@ -640,21 +653,20 @@ if __name__ == "__main__":
             f"- version actuelle : {version}"
         )
 
-        # 4. Contenu actuel de la page
+        # 4. Contenu actuel, pour préserver les autres tableaux
         current_body = get_page_body(
             sess,
             page_id,
         )
 
-        # 5. Bloc dashboard avec snapshot journalier
+        # 5. Dashboard : graphique général + tableaux journaliers
         dashboard_html = build_dashboard_html(
             summary,
             stats,
             current_body,
         )
 
-        # 6. Fusion avec la page existante
-        # Les autres tableaux restent intacts.
+        # 6. Dashboard en haut, autres contenus conservés dessous
         full_page_body = merge_dashboard_into_page(
             current_body,
             dashboard_html,
