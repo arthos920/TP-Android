@@ -38,9 +38,10 @@ CONFLUENCE_SPACE_KEY = "TEI"
 # Champ Xray contenant les statistiques consolidées du Test Plan.
 XRAY_STATS_CUSTOM_FIELD = "customfield_11527"
 
-# Le script ne modifie que le contenu placé entre ces deux marqueurs.
-DASHBOARD_START = "<!-- NIGHT_RUN_DASHBOARD_START -->"
-DASHBOARD_END = "<!-- NIGHT_RUN_DASHBOARD_END -->"
+# Les commentaires HTML utilisés précédemment ne sont pas toujours conservés
+# par Confluence. On utilise maintenant deux macros Anchor persistantes.
+START_ANCHOR_NAME = "night-run-dashboard-start"
+END_ANCHOR_NAME = "night-run-dashboard-end"
 
 
 # ---------------------------------------------------------------------------
@@ -179,7 +180,7 @@ def get_page_info(sess, page_id):
 
 # ---------------------------------------------------------------------------
 # CONFLUENCE - CURRENT BODY
-# Sert uniquement à préserver les autres tableaux de la page.
+# Sert uniquement à préserver les autres contenus de la page.
 # ---------------------------------------------------------------------------
 
 def get_page_body(sess, page_id):
@@ -241,84 +242,219 @@ def get_status(stats, status_name):
 
 
 # ---------------------------------------------------------------------------
-# HISTORY - READ EXISTING SNAPSHOTS
+# PERSISTENT ANCHORS
 # ---------------------------------------------------------------------------
 
-def extract_managed_dashboard(page_body):
-    pattern = re.compile(
-        re.escape(DASHBOARD_START)
-        + r".*?"
-        + re.escape(DASHBOARD_END),
-        flags=re.DOTALL,
+def build_anchor_macro(anchor_name):
+    return f"""
+<ac:structured-macro ac:name="anchor" ac:schema-version="1">
+    <ac:parameter ac:name="">{escape(anchor_name)}</ac:parameter>
+</ac:structured-macro>
+""".strip()
+
+
+def anchor_macro_pattern(anchor_name):
+    """
+    Regex tolérante aux attributs supplémentaires ajoutés par Confluence,
+    par exemple ac:macro-id.
+    """
+
+    return (
+        r'<ac:structured-macro\b'
+        r'(?=[^>]*\bac:name="anchor")'
+        r'[^>]*>'
+        r'.*?'
+        r'<ac:parameter\b[^>]*\bac:name=""[^>]*>'
+        r'\s*'
+        + re.escape(anchor_name)
+        + r'\s*'
+        r'</ac:parameter>'
+        r'.*?'
+        r'</ac:structured-macro>'
     )
 
-    match = pattern.search(page_body)
 
-    if not match:
-        return ""
+def dashboard_block_pattern():
+    return re.compile(
+        anchor_macro_pattern(START_ANCHOR_NAME)
+        + r".*?"
+        + anchor_macro_pattern(END_ANCHOR_NAME),
+        flags=re.DOTALL | re.IGNORECASE,
+    )
 
-    return match.group(0)
+
+def extract_managed_blocks(page_body):
+    return dashboard_block_pattern().findall(page_body)
+
+
+# ---------------------------------------------------------------------------
+# HISTORY - READ EXISTING VALUES
+# ---------------------------------------------------------------------------
+
+def add_history_value(
+    history,
+    date_value,
+    pass_count,
+    fail_count,
+    todo_count,
+    pass_rate,
+):
+    try:
+        parsed_date = datetime.strptime(
+            date_value,
+            "%d/%m/%Y",
+        )
+    except ValueError:
+        return
+
+    day_iso = parsed_date.strftime("%Y-%m-%d")
+
+    history[day_iso] = {
+        "pass": int(pass_count),
+        "fail": int(fail_count),
+        "todo": int(todo_count),
+        "pass_rate": float(
+            str(pass_rate).replace(",", ".")
+        ),
+    }
+
+
+def parse_general_history_table(block, history):
+    """
+    Lit le tableau général de la nouvelle version :
+
+    Date | PASS | FAIL | TODO | Taux de réussite
+    """
+
+    heading_match = re.search(
+        r"<h2>\s*Historique général\s*</h2>\s*"
+        r"(<table\b.*?</table>)",
+        block,
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    if not heading_match:
+        return
+
+    table_html = heading_match.group(1)
+
+    row_pattern = re.compile(
+        r"<tr>\s*"
+        r"<td[^>]*>\s*(\d{2}/\d{2}/\d{4})\s*</td>\s*"
+        r"<td[^>]*>\s*(\d+)\s*</td>\s*"
+        r"<td[^>]*>\s*(\d+)\s*</td>\s*"
+        r"<td[^>]*>\s*(\d+)\s*</td>\s*"
+        r"<td[^>]*>\s*([\d.,]+)\s*%\s*</td>\s*"
+        r"</tr>",
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    for match in row_pattern.finditer(table_html):
+        add_history_value(
+            history,
+            *match.groups(),
+        )
+
+
+def parse_legacy_daily_tables(page_body, history):
+    """
+    Récupère les données des tableaux journaliers déjà présents,
+    y compris dans les copies dupliquées actuelles.
+    """
+
+    daily_pattern = re.compile(
+        r"<h3>\s*Night run du\s+"
+        r"(\d{2}/\d{2}/\d{4})\s*</h3>\s*"
+        r"(<table\b.*?</table>)",
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    for match in daily_pattern.finditer(page_body):
+        display_day = match.group(1)
+        table_html = match.group(2)
+
+        def read_count(label):
+            label_match = re.search(
+                rf"<td[^>]*>\s*{re.escape(label)}\s*</td>\s*"
+                r"<td[^>]*>\s*(\d+)\s*</td>",
+                table_html,
+                flags=re.DOTALL | re.IGNORECASE,
+            )
+            return int(label_match.group(1)) if label_match else 0
+
+        rate_match = re.search(
+            r"<td[^>]*>\s*"
+            r"(?:<strong>)?\s*Taux de réussite\s*(?:</strong>)?"
+            r"\s*</td>\s*"
+            r"<td[^>]*>.*?"
+            r"([\d.,]+)\s*%",
+            table_html,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+
+        pass_rate = (
+            float(rate_match.group(1).replace(",", "."))
+            if rate_match
+            else 0.0
+        )
+
+        add_history_value(
+            history,
+            display_day,
+            read_count("PASS"),
+            read_count("FAIL"),
+            read_count("TODO"),
+            pass_rate,
+        )
+
+
+def parse_legacy_history_rows(page_body, history):
+    """
+    Compatibilité avec l'ancien tableau historique horizontal.
+    """
+
+    row_pattern = re.compile(
+        r'<tr[^>]*(?:data-night-run-day="[^"]+")?[^>]*>\s*'
+        r'<td[^>]*>\s*(\d{2}/\d{2}/\d{4})\s*</td>\s*'
+        r'<td[^>]*>\s*(\d+)\s*</td>\s*'
+        r'<td[^>]*>\s*(\d+)\s*</td>\s*'
+        r'<td[^>]*>\s*(\d+)\s*</td>\s*'
+        r'<td[^>]*>\s*([\d.,]+)\s*%\s*</td>\s*'
+        r'</tr>',
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    for match in row_pattern.finditer(page_body):
+        add_history_value(
+            history,
+            *match.groups(),
+        )
 
 
 def parse_existing_history(page_body):
     """
-    Récupère les résultats des jours précédents.
-
-    La fonction sait lire :
-    - le nouveau format avec NIGHT_RUN_SNAPSHOT ;
-    - l'ancien tableau historique créé par la version précédente.
+    Consolide l'historique des versions précédentes et de la version actuelle.
+    Une date n'apparaît qu'une fois dans le dictionnaire final.
     """
-
-    managed_dashboard = extract_managed_dashboard(page_body)
-
-    if not managed_dashboard:
-        return {}
 
     history = {}
 
-    # Nouveau format : commentaire technique placé avant chaque tableau journalier.
-    snapshot_pattern = re.compile(
-        r"<!--\s*NIGHT_RUN_SNAPSHOT\s+"
-        r"date=(\d{4}-\d{2}-\d{2})\s+"
-        r"pass=(\d+)\s+"
-        r"fail=(\d+)\s+"
-        r"todo=(\d+)\s+"
-        r"rate=([\d.,]+)\s*-->",
-        flags=re.IGNORECASE,
+    # Nouvelle version avec anchors.
+    for block in extract_managed_blocks(page_body):
+        parse_general_history_table(
+            block,
+            history,
+        )
+
+    # Anciennes versions actuellement dupliquées.
+    parse_legacy_daily_tables(
+        page_body,
+        history,
     )
-
-    for match in snapshot_pattern.finditer(managed_dashboard):
-        day, pass_count, fail_count, todo_count, pass_rate = match.groups()
-
-        history[day] = {
-            "pass": int(pass_count),
-            "fail": int(fail_count),
-            "todo": int(todo_count),
-            "pass_rate": float(pass_rate.replace(",", ".")),
-        }
-
-    # Compatibilité avec le tableau historique de la version précédente.
-    old_row_pattern = re.compile(
-        r'<tr data-night-run-day="([^"]+)">\s*'
-        r'<td[^>]*>.*?</td>\s*'
-        r'<td[^>]*>(\d+)</td>\s*'
-        r'<td[^>]*>(\d+)</td>\s*'
-        r'<td[^>]*>(\d+)</td>\s*'
-        r'<td[^>]*>([\d.,]+)\s*%</td>\s*'
-        r'</tr>',
-        flags=re.DOTALL,
+    parse_legacy_history_rows(
+        page_body,
+        history,
     )
-
-    for match in old_row_pattern.finditer(managed_dashboard):
-        day, pass_count, fail_count, todo_count, pass_rate = match.groups()
-
-        if day not in history:
-            history[day] = {
-                "pass": int(pass_count),
-                "fail": int(fail_count),
-                "todo": int(todo_count),
-                "pass_rate": float(pass_rate.replace(",", ".")),
-            }
 
     return history
 
@@ -326,7 +462,6 @@ def parse_existing_history(page_body):
 # ---------------------------------------------------------------------------
 # CHART
 # Un seul graphique, avec deux séries : PASS et FAIL.
-# Les dates deviennent les catégories de l'axe horizontal.
 # ---------------------------------------------------------------------------
 
 def build_chart_macro(history):
@@ -391,13 +526,15 @@ def build_chart_macro(history):
 
 
 # ---------------------------------------------------------------------------
-# DAILY TABLES
-# Un tableau séparé par journée, du plus récent au plus ancien.
+# ONE GENERAL HISTORY TABLE
+# Une seule ligne par journée.
+# Un nouveau run le même jour remplace les valeurs de cette journée.
 # ---------------------------------------------------------------------------
 
-def build_daily_tables(history):
-    blocks = []
+def build_general_history_table(history):
+    rows = []
 
+    # Les dates les plus récentes apparaissent en premier.
     for day in sorted(history, reverse=True):
         result = history[day]
 
@@ -406,59 +543,41 @@ def build_daily_tables(history):
             "%Y-%m-%d",
         ).strftime("%d/%m/%Y")
 
-        snapshot = (
-            f"<!-- NIGHT_RUN_SNAPSHOT "
-            f"date={day} "
-            f"pass={result['pass']} "
-            f"fail={result['fail']} "
-            f"todo={result['todo']} "
-            f"rate={result['pass_rate']:.2f} -->"
+        rows.append(
+            f"""
+<tr>
+    <td style="padding:8px;">{escape(display_day)}</td>
+    <td style="padding:8px;text-align:center;">{result["pass"]}</td>
+    <td style="padding:8px;text-align:center;">{result["fail"]}</td>
+    <td style="padding:8px;text-align:center;">{result["todo"]}</td>
+    <td style="padding:8px;text-align:center;">{result["pass_rate"]:.2f} %</td>
+</tr>
+""".strip()
         )
 
-        blocks.append(
-            f"""
-{snapshot}
-
-<h3>Night run du {escape(display_day)}</h3>
+    return f"""
+<h2>Historique général</h2>
 
 <table border="1" style="width:100%;border-collapse:collapse;">
     <thead>
         <tr>
-            <th style="padding:8px;">Statut</th>
-            <th style="padding:8px;text-align:center;">Nombre</th>
+            <th style="padding:8px;">Date</th>
+            <th style="padding:8px;text-align:center;">PASS</th>
+            <th style="padding:8px;text-align:center;">FAIL</th>
+            <th style="padding:8px;text-align:center;">TODO</th>
+            <th style="padding:8px;text-align:center;">Taux de réussite</th>
         </tr>
     </thead>
     <tbody>
-        <tr>
-            <td style="padding:8px;">PASS</td>
-            <td style="padding:8px;text-align:center;">{result["pass"]}</td>
-        </tr>
-        <tr>
-            <td style="padding:8px;">FAIL</td>
-            <td style="padding:8px;text-align:center;">{result["fail"]}</td>
-        </tr>
-        <tr>
-            <td style="padding:8px;">TODO</td>
-            <td style="padding:8px;text-align:center;">{result["todo"]}</td>
-        </tr>
-        <tr>
-            <td style="padding:8px;"><strong>Taux de réussite</strong></td>
-            <td style="padding:8px;text-align:center;">
-                <strong>{result["pass_rate"]:.2f} %</strong>
-            </td>
-        </tr>
+        {''.join(rows)}
     </tbody>
 </table>
 """.strip()
-        )
-
-    return "\n<p><br /></p>\n".join(blocks)
 
 
 # ---------------------------------------------------------------------------
 # BUILD DASHBOARD
-# En haut : le graphique général.
-# En dessous : uniquement les tableaux journaliers.
+# Un graphique + un tableau général.
 # ---------------------------------------------------------------------------
 
 def build_dashboard_html(summary, stats, page_body):
@@ -480,17 +599,15 @@ def build_dashboard_html(summary, stats, page_body):
     else:
         pass_rate = 0.0
 
-    # Utilise directement le fuseau horaire configuré sur Windows / le runner.
-    # Cela évite l'erreur ZoneInfo "No time zone found".
     now = datetime.now().astimezone()
-
     today_iso = now.strftime("%Y-%m-%d")
     last_update = now.strftime("%d/%m/%Y à %H:%M")
 
+    # Récupère les données des blocs actuels, y compris les copies dupliquées.
     history = parse_existing_history(page_body)
 
-    # Une seule valeur par journée :
-    # un nouveau lancement le même jour remplace l'état de cette journée.
+    # Une seule entrée par date.
+    # Deux exécutions le même jour mettent à jour la même ligne.
     history[today_iso] = {
         "pass": pass_count,
         "fail": fail_count,
@@ -499,14 +616,21 @@ def build_dashboard_html(summary, stats, page_body):
     }
 
     chart_macro = build_chart_macro(history)
-    daily_tables = build_daily_tables(history)
+    history_table = build_general_history_table(history)
 
     safe_summary = escape(str(summary))
     safe_test_plan_key = escape(str(TEST_PLAN_KEY))
     safe_jira_url = escape(str(JIRA_URL).rstrip("/"))
 
+    start_anchor = build_anchor_macro(
+        START_ANCHOR_NAME
+    )
+    end_anchor = build_anchor_macro(
+        END_ANCHOR_NAME
+    )
+
     return f"""
-{DASHBOARD_START}
+{start_anchor}
 
 <h1>Dashboard Night Run Automation</h1>
 
@@ -530,42 +654,116 @@ def build_dashboard_html(summary, stats, page_body):
 
 <p><br /></p>
 
-<h2>Résultats journaliers</h2>
+{history_table}
 
-{daily_tables}
-
-{DASHBOARD_END}
+{end_anchor}
 """.strip()
 
 
 # ---------------------------------------------------------------------------
+# LEGACY CLEANUP
+# Supprime précisément les dashboards générés par les deux versions précédentes.
+# Les autres tableaux de la page sont conservés.
+# ---------------------------------------------------------------------------
+
+def remove_legacy_daily_dashboard_blocks(page_body):
+    """
+    Ancienne version :
+    H1 Dashboard...
+    ...
+    H2 Résultats journaliers
+    H3 Night run du ...
+    table
+    """
+
+    legacy_pattern = re.compile(
+        r"<h1>\s*Dashboard Night Run Automation\s*</h1>"
+        r".*?"
+        r"<h2>\s*Résultats journaliers\s*</h2>"
+        r"(?:"
+        r"\s*(?:<!--.*?-->\s*)?"
+        r"<h3>\s*Night run du\s+\d{2}/\d{2}/\d{4}\s*</h3>"
+        r"\s*<table\b.*?</table>"
+        r"\s*(?:<p>\s*<br\s*/?>\s*</p>)?"
+        r")+",
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    return legacy_pattern.subn(
+        "",
+        page_body,
+    )
+
+
+def remove_legacy_single_history_blocks(page_body):
+    """
+    Version encore plus ancienne :
+    H1 Dashboard...
+    H2 État actuel...
+    H2/H3 Historique quotidien
+    table historique
+    """
+
+    legacy_pattern = re.compile(
+        r"<h1>\s*Dashboard Night Run Automation\s*</h1>"
+        r".*?"
+        r"<h[23]>\s*Historique quotidien\s*</h[23]>"
+        r"\s*<table\b.*?</table>"
+        r"(?:\s*<p>.*?Dernière mise à jour automatique.*?</p>)?",
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    return legacy_pattern.subn(
+        "",
+        page_body,
+    )
+
+
+# ---------------------------------------------------------------------------
 # MERGE
-# Le dashboard est toujours replacé au début de la page.
-# Les autres tableaux/contenus sont conservés en dessous.
+# Supprime tous les dashboards gérés, y compris les copies dupliquées,
+# puis ajoute exactement un dashboard au début de la page.
 # ---------------------------------------------------------------------------
 
 def merge_dashboard_into_page(existing_body, dashboard_html):
-    pattern = re.compile(
-        re.escape(DASHBOARD_START)
-        + r".*?"
-        + re.escape(DASHBOARD_END),
-        flags=re.DOTALL,
+    body = existing_body
+
+    # 1. Retire toutes les copies de la nouvelle version avec anchors.
+    body, managed_count = dashboard_block_pattern().subn(
+        "",
+        body,
     )
 
-    # Retire uniquement l'ancienne version du dashboard.
-    body_without_dashboard = pattern.sub(
-        "",
-        existing_body,
-        count=1,
-    ).strip()
+    # 2. Nettoie les copies créées par les versions précédentes.
+    body, legacy_daily_count = remove_legacy_daily_dashboard_blocks(
+        body
+    )
+    body, legacy_history_count = remove_legacy_single_history_blocks(
+        body
+    )
 
-    if not body_without_dashboard:
+    removed_count = (
+        managed_count
+        + legacy_daily_count
+        + legacy_history_count
+    )
+
+    print(
+        f"🧹 Blocs dashboard supprimés avant reconstruction : "
+        f"{removed_count}"
+    )
+
+    remaining_body = body.strip()
+
+    if not remaining_body:
         return dashboard_html
 
+    # Le dashboard reste en haut.
+    # Les autres tableaux et contenus existants restent en dessous.
     return (
         dashboard_html
         + "<p><br /></p>"
-        + body_without_dashboard
+        + remaining_body
     )
 
 
@@ -659,14 +857,14 @@ if __name__ == "__main__":
             page_id,
         )
 
-        # 5. Dashboard : graphique général + tableaux journaliers
+        # 5. Construit un seul dashboard
         dashboard_html = build_dashboard_html(
             summary,
             stats,
             current_body,
         )
 
-        # 6. Dashboard en haut, autres contenus conservés dessous
+        # 6. Supprime toutes les anciennes copies et insère le dashboard unique
         full_page_body = merge_dashboard_into_page(
             current_body,
             dashboard_html,
