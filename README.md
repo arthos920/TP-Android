@@ -1,20 +1,20 @@
+#Requires -Version 5.1
+
 # -------------------------------------------------------
-# Configuration GitLab
+# Configuration GitLab : valeurs à adapter
 # -------------------------------------------------------
 
 $gitLabUrl = "https://XXXX/gitlab"
 $projectId = "XXXX"
 $ref = "main"
-
-# Option 1 : token directement dans le script
 $token = "XXXX"
 
-# Option 2 recommandée : token dans une variable d'environnement
-# $token = $env:GITLAB_PRIVATE_TOKEN
+# Supprime le dernier "/" s'il est présent
+$gitLabUrl = $gitLabUrl.TrimEnd("/")
 
 
 # -------------------------------------------------------
-# Saisie de l'Issue Key
+# Demande de l'Issue Key Jira
 # -------------------------------------------------------
 
 do {
@@ -26,24 +26,35 @@ do {
 }
 while ([string]::IsNullOrWhiteSpace($issueKey))
 
+$issueKey = $issueKey.Trim().ToUpper()
+
 
 # -------------------------------------------------------
-# Saisie de l'adresse e-mail
+# Demande de l'adresse e-mail
 # -------------------------------------------------------
 
 do {
     $email = Read-Host "Entrez votre adresse e-mail"
 
-    if ([string]::IsNullOrWhiteSpace($email)) {
-        Write-Host "L'adresse e-mail est obligatoire."
+    $emailIsValid = (
+        -not [string]::IsNullOrWhiteSpace($email) -and
+        $email -match "^[^@\s]+@[^@\s]+\.[^@\s]+$"
+    )
+
+    if (-not $emailIsValid) {
+        Write-Host "Veuillez entrer une adresse e-mail valide."
     }
 }
-while ([string]::IsNullOrWhiteSpace($email))
+while (-not $emailIsValid)
+
+$email = $email.Trim()
 
 
 # -------------------------------------------------------
 # Choix du LAB
 # -------------------------------------------------------
+
+$validLab = $false
 
 do {
     Write-Host ""
@@ -72,7 +83,6 @@ do {
 
         default {
             Write-Host "Choix invalide. Entrez 1, 2 ou 3."
-            $validLab = $false
         }
     }
 }
@@ -84,14 +94,15 @@ while (-not $validLab)
 # -------------------------------------------------------
 
 Write-Host ""
-Write-Host "Informations de lancement :"
+Write-Host "Informations de lancement"
+Write-Host "-------------------------"
 Write-Host "Issue Key : $issueKey"
 Write-Host "Email     : $email"
 Write-Host "LAB       : $lab"
 Write-Host "Branche   : $ref"
 Write-Host ""
 
-$confirmation = Read-Host "Voulez-vous lancer la pipeline ? (O/N)"
+$confirmation = Read-Host "Lancer la pipeline ? (O/N)"
 
 if ($confirmation -notin @("O", "o", "Oui", "oui", "Y", "y", "Yes", "yes")) {
     Write-Host "Lancement annulé."
@@ -100,7 +111,7 @@ if ($confirmation -notin @("O", "o", "Oui", "oui", "Y", "y", "Yes", "yes")) {
 
 
 # -------------------------------------------------------
-# Création de la requête GitLab
+# Préparation de la requête GitLab
 # -------------------------------------------------------
 
 $headers = @{
@@ -126,29 +137,128 @@ $body = @{
     )
 } | ConvertTo-Json -Depth 5
 
+$triggerUrl = "$gitLabUrl/api/v4/projects/$projectId/pipeline"
+
 
 # -------------------------------------------------------
 # Déclenchement de la pipeline
 # -------------------------------------------------------
 
+Write-Host ""
+Write-Host "Déclenchement de la pipeline..."
+
 try {
     $response = Invoke-RestMethod `
-        -Uri "$gitLabUrl/api/v4/projects/$projectId/pipeline" `
+        -Uri $triggerUrl `
         -Method Post `
         -Headers $headers `
         -ContentType "application/json" `
-        -Body $body
-
-    Write-Host ""
-    Write-Host "Pipeline lancée avec succès."
-    Write-Host "ID     : $($response.id)"
-    Write-Host "Statut : $($response.status)"
-    Write-Host "LAB    : $lab"
-    Write-Host "URL    : $($response.web_url)"
+        -Body $body `
+        -ErrorAction Stop
 }
 catch {
     Write-Host ""
-    Write-Host "Erreur lors du lancement de la pipeline."
+    Write-Host "Erreur lors du déclenchement de la pipeline."
     Write-Host $_.Exception.Message
     exit 1
 }
+
+
+# -------------------------------------------------------
+# Informations de la pipeline créée
+# -------------------------------------------------------
+
+$pipelineId = $response.id
+$pipelineWebUrl = $response.web_url
+$pipelineApiUrl = "$gitLabUrl/api/v4/projects/$projectId/pipelines/$pipelineId"
+
+Write-Host ""
+Write-Host "Pipeline lancée."
+Write-Host "ID  : $pipelineId"
+Write-Host "URL : $pipelineWebUrl"
+Write-Host ""
+Write-Host "Suivi de la pipeline toutes les 2 secondes..."
+Write-Host ""
+
+
+# -------------------------------------------------------
+# Suivi de l'état de la pipeline
+# -------------------------------------------------------
+
+$finalStatuses = @(
+    "success",
+    "failed",
+    "canceled",
+    "skipped",
+    "manual"
+)
+
+$status = ""
+
+do {
+    try {
+        $pipeline = Invoke-RestMethod `
+            -Uri $pipelineApiUrl `
+            -Method Get `
+            -Headers $headers `
+            -ErrorAction Stop
+
+        $status = $pipeline.status
+
+        Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Statut : $status"
+    }
+    catch {
+        Write-Host "[$(Get-Date -Format 'HH:mm:ss')] Impossible de récupérer le statut."
+        Write-Host $_.Exception.Message
+    }
+
+    if ($status -notin $finalStatuses) {
+        Start-Sleep -Seconds 2
+    }
+}
+while ($status -notin $finalStatuses)
+
+
+# -------------------------------------------------------
+# Résultat final
+# -------------------------------------------------------
+
+Write-Host ""
+Write-Host "Résultat final"
+Write-Host "--------------"
+
+switch ($status) {
+    "success" {
+        Write-Host "La pipeline s'est terminée avec succès."
+        $exitCode = 0
+    }
+
+    "failed" {
+        Write-Host "La pipeline a échoué."
+        $exitCode = 1
+    }
+
+    "canceled" {
+        Write-Host "La pipeline a été annulée."
+        $exitCode = 1
+    }
+
+    "skipped" {
+        Write-Host "La pipeline a été ignorée."
+        $exitCode = 1
+    }
+
+    "manual" {
+        Write-Host "La pipeline attend une action manuelle dans GitLab."
+        $exitCode = 0
+    }
+
+    default {
+        Write-Host "Statut final inconnu : $status"
+        $exitCode = 1
+    }
+}
+
+Write-Host "URL : $pipelineWebUrl"
+
+exit $exitCode
