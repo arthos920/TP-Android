@@ -1856,3 +1856,4 @@ if __name__ == "__main__":
 
     except Exception as error:
         print(f"❌ Une erreur est survenue : {error}")
+        sys.exit(1)
