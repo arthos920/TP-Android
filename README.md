@@ -11,6 +11,8 @@ from html import escape, unescape
 import requests
 import urllib3
 
+from datamanager import DataManager
+
 
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
@@ -63,51 +65,73 @@ PASS_RATE_ORANGE_MIN = 75.0
 
 # ---------------------------------------------------------------------------
 # COMPOSANTS AFFICHÉS AU DÉBUT DU DASHBOARD
-# Remplace les noms et les URL par tes vraies valeurs.
+#
+# Le nom affiché est défini ici.
+# L'URL est lue dans Excel via DataManager.
+#
+# obj_alias correspond à l'alias passé à :
+# DataManager(datafile=..., actor=obj_alias)
+# returnExcelDict(obj_alias)
+#
+# url_key correspond à la clé du dictionnaire Excel contenant l'URL.
 # ---------------------------------------------------------------------------
 
+COMPONENTS_DATAFILE = "FROM_SETTINGS_FILE"
+
 COMPONENT_1_NAME = "Toto composant"
-COMPONENT_1_URL = "http://xxxx"
+COMPONENT_1_ALIAS = "TOTO"
+COMPONENT_1_URL_KEY = "url"
 
 COMPONENT_2_NAME = "Composant 2"
-COMPONENT_2_URL = "http://xxxx"
+COMPONENT_2_ALIAS = "COMPONENT_2"
+COMPONENT_2_URL_KEY = "url"
 
 COMPONENT_3_NAME = "Composant 3"
-COMPONENT_3_URL = "http://xxxx"
+COMPONENT_3_ALIAS = "COMPONENT_3"
+COMPONENT_3_URL_KEY = "url"
 
 COMPONENT_4_NAME = "Composant 4"
-COMPONENT_4_URL = "http://xxxx"
+COMPONENT_4_ALIAS = "COMPONENT_4"
+COMPONENT_4_URL_KEY = "url"
 
 COMPONENT_5_NAME = "Composant 5"
-COMPONENT_5_URL = "http://xxxx"
+COMPONENT_5_ALIAS = "COMPONENT_5"
+COMPONENT_5_URL_KEY = "url"
 
 COMPONENT_6_NAME = "Composant 6"
-COMPONENT_6_URL = "http://xxxx"
+COMPONENT_6_ALIAS = "COMPONENT_6"
+COMPONENT_6_URL_KEY = "url"
 
-COMPONENTS = [
+COMPONENT_SETTINGS = [
     {
         "name": COMPONENT_1_NAME,
-        "url": COMPONENT_1_URL,
+        "alias": COMPONENT_1_ALIAS,
+        "url_key": COMPONENT_1_URL_KEY,
     },
     {
         "name": COMPONENT_2_NAME,
-        "url": COMPONENT_2_URL,
+        "alias": COMPONENT_2_ALIAS,
+        "url_key": COMPONENT_2_URL_KEY,
     },
     {
         "name": COMPONENT_3_NAME,
-        "url": COMPONENT_3_URL,
+        "alias": COMPONENT_3_ALIAS,
+        "url_key": COMPONENT_3_URL_KEY,
     },
     {
         "name": COMPONENT_4_NAME,
-        "url": COMPONENT_4_URL,
+        "alias": COMPONENT_4_ALIAS,
+        "url_key": COMPONENT_4_URL_KEY,
     },
     {
         "name": COMPONENT_5_NAME,
-        "url": COMPONENT_5_URL,
+        "alias": COMPONENT_5_ALIAS,
+        "url_key": COMPONENT_5_URL_KEY,
     },
     {
         "name": COMPONENT_6_NAME,
-        "url": COMPONENT_6_URL,
+        "alias": COMPONENT_6_ALIAS,
+        "url_key": COMPONENT_6_URL_KEY,
     },
 ]
 
@@ -1325,10 +1349,128 @@ def build_general_history_table(history):
 
 
 # ---------------------------------------------------------------------------
+# DATAMANAGER - LECTURE DES URL DES COMPOSANTS
+# ---------------------------------------------------------------------------
+
+def get_component_url(
+    obj_alias,
+    url_key,
+    datafile=COMPONENTS_DATAFILE,
+):
+    """
+    Reproduit la logique utilisée par KeyCloackModule.initialize() :
+
+        data_manager = DataManager(
+            datafile=datafile,
+            actor=obj_alias,
+        )
+
+        excel_dict = data_manager.returnExcelDict(
+            obj_alias
+        )
+
+    Puis retourne la valeur associée à url_key.
+    """
+
+    data_manager = DataManager(
+        datafile=datafile,
+        actor=obj_alias,
+    )
+
+    excel_dict = data_manager.returnExcelDict(
+        obj_alias
+    )
+
+    if not isinstance(excel_dict, dict) or not excel_dict:
+        raise ValueError(
+            f"Aucune donnée Excel trouvée pour l'alias "
+            f"'{obj_alias}'."
+        )
+
+    if url_key not in excel_dict:
+        available_keys = ", ".join(
+            sorted(str(key) for key in excel_dict.keys())
+        )
+
+        raise KeyError(
+            f"La clé URL '{url_key}' est absente pour "
+            f"l'alias '{obj_alias}'. "
+            f"Clés disponibles : {available_keys}"
+        )
+
+    component_url = str(
+        excel_dict[url_key]
+    ).strip()
+
+    if not component_url:
+        raise ValueError(
+            f"La valeur de '{url_key}' est vide pour "
+            f"l'alias '{obj_alias}'."
+        )
+
+    return component_url
+
+
+def load_components_from_excel():
+    """
+    Charge les URL des six composants depuis Excel.
+
+    Retour :
+    [
+        {
+            "name": "Toto composant",
+            "url": "http://..."
+        },
+        ...
+    ]
+    """
+
+    components = []
+
+    for setting in COMPONENT_SETTINGS:
+        component_name = str(
+            setting["name"]
+        ).strip()
+
+        component_alias = str(
+            setting["alias"]
+        ).strip()
+
+        component_url_key = str(
+            setting["url_key"]
+        ).strip()
+
+        print(
+            f"🔎 Lecture DataManager : "
+            f"{component_name} "
+            f"(alias={component_alias}, clé={component_url_key}) ..."
+        )
+
+        component_url = get_component_url(
+            obj_alias=component_alias,
+            url_key=component_url_key,
+        )
+
+        components.append(
+            {
+                "name": component_name,
+                "url": component_url,
+            }
+        )
+
+        print(
+            f"✅ URL chargée pour {component_name} : "
+            f"{component_url}"
+        )
+
+    return components
+
+
+# ---------------------------------------------------------------------------
 # TABLEAU DES COMPOSANTS
 # ---------------------------------------------------------------------------
 
-def build_components_table():
+def build_components_table(components):
     """
     Construit le tableau placé au début de la page.
 
@@ -1339,7 +1481,7 @@ def build_components_table():
 
     rows = []
 
-    for component in COMPONENTS:
+    for component in components:
         component_name = str(
             component.get("name", "")
         ).strip()
@@ -1399,6 +1541,7 @@ def build_dashboard_html(
     summary,
     stats,
     execution_stats,
+    components,
     page_body,
 ):
     pass_status = get_status(stats, "PASS")
@@ -1444,7 +1587,9 @@ def build_dashboard_html(
         execution_stats,
     )
 
-    components_table = build_components_table()
+    components_table = build_components_table(
+        components
+    )
     chart_macro = build_chart_macro(history)
     execution_history_table = build_execution_history_table(
         execution_history
@@ -1658,12 +1803,17 @@ if __name__ == "__main__":
             TEST_PLAN_KEY
         )
 
-        # 3. Recherche de la page Confluence.
+        # 3. Chargement des URL des composants depuis Excel.
+        print("🚀 Chargement des composants via DataManager ...")
+
+        components = load_components_from_excel()
+
+        # 4. Recherche de la page Confluence.
         page_id = find_page_id(sess)
 
         print(f"✅ Page trouvée - ID : {page_id}")
 
-        # 4. Version et titre exacts.
+        # 5. Version et titre exacts.
         version, exact_title = get_page_info(
             sess,
             page_id,
@@ -1674,27 +1824,28 @@ if __name__ == "__main__":
             f"- version actuelle : {version}"
         )
 
-        # 5. Contenu actuel.
+        # 6. Contenu actuel.
         current_body = get_page_body(
             sess,
             page_id,
         )
 
-        # 6. Construction du dashboard.
+        # 7. Construction du dashboard.
         dashboard_html = build_dashboard_html(
             summary,
             stats,
             execution_stats,
+            components,
             current_body,
         )
 
-        # 7. Remplacement du dashboard unique.
+        # 8. Remplacement du dashboard unique.
         full_page_body = merge_dashboard_into_page(
             current_body,
             dashboard_html,
         )
 
-        # 8. Mise à jour Confluence.
+        # 9. Mise à jour Confluence.
         update_confluence_page(
             sess,
             page_id,
@@ -1705,4 +1856,3 @@ if __name__ == "__main__":
 
     except Exception as error:
         print(f"❌ Une erreur est survenue : {error}")
-        sys.exit(1)
