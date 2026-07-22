@@ -56,6 +56,10 @@ TEST_DAY_OFFSET = 0
 # Cela évite de dépendre de la manière dont Confluence réécrit le HTML du tableau.
 EXECUTION_HISTORY_METADATA_PREFIX = "night-run-exec-history-"
 
+# Préfixe des anchors invisibles de l'historique général.
+# Chaque date est stockée indépendamment du rendu HTML de Confluence.
+GENERAL_HISTORY_METADATA_PREFIX = "night-run-general-history-"
+
 # Seuils de couleur du pourcentage PASS par Test Execution.
 # >= 90 % : vert
 # >= 75 % et < 90 % : orange
@@ -653,6 +657,97 @@ def extract_managed_blocks(page_body):
 # HISTORIQUE GÉNÉRAL PASS / FAIL / TODO
 # ---------------------------------------------------------------------------
 
+def encode_general_history_metadata(day, result):
+    """
+    Mémorise une journée de l'historique général dans une Anchor
+    Confluence invisible.
+
+    Cela garantit qu'un nouveau run effectué le même jour remplace
+    réellement les valeurs précédentes.
+    """
+
+    payload = {
+        "d": day,
+        "p": int(result["pass"]),
+        "f": int(result["fail"]),
+        "t": int(result["todo"]),
+        "r": round(float(result["pass_rate"]), 2),
+    }
+
+    raw_payload = json.dumps(
+        payload,
+        separators=(",", ":"),
+        ensure_ascii=True,
+    ).encode("utf-8")
+
+    encoded_payload = base64.urlsafe_b64encode(
+        raw_payload
+    ).decode("ascii").rstrip("=")
+
+    return build_anchor_macro(
+        GENERAL_HISTORY_METADATA_PREFIX
+        + encoded_payload
+    )
+
+
+def parse_general_history_metadata(page_body):
+    """
+    Relit les snapshots invisibles de l'historique général.
+
+    Retour :
+    {
+        "2026-07-22": {
+            "pass": 31,
+            "fail": 1,
+            "todo": 31,
+            "pass_rate": 96.88
+        }
+    }
+    """
+
+    history = {}
+
+    metadata_pattern = re.compile(
+        r'<ac:parameter\b[^>]*\bac:name=""[^>]*>\s*'
+        + re.escape(GENERAL_HISTORY_METADATA_PREFIX)
+        + r"([A-Za-z0-9_-]+)\s*"
+        r"</ac:parameter>",
+        flags=re.DOTALL | re.IGNORECASE,
+    )
+
+    for match in metadata_pattern.finditer(page_body):
+        encoded_payload = match.group(1)
+        padding = "=" * ((-len(encoded_payload)) % 4)
+
+        try:
+            decoded_payload = base64.urlsafe_b64decode(
+                encoded_payload + padding
+            ).decode("utf-8")
+
+            payload = json.loads(decoded_payload)
+            day = str(payload["d"])
+
+            datetime.strptime(day, "%Y-%m-%d")
+
+            history[day] = {
+                "pass": int(payload["p"]),
+                "fail": int(payload["f"]),
+                "todo": int(payload["t"]),
+                "pass_rate": float(payload["r"]),
+            }
+
+        except (
+            KeyError,
+            TypeError,
+            ValueError,
+            json.JSONDecodeError,
+        ):
+            # Une ancienne métadonnée invalide ne doit pas bloquer le job.
+            continue
+
+    return history
+
+
 def add_history_value(
     history,
     date_value,
@@ -779,21 +874,41 @@ def parse_legacy_history_rows(page_body, history):
 
 
 def parse_existing_history(page_body):
-    history = {}
+    """
+    Les métadonnées invisibles sont la source prioritaire.
+
+    Le tableau HTML et les anciens formats ne sont utilisés qu'en secours,
+    notamment lors de la première exécution de cette version.
+    """
+
+    history = parse_general_history_metadata(
+        page_body
+    )
+
+    html_history = {}
 
     for block in extract_managed_blocks(page_body):
         parse_general_history_table(
             block,
-            history,
+            html_history,
         )
 
     parse_legacy_daily_tables(
         page_body,
-        history,
+        html_history,
     )
     parse_legacy_history_rows(
         page_body,
-        history,
+        html_history,
+    )
+
+    # Ne remplace jamais une valeur déjà issue des métadonnées.
+    for day, result in html_history.items():
+        history.setdefault(day, result)
+
+    print(
+        "📚 Historique général relu : "
+        f"{len(history)} journée(s)"
     )
 
     return history
@@ -1308,6 +1423,15 @@ def build_chart_macro(history):
 def build_general_history_table(history):
     rows = []
 
+    # Une Anchor invisible par date conserve les valeurs exactes.
+    metadata_anchors = "\n".join(
+        encode_general_history_metadata(
+            day,
+            history[day],
+        )
+        for day in sorted(history)
+    )
+
     for day in sorted(history, reverse=True):
         result = history[day]
 
@@ -1329,6 +1453,8 @@ def build_general_history_table(history):
         )
 
     return f"""
+{metadata_anchors}
+
 <h2>Historique général</h2>
 
 <table border="1" style="width:100%;border-collapse:collapse;">
@@ -1573,12 +1699,27 @@ def build_dashboard_html(
     # Historique général.
     history = parse_existing_history(page_body)
 
+    previous_day_result = history.get(
+        today_iso
+    )
+
     history[today_iso] = {
         "pass": pass_count,
         "fail": fail_count,
         "todo": todo_count,
         "pass_rate": pass_rate,
     }
+
+    if previous_day_result is None:
+        print(
+            f"➕ Historique général : ajout de la date "
+            f"{today_iso}"
+        )
+    else:
+        print(
+            f"🔄 Historique général : remplacement des valeurs "
+            f"de la date {today_iso}"
+        )
 
     # Historique par Test Execution limité à 7 journées.
     execution_history = update_execution_history(
