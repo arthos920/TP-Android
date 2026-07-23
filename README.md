@@ -866,13 +866,25 @@ def find_csv_attachment(
 def make_absolute_confluence_url(
     link: str,
 ) -> str:
+    """
+    Construit l'URL complète de téléchargement sans perdre le
+    context path Confluence.
+
+    Exemple :
+        CONFLUENCE_URL = https://serveur/confluence
+        link = /download/attachments/123/fichier.csv
+
+    Résultat :
+        https://serveur/confluence/download/attachments/123/fichier.csv
+    """
+
     if link.startswith(
         ("http://", "https://")
     ):
         return link
 
     parsed_base = urlparse(
-        CONFLUENCE_URL
+        CONFLUENCE_URL.rstrip("/")
     )
 
     origin = (
@@ -880,15 +892,25 @@ def make_absolute_confluence_url(
         f"{parsed_base.netloc}"
     )
 
-    if link.startswith("/"):
-        return urljoin(
-            origin + "/",
-            link.lstrip("/"),
-        )
+    context_path = parsed_base.path.rstrip("/")
+    normalized_link = "/" + link.lstrip("/")
 
-    return urljoin(
-        CONFLUENCE_URL.rstrip("/") + "/",
-        link,
+    # Si le lien retourné contient déjà /confluence, ne pas le doubler.
+    if (
+        context_path
+        and (
+            normalized_link == context_path
+            or normalized_link.startswith(
+                context_path + "/"
+            )
+        )
+    ):
+        return origin + normalized_link
+
+    return (
+        origin
+        + context_path
+        + normalized_link
     )
 
 
