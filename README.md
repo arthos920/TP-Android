@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 
-import base64
-import json
+import csv
+import io
 import re
 import sys
 from datetime import datetime, timedelta
-from html import escape, unescape
+from pathlib import Path
+from typing import Any
+from urllib.parse import quote, urljoin, urlparse
 
 import requests
 import urllib3
@@ -17,157 +19,167 @@ from datamanager import DataManager
 urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 
+# ===========================================================================
+# CONFIGURATION
+# ===========================================================================
+
 # ---------------------------------------------------------------------------
-# GLOBAL SETTINGS
-# Remets ici exactement tes valeurs actuelles.
+# JIRA / XRAY
 # ---------------------------------------------------------------------------
 
-# ---------- JIRA ----------
 JIRA_URL = ""
 JIRA_USER = ""
 JIRA_TOKEN = ""
 
-# Proxy Jira dédié. Laisse vide si Jira n'utilise pas de proxy.
+# Laisse vide si Jira n'utilise pas de proxy.
 JIRA_PROXY_URL = ""
 
-# ---------- CONFLUENCE ----------
+# Test Plan Xray ciblé.
+TEST_PLAN_KEY = ""
+
+# Champ Xray contenant les statistiques du Test Plan et des Test Executions.
+XRAY_STATS_CUSTOM_FIELD = "customfield_11527"
+
+
+# ---------------------------------------------------------------------------
+# CONFLUENCE
+# ---------------------------------------------------------------------------
+
 CONFLUENCE_URL = ""
 CONFLUENCE_TOKEN = ""
 
-# ---------- PROXY CONFLUENCE ----------
-PROXY_URL = ""
+# Laisse vide si Confluence n'utilise pas de proxy.
+CONFLUENCE_PROXY_URL = ""
 
-# ---------- OTHER ----------
-TEST_PLAN_KEY = ""
 CONFLUENCE_PAGE_TITLE = "Dashboard night run automation"
 CONFLUENCE_SPACE_KEY = "TEI"
 
-# Champ Xray contenant les statistiques consolidées.
-XRAY_STATS_CUSTOM_FIELD = "customfield_11527"
+# Le même fichier est créé puis versionné sur la page.
+CSV_FILENAME = "night_run_dashboard.csv"
 
-# Le tableau par Test Execution conserve au maximum 7 journées enregistrées.
-MAX_TEST_EXECUTION_HISTORY_DAYS = 7
+# Copie locale créée à chaque lancement pour faciliter le diagnostic.
+LOCAL_CSV_PATH = Path(CSV_FILENAME)
 
-# Décalage utilisé uniquement pour tester plusieurs journées.
+
+# ---------------------------------------------------------------------------
+# HISTORIQUE
+# ---------------------------------------------------------------------------
+
+# Nombre maximal de journées conservées dans le CSV.
+MAX_HISTORY_DAYS = 7
+
+# Décalage uniquement destiné aux tests :
 # 0 = aujourd'hui, 1 = J+1, 2 = J+2...
 TEST_DAY_OFFSET = 0
 
-# Préfixe des anchors invisibles qui mémorisent les pourcentages par journée.
-# Cela évite de dépendre de la manière dont Confluence réécrit le HTML du tableau.
-EXECUTION_HISTORY_METADATA_PREFIX = "night-run-exec-history-"
+# Séparateur adapté à Excel en environnement français.
+CSV_DELIMITER = ";"
 
-# Préfixe des anchors invisibles de l'historique général.
-# Chaque date est stockée indépendamment du rendu HTML de Confluence.
-GENERAL_HISTORY_METADATA_PREFIX = "night-run-general-history-"
+# Les pourcentages sont écrits comme des nombres bruts :
+# 96.88 et non "96.88 %".
+CSV_FLOAT_DECIMALS = 2
 
-# Seuils de couleur du pourcentage PASS par Test Execution.
-# >= 90 % : vert
-# >= 75 % et < 90 % : orange
-# < 75 % : rouge
-PASS_RATE_GREEN_MIN = 90.0
-PASS_RATE_ORANGE_MIN = 75.0
 
 # ---------------------------------------------------------------------------
-# COMPOSANTS AFFICHÉS AU DÉBUT DU DASHBOARD
+# COMPOSANTS / DATAMANAGER
 #
-# Le nom affiché est défini ici.
-# L'URL est lue dans Excel via DataManager.
-#
-# obj_alias correspond à l'alias passé à :
-# DataManager(datafile=..., actor=obj_alias)
-# returnExcelDict(obj_alias)
-#
-# url_key correspond à la clé du dictionnaire Excel contenant l'URL.
+# Les données des composants sont conservées dans le CSV sous forme de
+# colonnes fixes. Mets INCLUDE_COMPONENTS_IN_CSV = False pour les retirer.
 # ---------------------------------------------------------------------------
 
+INCLUDE_COMPONENTS_IN_CSV = True
 COMPONENTS_DATAFILE = "FROM_SETTINGS_FILE"
-
-COMPONENT_1_NAME = "Toto composant"
-COMPONENT_1_ALIAS = "TOTO"
-COMPONENT_1_URL_KEY = "url"
-
-COMPONENT_2_NAME = "Composant 2"
-COMPONENT_2_ALIAS = "COMPONENT_2"
-COMPONENT_2_URL_KEY = "url"
-
-COMPONENT_3_NAME = "Composant 3"
-COMPONENT_3_ALIAS = "COMPONENT_3"
-COMPONENT_3_URL_KEY = "url"
-
-COMPONENT_4_NAME = "Composant 4"
-COMPONENT_4_ALIAS = "COMPONENT_4"
-COMPONENT_4_URL_KEY = "url"
-
-COMPONENT_5_NAME = "Composant 5"
-COMPONENT_5_ALIAS = "COMPONENT_5"
-COMPONENT_5_URL_KEY = "url"
-
-COMPONENT_6_NAME = "Composant 6"
-COMPONENT_6_ALIAS = "COMPONENT_6"
-COMPONENT_6_URL_KEY = "url"
 
 COMPONENT_SETTINGS = [
     {
-        "name": COMPONENT_1_NAME,
-        "alias": COMPONENT_1_ALIAS,
-        "url_key": COMPONENT_1_URL_KEY,
+        "name": "Toto composant",
+        "alias": "TOTO",
+        "url_key": "url",
     },
     {
-        "name": COMPONENT_2_NAME,
-        "alias": COMPONENT_2_ALIAS,
-        "url_key": COMPONENT_2_URL_KEY,
+        "name": "Composant 2",
+        "alias": "COMPONENT_2",
+        "url_key": "url",
     },
     {
-        "name": COMPONENT_3_NAME,
-        "alias": COMPONENT_3_ALIAS,
-        "url_key": COMPONENT_3_URL_KEY,
+        "name": "Composant 3",
+        "alias": "COMPONENT_3",
+        "url_key": "url",
     },
     {
-        "name": COMPONENT_4_NAME,
-        "alias": COMPONENT_4_ALIAS,
-        "url_key": COMPONENT_4_URL_KEY,
+        "name": "Composant 4",
+        "alias": "COMPONENT_4",
+        "url_key": "url",
     },
     {
-        "name": COMPONENT_5_NAME,
-        "alias": COMPONENT_5_ALIAS,
-        "url_key": COMPONENT_5_URL_KEY,
+        "name": "Composant 5",
+        "alias": "COMPONENT_5",
+        "url_key": "url",
     },
     {
-        "name": COMPONENT_6_NAME,
-        "alias": COMPONENT_6_ALIAS,
-        "url_key": COMPONENT_6_URL_KEY,
+        "name": "Composant 6",
+        "alias": "COMPONENT_6",
+        "url_key": "url",
     },
 ]
 
-# Anchors persistantes du dashboard principal.
-START_ANCHOR_NAME = "night-run-dashboard-start"
-END_ANCHOR_NAME = "night-run-dashboard-end"
 
-# Anchors persistantes de la table des Test Executions.
-EXECUTIONS_START_ANCHOR_NAME = "night-run-executions-start"
-EXECUTIONS_END_ANCHOR_NAME = "night-run-executions-end"
+# ===========================================================================
+# CONSTANTES DU CSV
+# ===========================================================================
+
+DATE_COLUMN = "Date"
+UPDATE_TIME_COLUMN = "Heure de mise à jour"
+TEST_PLAN_KEY_COLUMN = "Test Plan - Clé"
+TEST_PLAN_NAME_COLUMN = "Test Plan - Nom"
+
+GLOBAL_TOTAL_COLUMN = "Global - Total"
+GLOBAL_PASS_COLUMN = "Global - PASS"
+GLOBAL_FAIL_COLUMN = "Global - FAIL"
+GLOBAL_TODO_COLUMN = "Global - TODO"
+GLOBAL_RATE_COLUMN = "Global - Réussite (%)"
+
+FIXED_HEADERS = [
+    DATE_COLUMN,
+    UPDATE_TIME_COLUMN,
+    TEST_PLAN_KEY_COLUMN,
+    TEST_PLAN_NAME_COLUMN,
+    GLOBAL_TOTAL_COLUMN,
+    GLOBAL_PASS_COLUMN,
+    GLOBAL_FAIL_COLUMN,
+    GLOBAL_TODO_COLUMN,
+    GLOBAL_RATE_COLUMN,
+]
+
+ISSUE_KEY_PATTERN = re.compile(
+    r"^[A-Z][A-Z0-9_]*-\d+$",
+    re.IGNORECASE,
+)
 
 
-# ---------------------------------------------------------------------------
-# HTTP HELPERS
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# HTTP
+# ===========================================================================
 
-def get_jira_proxies():
-    if not JIRA_PROXY_URL:
+def build_proxies(proxy_url: str) -> dict[str, str] | None:
+    if not proxy_url:
         return None
 
     return {
-        "http": JIRA_PROXY_URL,
-        "https": JIRA_PROXY_URL,
+        "http": proxy_url,
+        "https": proxy_url,
     }
 
 
-def jira_get(url, params=None):
+def jira_get(
+    url: str,
+    params: dict[str, Any] | None = None,
+) -> requests.Response:
     response = requests.get(
         url,
         params=params,
         auth=(JIRA_USER, JIRA_TOKEN),
-        proxies=get_jira_proxies(),
+        proxies=build_proxies(JIRA_PROXY_URL),
         verify=False,
         timeout=30,
     )
@@ -175,1327 +187,42 @@ def jira_get(url, params=None):
     return response
 
 
-def make_session():
+def make_confluence_session() -> requests.Session:
     """
-    Session Confluence : proxy + Bearer token.
+    Ne met volontairement pas Content-Type=application/json.
+
+    Lors de l'upload du CSV, requests doit construire automatiquement
+    l'en-tête multipart/form-data.
     """
-    sess = requests.Session()
-    sess.verify = False
 
-    if PROXY_URL:
-        sess.proxies = {
-            "http": PROXY_URL,
-            "https": PROXY_URL,
-        }
-
-    sess.headers.update(
+    session = requests.Session()
+    session.verify = False
+    session.proxies.update(
+        build_proxies(CONFLUENCE_PROXY_URL) or {}
+    )
+    session.headers.update(
         {
             "Authorization": f"Bearer {CONFLUENCE_TOKEN}",
-            "Content-Type": "application/json",
             "Accept": "application/json",
         }
     )
+    return session
 
-    return sess
 
-
-# ---------------------------------------------------------------------------
-# JIRA - STATS DU TEST PLAN
-# La logique existante est conservée.
-# ---------------------------------------------------------------------------
-
-def parse_xray_stats(stats_data):
-    stats = {}
-
-    if not stats_data:
-        return stats
-
-    for status in stats_data.get("statuses", []):
-        status_name = str(status.get("name", "")).upper().strip()
-
-        if not status_name:
-            continue
-
-        stats[status_name] = {
-            "count": status.get("statusCount", 0),
-            "percent": status.get("statusPercent", 0),
-        }
-
-    return stats
-
-
-def get_jira_stats(issue_key):
-    url = f"{JIRA_URL}/rest/api/2/issue/{issue_key}"
-
-    print(f"🔎 Requête JIRA ({JIRA_USER}) ...")
-
-    resp = jira_get(url)
-    data = resp.json()
-
-    summary = data["fields"]["summary"]
-    stats_data = data["fields"].get(XRAY_STATS_CUSTOM_FIELD)
-
-    if not stats_data:
-        raise ValueError(
-            f"Champ {XRAY_STATS_CUSTOM_FIELD} absent ou vide."
-        )
-
-    return {
-        "summary": summary,
-        "stats": parse_xray_stats(stats_data),
-    }
-
-
-# ---------------------------------------------------------------------------
-# XRAY - TEST EXECUTIONS DU TEST PLAN
-# ---------------------------------------------------------------------------
-
-ISSUE_KEY_PATTERN = re.compile(r"^[A-Z][A-Z0-9_]*-\d+$", re.IGNORECASE)
-
-
-def extract_test_execution_keys(payload):
-    """
-    Accepte les différentes formes courantes de réponse Xray :
-    - ["PROJ-1", "PROJ-2"]
-    - [{"key": "PROJ-1"}, ...]
-    - {"testExecutions": [...]}
-    - {"results": [...]}
-    """
-
-    if isinstance(payload, dict):
-        for container_name in (
-            "testExecutions",
-            "results",
-            "issues",
-            "values",
-            "entries",
-        ):
-            if container_name in payload:
-                payload = payload[container_name]
-                break
-        else:
-            payload = [payload]
-
-    if not isinstance(payload, list):
-        raise ValueError(
-            "Format inattendu pour la liste des Test Executions Xray."
-        )
-
-    keys = []
-
-    for item in payload:
-        candidate = None
-
-        if isinstance(item, str):
-            candidate = item
-
-        elif isinstance(item, dict):
-            candidate = (
-                item.get("key")
-                or item.get("issueKey")
-                or item.get("testExecutionKey")
-            )
-
-        if candidate and ISSUE_KEY_PATTERN.match(str(candidate)):
-            keys.append(str(candidate).upper())
-
-    # Supprime les doublons sans modifier l'ordre.
-    return list(dict.fromkeys(keys))
-
-
-def get_test_execution_keys(test_plan_key):
-    url = (
-        f"{JIRA_URL}/rest/raven/1.0/api/testplan/"
-        f"{test_plan_key}/testexecution"
-    )
-
-    print(
-        f"🔎 Récupération des Test Executions du Test Plan "
-        f"{test_plan_key} ..."
-    )
-
-    response = jira_get(url)
-    keys = extract_test_execution_keys(response.json())
-
-    if not keys:
-        raise ValueError(
-            f"Aucune Test Execution trouvée pour {test_plan_key}."
-        )
-
-    print(
-        f"✅ {len(keys)} Test Execution(s) trouvée(s) : "
-        + ", ".join(keys)
-    )
-
-    return keys
-
-
-def get_test_execution_run_pass_percent(test_execution_key):
-    """
-    Solution de secours si le champ de statistiques Xray n'est pas présent
-    sur la Test Execution : compte les statuts des Test Runs.
-    """
-
-    url = (
-        f"{JIRA_URL}/rest/raven/1.0/api/testexec/"
-        f"{test_execution_key}/test"
-    )
-
-    response = jira_get(url)
-    payload = response.json()
-
-    if isinstance(payload, dict):
-        test_runs = (
-            payload.get("results")
-            or payload.get("tests")
-            or payload.get("entries")
-            or []
-        )
-    elif isinstance(payload, list):
-        test_runs = payload
-    else:
-        test_runs = []
-
-    pass_count = 0
-    total_count = 0
-
-    for test_run in test_runs:
-        if not isinstance(test_run, dict):
-            continue
-
-        status = test_run.get("status")
-
-        if isinstance(status, dict):
-            status = (
-                status.get("name")
-                or status.get("status")
-                or status.get("key")
-            )
-
-        total_count += 1
-
-        if str(status or "").upper().strip() == "PASS":
-            pass_count += 1
-
-    if total_count == 0:
-        return 0.0
-
-    return round(pass_count / total_count * 100, 2)
-
-
-def get_one_test_execution_pass_stats(test_execution_key):
-    """
-    Retour :
-    {
-        "key": "PROJ-123",
-        "summary": "Night Run Web",
-        "pass_percent": 96.50
-    }
-    """
-
-    url = f"{JIRA_URL}/rest/api/2/issue/{test_execution_key}"
-
-    response = jira_get(
-        url,
-        params={
-            "fields": f"summary,{XRAY_STATS_CUSTOM_FIELD}",
-        },
-    )
-
-    issue = response.json()
-    fields = issue.get("fields", {})
-
-    summary = fields.get("summary", test_execution_key)
-    stats_data = fields.get(XRAY_STATS_CUSTOM_FIELD)
-    stats = parse_xray_stats(stats_data)
-
-    if "PASS" in stats:
-        pass_percent = float(stats["PASS"].get("percent", 0))
-    else:
-        print(
-            f"⚠️ Champ de statistiques absent sur {test_execution_key}. "
-            "Calcul depuis les Test Runs."
-        )
-        pass_percent = get_test_execution_run_pass_percent(
-            test_execution_key
-        )
-
-    return {
-        "key": test_execution_key,
-        "summary": summary,
-        "pass_percent": round(pass_percent, 2),
-    }
-
-
-def get_test_executions_pass_stats(test_plan_key):
-    execution_keys = get_test_execution_keys(test_plan_key)
-    results = []
-
-    for execution_key in execution_keys:
-        execution_result = get_one_test_execution_pass_stats(
-            execution_key
-        )
-        results.append(execution_result)
-
-        print(
-            f"📊 {execution_key} : "
-            f"{execution_result['pass_percent']:.2f} % PASS"
-        )
-
-    return results
-
-
-# ---------------------------------------------------------------------------
-# CONFLUENCE - PAGE
-# La recherche et la récupération de la page restent inchangées.
-# ---------------------------------------------------------------------------
-
-def find_page_id(sess):
-    """CQL search : retourne l'identifiant API de la page."""
-
-    cql = (
-        f'title ~ "{CONFLUENCE_PAGE_TITLE}" '
-        f'AND space = "{CONFLUENCE_SPACE_KEY}"'
-    )
-
-    url = f"{CONFLUENCE_URL}/rest/api/search"
-    params = {
-        "cql": cql,
-        "start": 0,
-        "limit": 10,
-    }
-
-    print(f"🔎 Recherche Confluence (CQL) : {cql}")
-
-    resp = sess.get(
-        url,
-        params=params,
-        timeout=30,
-    )
-    resp.raise_for_status()
-
-    results = resp.json().get("results", [])
-
-    if not results:
-        raise Exception(
-            f"Page '{CONFLUENCE_PAGE_TITLE}' introuvable."
-        )
-
-    return results[0]["content"]["id"]
-
-
-def get_page_info(sess, page_id):
-    """
-    Retourne (current_version, exact_title).
-    """
-
-    url = f"{CONFLUENCE_URL}/rest/api/content/{page_id}"
-
-    resp = sess.get(
-        url,
-        timeout=30,
-    )
-
-    if resp.status_code != 200:
-        raise Exception(
-            f"Erreur récupération page ({resp.status_code}) : {resp.text}"
-        )
-
-    data = resp.json()
-
-    return data["version"]["number"], data["title"]
-
-
-def get_page_body(sess, page_id):
-    url = f"{CONFLUENCE_URL}/rest/api/content/{page_id}"
-
-    resp = sess.get(
-        url,
-        params={"expand": "body.storage"},
-        timeout=30,
-    )
-
-    if resp.status_code != 200:
-        raise Exception(
-            f"Erreur récupération du contenu Confluence "
-            f"({resp.status_code}) : {resp.text}"
-        )
-
-    data = resp.json()
-
-    try:
-        return data["body"]["storage"]["value"]
-    except KeyError as exc:
-        raise Exception(
-            "Le body.storage de la page Confluence est absent."
-        ) from exc
-
-
-# ---------------------------------------------------------------------------
-# VALUE HELPERS
-# ---------------------------------------------------------------------------
-
-def to_int(value):
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return 0
-
-
-def to_float(value):
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def get_status(stats, status_name):
-    value = stats.get(
-        status_name,
-        {
-            "count": 0,
-            "percent": 0,
-        },
-    )
-
-    return {
-        "count": to_int(value.get("count")),
-        "percent": to_float(value.get("percent")),
-    }
-
-
-def html_to_text(value):
-    value = re.sub(r"<[^>]+>", " ", value)
-    value = unescape(value)
-    return re.sub(r"\s+", " ", value).strip()
-
-
-def get_pass_rate_cell_style(pass_percent):
-    """
-    Retourne le style de toute la cellule selon le pourcentage PASS.
-
-    Vert   : taux >= PASS_RATE_GREEN_MIN
-    Orange : taux >= PASS_RATE_ORANGE_MIN
-    Rouge  : taux < PASS_RATE_ORANGE_MIN
-    """
-
-    if pass_percent >= PASS_RATE_GREEN_MIN:
-        background_color = "#E3FCEF"
-        text_color = "#006644"
-    elif pass_percent >= PASS_RATE_ORANGE_MIN:
-        background_color = "#FFF0B3"
-        text_color = "#974F0C"
-    else:
-        background_color = "#FFEBE6"
-        text_color = "#BF2600"
-
-    return (
-        f"padding:8px;"
-        f"text-align:center;"
-        f"background-color:{background_color};"
-        f"color:{text_color};"
-        f"font-weight:bold;"
-    )
-
-
-# ---------------------------------------------------------------------------
-# PERSISTENT ANCHORS
-# ---------------------------------------------------------------------------
-
-def build_anchor_macro(anchor_name):
-    return f"""
-<ac:structured-macro ac:name="anchor" ac:schema-version="1">
-    <ac:parameter ac:name="">{escape(anchor_name)}</ac:parameter>
-</ac:structured-macro>
-""".strip()
-
-
-def anchor_macro_pattern(anchor_name):
-    return (
-        r'<ac:structured-macro\b'
-        r'(?=[^>]*\bac:name="anchor")'
-        r'[^>]*>'
-        r'.*?'
-        r'<ac:parameter\b[^>]*\bac:name=""[^>]*>'
-        r'\s*'
-        + re.escape(anchor_name)
-        + r'\s*'
-        r'</ac:parameter>'
-        r'.*?'
-        r'</ac:structured-macro>'
-    )
-
-
-def anchored_block_pattern(start_anchor, end_anchor):
-    return re.compile(
-        anchor_macro_pattern(start_anchor)
-        + r".*?"
-        + anchor_macro_pattern(end_anchor),
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-
-
-def dashboard_block_pattern():
-    return anchored_block_pattern(
-        START_ANCHOR_NAME,
-        END_ANCHOR_NAME,
-    )
-
-
-def executions_block_pattern():
-    return anchored_block_pattern(
-        EXECUTIONS_START_ANCHOR_NAME,
-        EXECUTIONS_END_ANCHOR_NAME,
-    )
-
-
-def extract_managed_blocks(page_body):
-    return dashboard_block_pattern().findall(page_body)
-
-
-# ---------------------------------------------------------------------------
-# HISTORIQUE GÉNÉRAL PASS / FAIL / TODO
-# ---------------------------------------------------------------------------
-
-def encode_general_history_metadata(day, result):
-    """
-    Mémorise une journée de l'historique général dans une Anchor
-    Confluence invisible.
-
-    Cela garantit qu'un nouveau run effectué le même jour remplace
-    réellement les valeurs précédentes.
-    """
-
-    payload = {
-        "d": day,
-        "p": int(result["pass"]),
-        "f": int(result["fail"]),
-        "t": int(result["todo"]),
-        "r": round(float(result["pass_rate"]), 2),
-    }
-
-    raw_payload = json.dumps(
-        payload,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    ).encode("utf-8")
-
-    encoded_payload = base64.urlsafe_b64encode(
-        raw_payload
-    ).decode("ascii").rstrip("=")
-
-    return build_anchor_macro(
-        GENERAL_HISTORY_METADATA_PREFIX
-        + encoded_payload
-    )
-
-
-def parse_general_history_metadata(page_body):
-    """
-    Relit les snapshots invisibles de l'historique général.
-
-    Retour :
-    {
-        "2026-07-22": {
-            "pass": 31,
-            "fail": 1,
-            "todo": 31,
-            "pass_rate": 96.88
-        }
-    }
-    """
-
-    history = {}
-
-    metadata_pattern = re.compile(
-        r'<ac:parameter\b[^>]*\bac:name=""[^>]*>\s*'
-        + re.escape(GENERAL_HISTORY_METADATA_PREFIX)
-        + r"([A-Za-z0-9_-]+)\s*"
-        r"</ac:parameter>",
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-
-    for match in metadata_pattern.finditer(page_body):
-        encoded_payload = match.group(1)
-        padding = "=" * ((-len(encoded_payload)) % 4)
-
-        try:
-            decoded_payload = base64.urlsafe_b64decode(
-                encoded_payload + padding
-            ).decode("utf-8")
-
-            payload = json.loads(decoded_payload)
-            day = str(payload["d"])
-
-            datetime.strptime(day, "%Y-%m-%d")
-
-            history[day] = {
-                "pass": int(payload["p"]),
-                "fail": int(payload["f"]),
-                "todo": int(payload["t"]),
-                "pass_rate": float(payload["r"]),
-            }
-
-        except (
-            KeyError,
-            TypeError,
-            ValueError,
-            json.JSONDecodeError,
-        ):
-            # Une ancienne métadonnée invalide ne doit pas bloquer le job.
-            continue
-
-    return history
-
-
-def add_history_value(
-    history,
-    date_value,
-    pass_count,
-    fail_count,
-    todo_count,
-    pass_rate,
-):
-    try:
-        parsed_date = datetime.strptime(
-            date_value,
-            "%d/%m/%Y",
-        )
-    except ValueError:
-        return
-
-    day_iso = parsed_date.strftime("%Y-%m-%d")
-
-    history[day_iso] = {
-        "pass": int(pass_count),
-        "fail": int(fail_count),
-        "todo": int(todo_count),
-        "pass_rate": float(
-            str(pass_rate).replace(",", ".")
-        ),
-    }
-
-
-def parse_general_history_table(block, history):
-    heading_match = re.search(
-        r"<h2>\s*Historique général\s*</h2>\s*"
-        r"(<table\b.*?</table>)",
-        block,
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-
-    if not heading_match:
-        return
-
-    table_html = heading_match.group(1)
-
-    row_pattern = re.compile(
-        r"<tr>\s*"
-        r"<td[^>]*>\s*(\d{2}/\d{2}/\d{4})\s*</td>\s*"
-        r"<td[^>]*>\s*(\d+)\s*</td>\s*"
-        r"<td[^>]*>\s*(\d+)\s*</td>\s*"
-        r"<td[^>]*>\s*(\d+)\s*</td>\s*"
-        r"<td[^>]*>\s*([\d.,]+)\s*%\s*</td>\s*"
-        r"</tr>",
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-
-    for match in row_pattern.finditer(table_html):
-        add_history_value(
-            history,
-            *match.groups(),
-        )
-
-
-def parse_legacy_daily_tables(page_body, history):
-    daily_pattern = re.compile(
-        r"<h3>\s*Night run du\s+"
-        r"(\d{2}/\d{2}/\d{4})\s*</h3>\s*"
-        r"(<table\b.*?</table>)",
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-
-    for match in daily_pattern.finditer(page_body):
-        display_day = match.group(1)
-        table_html = match.group(2)
-
-        def read_count(label):
-            label_match = re.search(
-                rf"<td[^>]*>\s*{re.escape(label)}\s*</td>\s*"
-                r"<td[^>]*>\s*(\d+)\s*</td>",
-                table_html,
-                flags=re.DOTALL | re.IGNORECASE,
-            )
-            return int(label_match.group(1)) if label_match else 0
-
-        rate_match = re.search(
-            r"<td[^>]*>\s*"
-            r"(?:<strong>)?\s*Taux de réussite\s*(?:</strong>)?"
-            r"\s*</td>\s*"
-            r"<td[^>]*>.*?"
-            r"([\d.,]+)\s*%",
-            table_html,
-            flags=re.DOTALL | re.IGNORECASE,
-        )
-
-        pass_rate = (
-            float(rate_match.group(1).replace(",", "."))
-            if rate_match
-            else 0.0
-        )
-
-        add_history_value(
-            history,
-            display_day,
-            read_count("PASS"),
-            read_count("FAIL"),
-            read_count("TODO"),
-            pass_rate,
-        )
-
-
-def parse_legacy_history_rows(page_body, history):
-    row_pattern = re.compile(
-        r'<tr[^>]*(?:data-night-run-day="[^"]+")?[^>]*>\s*'
-        r'<td[^>]*>\s*(\d{2}/\d{2}/\d{4})\s*</td>\s*'
-        r'<td[^>]*>\s*(\d+)\s*</td>\s*'
-        r'<td[^>]*>\s*(\d+)\s*</td>\s*'
-        r'<td[^>]*>\s*(\d+)\s*</td>\s*'
-        r'<td[^>]*>\s*([\d.,]+)\s*%\s*</td>\s*'
-        r'</tr>',
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-
-    for match in row_pattern.finditer(page_body):
-        add_history_value(
-            history,
-            *match.groups(),
-        )
-
-
-def parse_existing_history(page_body):
-    """
-    Les métadonnées invisibles sont la source prioritaire.
-
-    Le tableau HTML et les anciens formats ne sont utilisés qu'en secours,
-    notamment lors de la première exécution de cette version.
-    """
-
-    history = parse_general_history_metadata(
-        page_body
-    )
-
-    html_history = {}
-
-    for block in extract_managed_blocks(page_body):
-        parse_general_history_table(
-            block,
-            html_history,
-        )
-
-    parse_legacy_daily_tables(
-        page_body,
-        html_history,
-    )
-    parse_legacy_history_rows(
-        page_body,
-        html_history,
-    )
-
-    # Ne remplace jamais une valeur déjà issue des métadonnées.
-    for day, result in html_history.items():
-        history.setdefault(day, result)
-
-    print(
-        "📚 Historique général relu : "
-        f"{len(history)} journée(s)"
-    )
-
-    return history
-
-
-# ---------------------------------------------------------------------------
-# HISTORIQUE DES TEST EXECUTIONS - 7 JOURS
-#
-# Structure :
-# {
-#   "2026-07-16": {
-#       "PROJ-123": {"summary": "...", "pass_percent": 95.0}
-#   }
-# }
-# ---------------------------------------------------------------------------
-
-def encode_execution_history_metadata(day, day_results):
-    """
-    Stocke les valeurs d'une journée dans une Anchor Confluence invisible.
-
-    Exemple logique :
-    {
-        "d": "2026-07-16",
-        "v": {
-            "PROJ-123": 96.50,
-            "PROJ-456": 82.00
-        }
-    }
-
-    Cette donnée persiste même si Confluence réorganise les balises
-    <thead>, <tbody> ou les styles du tableau.
-    """
-
-    payload = {
-        "d": day,
-        "v": {
-            execution_key: round(
-                float(result["pass_percent"]),
-                2,
-            )
-            for execution_key, result in day_results.items()
-        },
-    }
-
-    raw_payload = json.dumps(
-        payload,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    ).encode("utf-8")
-
-    encoded_payload = base64.urlsafe_b64encode(
-        raw_payload
-    ).decode("ascii").rstrip("=")
-
-    anchor_name = (
-        EXECUTION_HISTORY_METADATA_PREFIX
-        + encoded_payload
-    )
-
-    return build_anchor_macro(anchor_name)
-
-
-def parse_execution_history_metadata(page_body):
-    """
-    Relit les snapshots invisibles écrits par
-    encode_execution_history_metadata().
-    """
-
-    history = {}
-
-    anchor_value_pattern = re.compile(
-        r'<ac:parameter\b[^>]*\bac:name=""[^>]*>\s*'
-        + re.escape(EXECUTION_HISTORY_METADATA_PREFIX)
-        + r"([A-Za-z0-9_-]+)\s*"
-        r"</ac:parameter>",
-        flags=re.DOTALL | re.IGNORECASE,
-    )
-
-    for match in anchor_value_pattern.finditer(page_body):
-        encoded_payload = match.group(1)
-
-        padding = "=" * (
-            (-len(encoded_payload)) % 4
-        )
-
-        try:
-            decoded_payload = base64.urlsafe_b64decode(
-                encoded_payload + padding
-            ).decode("utf-8")
-
-            payload = json.loads(decoded_payload)
-            day = payload["d"]
-            values = payload["v"]
-
-            datetime.strptime(day, "%Y-%m-%d")
-
-            history.setdefault(day, {})
-
-            for execution_key, pass_percent in values.items():
-                execution_key = str(execution_key).upper()
-
-                if not ISSUE_KEY_PATTERN.match(execution_key):
-                    continue
-
-                history[day][execution_key] = {
-                    "summary": execution_key,
-                    "pass_percent": float(pass_percent),
-                }
-
-        except (
-            KeyError,
-            TypeError,
-            ValueError,
-            json.JSONDecodeError,
-        ):
-            # Une ancienne Anchor incorrecte ne doit pas faire échouer le job.
-            continue
-
-    return history
-
-
-def find_execution_history_tables(page_body):
-    """
-    Recherche le tableau même si Confluence a modifié les balises
-    <thead>/<tbody> ou les attributs des macros.
-    """
-
-    tables = []
-
-    # Méthode principale : bloc entre les deux anchors dédiées.
-    for block in executions_block_pattern().findall(page_body):
-        table_match = re.search(
-            r"<table\b.*?</table>",
-            block,
-            flags=re.DOTALL | re.IGNORECASE,
-        )
-
-        if table_match:
-            tables.append(table_match.group(0))
-
-    # Solution de secours : recherche depuis le titre du tableau.
-    if not tables:
-        fallback_matches = re.findall(
-            r"<h2[^>]*>\s*"
-            r"Pourcentage PASS par Test Execution"
-            r".*?</h2>"
-            r".*?"
-            r"(<table\b.*?</table>)",
-            page_body,
-            flags=re.DOTALL | re.IGNORECASE,
-        )
-
-        tables.extend(fallback_matches)
-
-    return tables
-
-
-def parse_execution_history_table(page_body):
-    """
-    Récupère l'historique du tableau des Test Executions.
-
-    Priorité :
-    1. métadonnées invisibles et persistantes ;
-    2. lecture du tableau HTML existant pour compatibilité.
-    """
-
-    history = parse_execution_history_metadata(
-        page_body
-    )
-
-    for table_html in find_execution_history_tables(page_body):
-        all_rows = re.findall(
-            r"<tr\b[^>]*>(.*?)</tr>",
-            table_html,
-            flags=re.DOTALL | re.IGNORECASE,
-        )
-
-        header_index = None
-        header_cells = []
-
-        # Confluence peut supprimer <thead>.
-        # On cherche donc la première ligne dont la première cellule
-        # contient "Test Execution".
-        for index, row_html in enumerate(all_rows):
-            cells = re.findall(
-                r"<t[hd]\b[^>]*>(.*?)</t[hd]>",
-                row_html,
-                flags=re.DOTALL | re.IGNORECASE,
-            )
-
-            if len(cells) < 2:
-                continue
-
-            first_header = html_to_text(cells[0]).lower()
-
-            if "test execution" in first_header:
-                header_index = index
-                header_cells = cells
-                break
-
-        if header_index is None:
-            continue
-
-        days = []
-
-        for header_cell in header_cells[1:]:
-            date_text = html_to_text(header_cell)
-
-            try:
-                day_iso = datetime.strptime(
-                    date_text,
-                    "%d/%m/%Y",
-                ).strftime("%Y-%m-%d")
-            except ValueError:
-                day_iso = None
-
-            days.append(day_iso)
-
-        for row_html in all_rows[header_index + 1:]:
-            cells = re.findall(
-                r"<td\b[^>]*>(.*?)</td>",
-                row_html,
-                flags=re.DOTALL | re.IGNORECASE,
-            )
-
-            if len(cells) < 2:
-                continue
-
-            first_cell_text = html_to_text(cells[0])
-
-            key_match = re.search(
-                r"\b([A-Z][A-Z0-9_]*-\d+)\b",
-                first_cell_text,
-                flags=re.IGNORECASE,
-            )
-
-            if not key_match:
-                continue
-
-            execution_key = key_match.group(1).upper()
-
-            summary = first_cell_text.replace(
-                key_match.group(1),
-                "",
-                1,
-            ).strip(" -–—:")
-
-            if not summary:
-                summary = execution_key
-
-            for cell_index, cell in enumerate(cells[1:]):
-                if (
-                    cell_index >= len(days)
-                    or not days[cell_index]
-                ):
-                    continue
-
-                value_text = html_to_text(cell)
-
-                if not value_text or value_text in {"-", "—"}:
-                    continue
-
-                percent_match = re.search(
-                    r"([\d.,]+)",
-                    value_text,
-                )
-
-                if not percent_match:
-                    continue
-
-                pass_percent = float(
-                    percent_match.group(1).replace(",", ".")
-                )
-
-                day = days[cell_index]
-
-                # Les valeurs du tableau complètent les métadonnées,
-                # notamment avec le résumé de la Test Execution.
-                history.setdefault(day, {})[
-                    execution_key
-                ] = {
-                    "summary": summary,
-                    "pass_percent": pass_percent,
-                }
-
-    print(
-        "📚 Historique Test Executions relu : "
-        f"{len(history)} journée(s)"
-    )
-
-    return history
-
-
-def keep_last_execution_history_days(history):
-    kept_days = sorted(history)[
-        -MAX_TEST_EXECUTION_HISTORY_DAYS:
-    ]
-
-    return {
-        day: history[day]
-        for day in kept_days
-    }
-
-
-def update_execution_history(
-    page_body,
-    today_iso,
-    current_execution_stats,
-):
-    history = parse_execution_history_table(page_body)
-
-    # Le run du jour remplace entièrement le snapshot du même jour.
-    history[today_iso] = {
-        item["key"]: {
-            "summary": item["summary"],
-            "pass_percent": item["pass_percent"],
-        }
-        for item in current_execution_stats
-    }
-
-    return keep_last_execution_history_days(history)
-
-
-def build_execution_history_table(history):
-    if not history:
-        return "<p>Aucune donnée de Test Execution disponible.</p>"
-
-    ordered_days = sorted(history)
-
-    # Une Anchor invisible par journée conserve les valeurs de manière robuste.
-    metadata_anchors = "\n".join(
-        encode_execution_history_metadata(
-            day,
-            history[day],
-        )
-        for day in ordered_days
-    )
-
-    execution_metadata = {}
-
-    for day in ordered_days:
-        for execution_key, result in history[day].items():
-            execution_metadata[execution_key] = result.get(
-                "summary",
-                execution_key,
-            )
-
-    ordered_execution_keys = sorted(
-        execution_metadata,
-        key=lambda key: (
-            execution_metadata[key].lower(),
-            key,
-        ),
-    )
-
-    header_cells = []
-
-    for day in ordered_days:
-        display_day = datetime.strptime(
-            day,
-            "%Y-%m-%d",
-        ).strftime("%d/%m/%Y")
-
-        header_cells.append(
-            f'<th style="padding:8px;text-align:center;">'
-            f"{escape(display_day)}</th>"
-        )
-
-    rows = []
-
-    for execution_key in ordered_execution_keys:
-        summary = execution_metadata[execution_key]
-        safe_key = escape(execution_key)
-        safe_summary = escape(summary)
-        jira_link = (
-            f"{escape(JIRA_URL.rstrip('/'))}/browse/{safe_key}"
-        )
-
-        value_cells = []
-
-        for day in ordered_days:
-            result = history[day].get(execution_key)
-
-            if result is None:
-                value_cells.append(
-                    '<td style="padding:8px;text-align:center;">—</td>'
-                )
-            else:
-                pass_percent = float(result["pass_percent"])
-                cell_style = get_pass_rate_cell_style(
-                    pass_percent
-                )
-
-                value_cells.append(
-                    f'<td style="{cell_style}">'
-                    f"{pass_percent:.2f} %"
-                    "</td>"
-                )
-
-        rows.append(
-            f"""
-<tr>
-    <td style="padding:8px;">
-        <a href="{jira_link}"><code>{safe_key}</code></a>
-        - {safe_summary}
-    </td>
-    {''.join(value_cells)}
-</tr>
-""".strip()
-        )
-
-    start_anchor = build_anchor_macro(
-        EXECUTIONS_START_ANCHOR_NAME
-    )
-    end_anchor = build_anchor_macro(
-        EXECUTIONS_END_ANCHOR_NAME
-    )
-
-    return f"""
-{start_anchor}
-
-{metadata_anchors}
-
-<h2>Pourcentage PASS par Test Execution — 7 derniers jours</h2>
-
-<p>
-    Une ligne par Test Execution. Les colonnes correspondent aux
-    sept dernières journées enregistrées.
-</p>
-
-<table border="1" style="width:100%;border-collapse:collapse;">
-    <thead>
-        <tr>
-            <th style="padding:8px;">Test Execution</th>
-            {''.join(header_cells)}
-        </tr>
-    </thead>
-    <tbody>
-        {''.join(rows)}
-    </tbody>
-</table>
-
-{end_anchor}
-""".strip()
-
-
-# ---------------------------------------------------------------------------
-# GRAPHIQUE GÉNÉRAL PASS / FAIL
-# ---------------------------------------------------------------------------
-
-def build_chart_macro(history):
-    ordered_days = sorted(history)
-
-    if not ordered_days:
-        return "<p>Aucune donnée disponible pour le graphique.</p>"
-
-    date_headers = []
-    pass_values = []
-    fail_values = []
-
-    for day in ordered_days:
-        display_day = datetime.strptime(
-            day,
-            "%Y-%m-%d",
-        ).strftime("%d/%m/%Y")
-
-        date_headers.append(
-            f"<th>{escape(display_day)}</th>"
-        )
-        pass_values.append(
-            f"<td>{history[day]['pass']}</td>"
-        )
-        fail_values.append(
-            f"<td>{history[day]['fail']}</td>"
-        )
-
-    return f"""
-<ac:structured-macro ac:name="chart" ac:schema-version="1">
-    <ac:parameter ac:name="type">line</ac:parameter>
-    <ac:parameter ac:name="title">Évolution quotidienne des tests PASS / FAIL</ac:parameter>
-    <ac:parameter ac:name="legend">true</ac:parameter>
-    <ac:parameter ac:name="dataOrientation">horizontal</ac:parameter>
-    <ac:parameter ac:name="dataDisplay">false</ac:parameter>
-    <ac:parameter ac:name="showShapes">true</ac:parameter>
-    <ac:parameter ac:name="width">1100</ac:parameter>
-    <ac:parameter ac:name="height">420</ac:parameter>
-    <ac:parameter ac:name="xLabel">Date</ac:parameter>
-    <ac:parameter ac:name="yLabel">Nombre de tests</ac:parameter>
-    <ac:parameter ac:name="categoryLabelPosition">down45</ac:parameter>
-    <ac:rich-text-body>
-        <table>
-            <tbody>
-                <tr>
-                    <th>Statut</th>
-                    {''.join(date_headers)}
-                </tr>
-                <tr>
-                    <th>PASS</th>
-                    {''.join(pass_values)}
-                </tr>
-                <tr>
-                    <th>FAIL</th>
-                    {''.join(fail_values)}
-                </tr>
-            </tbody>
-        </table>
-    </ac:rich-text-body>
-</ac:structured-macro>
-""".strip()
-
-
-def build_general_history_table(history):
-    rows = []
-
-    # Une Anchor invisible par date conserve les valeurs exactes.
-    metadata_anchors = "\n".join(
-        encode_general_history_metadata(
-            day,
-            history[day],
-        )
-        for day in sorted(history)
-    )
-
-    for day in sorted(history, reverse=True):
-        result = history[day]
-
-        display_day = datetime.strptime(
-            day,
-            "%Y-%m-%d",
-        ).strftime("%d/%m/%Y")
-
-        rows.append(
-            f"""
-<tr>
-    <td style="padding:8px;">{escape(display_day)}</td>
-    <td style="padding:8px;text-align:center;">{result["pass"]}</td>
-    <td style="padding:8px;text-align:center;">{result["fail"]}</td>
-    <td style="padding:8px;text-align:center;">{result["todo"]}</td>
-    <td style="padding:8px;text-align:center;">{result["pass_rate"]:.2f} %</td>
-</tr>
-""".strip()
-        )
-
-    return f"""
-{metadata_anchors}
-
-<h2>Historique général</h2>
-
-<table border="1" style="width:100%;border-collapse:collapse;">
-    <thead>
-        <tr>
-            <th style="padding:8px;">Date</th>
-            <th style="padding:8px;text-align:center;">PASS</th>
-            <th style="padding:8px;text-align:center;">FAIL</th>
-            <th style="padding:8px;text-align:center;">TODO</th>
-            <th style="padding:8px;text-align:center;">Taux de réussite</th>
-        </tr>
-    </thead>
-    <tbody>
-        {''.join(rows)}
-    </tbody>
-</table>
-""".strip()
-
-
-# ---------------------------------------------------------------------------
-# DATAMANAGER - LECTURE DES URL DES COMPOSANTS
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# DATAMANAGER / COMPOSANTS
+# ===========================================================================
 
 def get_component_url(
-    obj_alias,
-    url_key,
-    datafile=COMPONENTS_DATAFILE,
-):
+    obj_alias: str,
+    url_key: str,
+    datafile: str = COMPONENTS_DATAFILE,
+) -> str:
     """
-    Reproduit la logique utilisée par KeyCloackModule.initialize() :
+    Reprend la logique utilisée dans le module Keycloak :
 
-        data_manager = DataManager(
-            datafile=datafile,
-            actor=obj_alias,
-        )
-
-        excel_dict = data_manager.returnExcelDict(
-            obj_alias
-        )
-
-    Puis retourne la valeur associée à url_key.
+        DataManager(datafile=datafile, actor=obj_alias)
+        returnExcelDict(obj_alias)
     """
 
     data_manager = DataManager(
@@ -1515,13 +242,12 @@ def get_component_url(
 
     if url_key not in excel_dict:
         available_keys = ", ".join(
-            sorted(str(key) for key in excel_dict.keys())
+            sorted(str(key) for key in excel_dict)
         )
 
         raise KeyError(
-            f"La clé URL '{url_key}' est absente pour "
-            f"l'alias '{obj_alias}'. "
-            f"Clés disponibles : {available_keys}"
+            f"La clé '{url_key}' est absente pour l'alias "
+            f"'{obj_alias}'. Clés disponibles : {available_keys}"
         )
 
     component_url = str(
@@ -1530,30 +256,23 @@ def get_component_url(
 
     if not component_url:
         raise ValueError(
-            f"La valeur de '{url_key}' est vide pour "
-            f"l'alias '{obj_alias}'."
+            f"L'URL est vide pour l'alias '{obj_alias}' "
+            f"et la clé '{url_key}'."
         )
 
     return component_url
 
 
-def load_components_from_excel():
-    """
-    Charge les URL des six composants depuis Excel.
-
-    Retour :
-    [
-        {
-            "name": "Toto composant",
-            "url": "http://..."
-        },
-        ...
-    ]
-    """
+def load_components_from_excel() -> list[dict[str, str]]:
+    if not INCLUDE_COMPONENTS_IN_CSV:
+        return []
 
     components = []
 
-    for setting in COMPONENT_SETTINGS:
+    for index, setting in enumerate(
+        COMPONENT_SETTINGS,
+        start=1,
+    ):
         component_name = str(
             setting["name"]
         ).strip()
@@ -1567,9 +286,9 @@ def load_components_from_excel():
         ).strip()
 
         print(
-            f"🔎 Lecture DataManager : "
+            f"🔎 DataManager composant {index} : "
             f"{component_name} "
-            f"(alias={component_alias}, clé={component_url_key}) ..."
+            f"(alias={component_alias}, clé={component_url_key})"
         )
 
         component_url = get_component_url(
@@ -1579,422 +298,1144 @@ def load_components_from_excel():
 
         components.append(
             {
+                "index": str(index),
                 "name": component_name,
                 "url": component_url,
             }
         )
 
-        print(
-            f"✅ URL chargée pour {component_name} : "
-            f"{component_url}"
-        )
-
     return components
 
 
-# ---------------------------------------------------------------------------
-# TABLEAU DES COMPOSANTS
-# ---------------------------------------------------------------------------
+def get_component_headers() -> list[str]:
+    if not INCLUDE_COMPONENTS_IN_CSV:
+        return []
 
-def build_components_table(components):
-    """
-    Construit le tableau placé au début de la page.
+    headers = []
 
-    Colonnes :
-    - Composant
-    - URL
-    """
+    for index in range(
+        1,
+        len(COMPONENT_SETTINGS) + 1,
+    ):
+        headers.extend(
+            [
+                f"Composant {index} - Nom",
+                f"Composant {index} - URL",
+            ]
+        )
 
-    rows = []
+    return headers
 
+
+def add_components_to_row(
+    row: dict[str, str],
+    components: list[dict[str, str]],
+) -> None:
     for component in components:
-        component_name = str(
-            component.get("name", "")
-        ).strip()
-        component_url = str(
-            component.get("url", "")
-        ).strip()
+        index = component["index"]
 
-        safe_name = escape(
-            component_name or "Composant non renseigné"
+        row[f"Composant {index} - Nom"] = (
+            component["name"]
+        )
+        row[f"Composant {index} - URL"] = (
+            component["url"]
         )
 
-        if component_url:
-            safe_url = escape(
-                component_url,
-                quote=True,
-            )
 
-            url_cell = (
-                f'<a href="{safe_url}">'
-                f"{escape(component_url)}"
-                f"</a>"
-            )
-        else:
-            url_cell = "—"
+# ===========================================================================
+# XRAY - STATISTIQUES
+# ===========================================================================
 
-        rows.append(
-            f"""
-<tr>
-    <td style="padding:8px;">{safe_name}</td>
-    <td style="padding:8px;">{url_cell}</td>
-</tr>
-""".strip()
+def parse_xray_stats(
+    stats_data: dict[str, Any] | None,
+) -> dict[str, dict[str, float]]:
+    stats: dict[str, dict[str, float]] = {}
+
+    if not stats_data:
+        return stats
+
+    for status in stats_data.get("statuses", []):
+        status_name = str(
+            status.get("name", "")
+        ).upper().strip()
+
+        if not status_name:
+            continue
+
+        stats[status_name] = {
+            "count": float(
+                status.get("statusCount", 0) or 0
+            ),
+            "percent": float(
+                status.get("statusPercent", 0) or 0
+            ),
+        }
+
+    return stats
+
+
+def normalize_status_name(value: Any) -> str:
+    if isinstance(value, dict):
+        value = (
+            value.get("name")
+            or value.get("status")
+            or value.get("key")
         )
 
-    return f"""
-<h2>Composants</h2>
-
-<table border="1" style="width:100%;border-collapse:collapse;">
-    <thead>
-        <tr>
-            <th style="padding:8px;">Composant</th>
-            <th style="padding:8px;">URL</th>
-        </tr>
-    </thead>
-    <tbody>
-        {''.join(rows)}
-    </tbody>
-</table>
-""".strip()
+    return str(value or "UNKNOWN").upper().strip()
 
 
-# ---------------------------------------------------------------------------
-# BUILD DASHBOARD
-# ---------------------------------------------------------------------------
+def build_metrics(
+    issue_key: str,
+    summary: str,
+    stats: dict[str, dict[str, float]],
+) -> dict[str, Any]:
+    counts = {
+        status_name: int(
+            status_value.get("count", 0)
+        )
+        for status_name, status_value in stats.items()
+    }
 
-def build_dashboard_html(
-    summary,
-    stats,
-    execution_stats,
-    components,
-    page_body,
-):
-    pass_status = get_status(stats, "PASS")
-    fail_status = get_status(stats, "FAIL")
-    todo_status = get_status(stats, "TODO")
+    pass_count = counts.get("PASS", 0)
+    fail_count = counts.get("FAIL", 0)
 
-    pass_count = pass_status["count"]
-    fail_count = fail_status["count"]
-    todo_count = todo_status["count"]
+    todo_count = (
+        counts.get("TODO", 0)
+        + counts.get("TO DO", 0)
+        + counts.get("NOT EXECUTED", 0)
+    )
+
+    # Le total garde aussi les éventuels statuts personnalisés Xray.
+    total_count = sum(counts.values())
 
     completed_count = pass_count + fail_count
 
-    if completed_count:
-        pass_rate = round(
+    success_rate = (
+        round(
             pass_count / completed_count * 100,
-            2,
+            CSV_FLOAT_DECIMALS,
         )
-    else:
-        pass_rate = 0.0
-
-    now = datetime.now().astimezone()
-    snapshot_date = now + timedelta(
-        days=TEST_DAY_OFFSET
+        if completed_count
+        else 0.0
     )
 
-    today_iso = snapshot_date.strftime("%Y-%m-%d")
-    last_update = now.strftime("%d/%m/%Y à %H:%M")
-
-    # Historique général.
-    history = parse_existing_history(page_body)
-
-    previous_day_result = history.get(
-        today_iso
-    )
-
-    history[today_iso] = {
+    return {
+        "key": issue_key,
+        "summary": summary,
+        "total": total_count,
         "pass": pass_count,
         "fail": fail_count,
         "todo": todo_count,
-        "pass_rate": pass_rate,
+        "success_rate": success_rate,
     }
 
-    if previous_day_result is None:
+
+def get_issue_metrics_from_custom_field(
+    issue_key: str,
+) -> dict[str, Any] | None:
+    url = f"{JIRA_URL}/rest/api/2/issue/{issue_key}"
+
+    response = jira_get(
+        url,
+        params={
+            "fields": (
+                f"summary,{XRAY_STATS_CUSTOM_FIELD}"
+            ),
+        },
+    )
+
+    issue = response.json()
+    fields = issue.get("fields", {})
+
+    summary = str(
+        fields.get("summary", issue_key)
+    ).strip()
+
+    stats_data = fields.get(
+        XRAY_STATS_CUSTOM_FIELD
+    )
+
+    stats = parse_xray_stats(
+        stats_data
+    )
+
+    if not stats:
+        return None
+
+    return build_metrics(
+        issue_key=issue_key,
+        summary=summary,
+        stats=stats,
+    )
+
+
+def get_test_runs(
+    test_execution_key: str,
+) -> list[dict[str, Any]]:
+    """
+    Lit les Test Runs d'une Test Execution avec pagination lorsque
+    l'endpoint Xray la fournit.
+    """
+
+    url = (
+        f"{JIRA_URL}/rest/raven/1.0/api/testexec/"
+        f"{test_execution_key}/test"
+    )
+
+    results: list[dict[str, Any]] = []
+    start = 0
+    limit = 100
+
+    while True:
+        response = jira_get(
+            url,
+            params={
+                "start": start,
+                "limit": limit,
+            },
+        )
+
+        payload = response.json()
+
+        if isinstance(payload, list):
+            current_results = payload
+            total = len(payload)
+
+        elif isinstance(payload, dict):
+            current_results = (
+                payload.get("results")
+                or payload.get("tests")
+                or payload.get("entries")
+                or payload.get("values")
+                or []
+            )
+            total = int(
+                payload.get(
+                    "total",
+                    len(current_results),
+                )
+            )
+
+        else:
+            current_results = []
+            total = 0
+
+        current_results = [
+            result
+            for result in current_results
+            if isinstance(result, dict)
+        ]
+
+        results.extend(
+            current_results
+        )
+
+        if not current_results:
+            break
+
+        start += len(current_results)
+
+        if start >= total:
+            break
+
+        if len(current_results) < limit:
+            break
+
+    return results
+
+
+def get_test_execution_metrics_from_runs(
+    test_execution_key: str,
+) -> dict[str, Any]:
+    issue_url = (
+        f"{JIRA_URL}/rest/api/2/issue/"
+        f"{test_execution_key}"
+    )
+
+    issue_response = jira_get(
+        issue_url,
+        params={"fields": "summary"},
+    )
+
+    summary = str(
+        issue_response.json()
+        .get("fields", {})
+        .get("summary", test_execution_key)
+    ).strip()
+
+    status_counts: dict[str, int] = {}
+
+    for test_run in get_test_runs(
+        test_execution_key
+    ):
+        status = normalize_status_name(
+            test_run.get("status")
+            or test_run.get("testRunStatus")
+            or test_run.get("executionStatus")
+        )
+
+        status_counts[status] = (
+            status_counts.get(status, 0) + 1
+        )
+
+    stats = {
+        status_name: {
+            "count": count,
+            "percent": 0,
+        }
+        for status_name, count in status_counts.items()
+    }
+
+    return build_metrics(
+        issue_key=test_execution_key,
+        summary=summary,
+        stats=stats,
+    )
+
+
+def get_test_plan_metrics() -> dict[str, Any]:
+    print(
+        f"🔎 Statistiques du Test Plan "
+        f"{TEST_PLAN_KEY}"
+    )
+
+    metrics = get_issue_metrics_from_custom_field(
+        TEST_PLAN_KEY
+    )
+
+    if metrics is None:
+        raise ValueError(
+            f"Le champ {XRAY_STATS_CUSTOM_FIELD} est absent "
+            f"ou vide sur le Test Plan {TEST_PLAN_KEY}."
+        )
+
+    return metrics
+
+
+def extract_test_execution_keys(
+    payload: Any,
+) -> list[str]:
+    if isinstance(payload, dict):
+        for container_name in (
+            "testExecutions",
+            "results",
+            "issues",
+            "values",
+            "entries",
+        ):
+            if container_name in payload:
+                payload = payload[container_name]
+                break
+        else:
+            payload = [payload]
+
+    if not isinstance(payload, list):
+        raise ValueError(
+            "Format Xray inattendu pour les Test Executions."
+        )
+
+    keys: list[str] = []
+
+    for item in payload:
+        candidate = None
+
+        if isinstance(item, str):
+            candidate = item
+
+        elif isinstance(item, dict):
+            candidate = (
+                item.get("key")
+                or item.get("issueKey")
+                or item.get("testExecutionKey")
+            )
+
+        if (
+            candidate
+            and ISSUE_KEY_PATTERN.match(
+                str(candidate)
+            )
+        ):
+            keys.append(
+                str(candidate).upper()
+            )
+
+    return list(
+        dict.fromkeys(keys)
+    )
+
+
+def get_test_execution_keys() -> list[str]:
+    url = (
+        f"{JIRA_URL}/rest/raven/1.0/api/testplan/"
+        f"{TEST_PLAN_KEY}/testexecution"
+    )
+
+    print(
+        f"🔎 Test Executions liées au Test Plan "
+        f"{TEST_PLAN_KEY}"
+    )
+
+    response = jira_get(url)
+    keys = extract_test_execution_keys(
+        response.json()
+    )
+
+    if not keys:
+        raise ValueError(
+            f"Aucune Test Execution trouvée pour "
+            f"{TEST_PLAN_KEY}."
+        )
+
+    print(
+        f"✅ {len(keys)} Test Execution(s) : "
+        + ", ".join(keys)
+    )
+
+    return keys
+
+
+def get_all_test_execution_metrics() -> list[dict[str, Any]]:
+    results = []
+
+    for test_execution_key in get_test_execution_keys():
+        metrics = get_issue_metrics_from_custom_field(
+            test_execution_key
+        )
+
+        if metrics is None:
+            print(
+                f"⚠️ Champ Xray absent sur "
+                f"{test_execution_key}. "
+                "Lecture des Test Runs."
+            )
+
+            metrics = (
+                get_test_execution_metrics_from_runs(
+                    test_execution_key
+                )
+            )
+
+        results.append(
+            metrics
+        )
+
         print(
-            f"➕ Historique général : ajout de la date "
-            f"{today_iso}"
+            f"📊 {metrics['summary']} : "
+            f"Total={metrics['total']} | "
+            f"PASS={metrics['pass']} | "
+            f"FAIL={metrics['fail']} | "
+            f"TODO={metrics['todo']} | "
+            f"Réussite={metrics['success_rate']:.2f}%"
+        )
+
+    # Le nom est unique selon la règle métier donnée.
+    return sorted(
+        results,
+        key=lambda item: item["summary"].lower(),
+    )
+
+
+# ===========================================================================
+# COLONNES DYNAMIQUES DES TEST EXECUTIONS
+# ===========================================================================
+
+def get_execution_columns(
+    execution_name: str,
+) -> list[str]:
+    return [
+        f"{execution_name} - Total",
+        f"{execution_name} - PASS",
+        f"{execution_name} - FAIL",
+        f"{execution_name} - TODO",
+        f"{execution_name} - Réussite (%)",
+    ]
+
+
+def add_execution_metrics_to_row(
+    row: dict[str, str],
+    execution_metrics: list[dict[str, Any]],
+) -> None:
+    for metrics in execution_metrics:
+        execution_name = metrics["summary"]
+        columns = get_execution_columns(
+            execution_name
+        )
+
+        row[columns[0]] = str(
+            metrics["total"]
+        )
+        row[columns[1]] = str(
+            metrics["pass"]
+        )
+        row[columns[2]] = str(
+            metrics["fail"]
+        )
+        row[columns[3]] = str(
+            metrics["todo"]
+        )
+        row[columns[4]] = format_float(
+            metrics["success_rate"]
+        )
+
+
+# ===========================================================================
+# CONFLUENCE - PAGE ET PIÈCE JOINTE
+# ===========================================================================
+
+def find_page_id(
+    session: requests.Session,
+) -> str:
+    """
+    Garde la recherche CQL utilisée précédemment.
+    """
+
+    cql = (
+        f'title ~ "{CONFLUENCE_PAGE_TITLE}" '
+        f'AND space = "{CONFLUENCE_SPACE_KEY}"'
+    )
+
+    url = (
+        f"{CONFLUENCE_URL}/rest/api/search"
+    )
+
+    response = session.get(
+        url,
+        params={
+            "cql": cql,
+            "start": 0,
+            "limit": 10,
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    results = response.json().get(
+        "results",
+        [],
+    )
+
+    if not results:
+        raise ValueError(
+            f"Page Confluence "
+            f"'{CONFLUENCE_PAGE_TITLE}' introuvable."
+        )
+
+    page_id = str(
+        results[0]["content"]["id"]
+    )
+
+    print(
+        f"✅ Page Confluence trouvée : "
+        f"{page_id}"
+    )
+
+    return page_id
+
+
+def find_csv_attachment(
+    session: requests.Session,
+    page_id: str,
+) -> dict[str, Any] | None:
+    url = (
+        f"{CONFLUENCE_URL}/rest/api/content/"
+        f"{page_id}/child/attachment"
+    )
+
+    response = session.get(
+        url,
+        params={
+            "filename": CSV_FILENAME,
+            "limit": 200,
+            "expand": "version",
+        },
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    for attachment in response.json().get(
+        "results",
+        [],
+    ):
+        if attachment.get("title") == CSV_FILENAME:
+            return attachment
+
+    return None
+
+
+def make_absolute_confluence_url(
+    link: str,
+) -> str:
+    if link.startswith(
+        ("http://", "https://")
+    ):
+        return link
+
+    parsed_base = urlparse(
+        CONFLUENCE_URL
+    )
+
+    origin = (
+        f"{parsed_base.scheme}://"
+        f"{parsed_base.netloc}"
+    )
+
+    if link.startswith("/"):
+        return urljoin(
+            origin + "/",
+            link.lstrip("/"),
+        )
+
+    return urljoin(
+        CONFLUENCE_URL.rstrip("/") + "/",
+        link,
+    )
+
+
+def download_attachment_content(
+    session: requests.Session,
+    page_id: str,
+    attachment: dict[str, Any],
+) -> bytes:
+    download_link = (
+        attachment.get("_links", {})
+        .get("download")
+    )
+
+    if download_link:
+        download_url = (
+            make_absolute_confluence_url(
+                download_link
+            )
+        )
+    else:
+        download_url = (
+            f"{CONFLUENCE_URL}/download/attachments/"
+            f"{page_id}/{quote(CSV_FILENAME)}"
+        )
+
+    response = session.get(
+        download_url,
+        timeout=30,
+    )
+    response.raise_for_status()
+
+    return response.content
+
+
+def create_csv_attachment(
+    session: requests.Session,
+    page_id: str,
+    csv_content: bytes,
+) -> None:
+    url = (
+        f"{CONFLUENCE_URL}/rest/api/content/"
+        f"{page_id}/child/attachment"
+    )
+
+    response = session.post(
+        url,
+        headers={
+            "X-Atlassian-Token": "no-check",
+        },
+        files={
+            "file": (
+                CSV_FILENAME,
+                io.BytesIO(csv_content),
+                "text/csv",
+            )
+        },
+        data={
+            "comment": (
+                "Création automatique des données "
+                "du dashboard night run"
+            )
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+
+    print(
+        f"✅ Pièce jointe créée : "
+        f"{CSV_FILENAME}"
+    )
+
+
+def update_csv_attachment(
+    session: requests.Session,
+    page_id: str,
+    attachment_id: str,
+    csv_content: bytes,
+) -> None:
+    url = (
+        f"{CONFLUENCE_URL}/rest/api/content/"
+        f"{page_id}/child/attachment/"
+        f"{attachment_id}/data"
+    )
+
+    response = session.post(
+        url,
+        headers={
+            "X-Atlassian-Token": "no-check",
+        },
+        files={
+            "file": (
+                CSV_FILENAME,
+                io.BytesIO(csv_content),
+                "text/csv",
+            )
+        },
+        data={
+            "comment": (
+                "Mise à jour automatique des données "
+                "du dashboard night run"
+            )
+        },
+        timeout=60,
+    )
+    response.raise_for_status()
+
+    print(
+        f"✅ Nouvelle version de la pièce jointe : "
+        f"{CSV_FILENAME}"
+    )
+
+
+# ===========================================================================
+# CSV
+# ===========================================================================
+
+def format_float(
+    value: float,
+) -> str:
+    return f"{float(value):.{CSV_FLOAT_DECIMALS}f}"
+
+
+def read_existing_csv(
+    csv_content: bytes | None,
+) -> tuple[list[str], list[dict[str, str]]]:
+    if not csv_content:
+        return [], []
+
+    text = csv_content.decode(
+        "utf-8-sig"
+    )
+
+    reader = csv.DictReader(
+        io.StringIO(text),
+        delimiter=CSV_DELIMITER,
+    )
+
+    if not reader.fieldnames:
+        return [], []
+
+    rows = [
+        {
+            str(key): (
+                "" if value is None else str(value)
+            )
+            for key, value in row.items()
+        }
+        for row in reader
+    ]
+
+    return list(reader.fieldnames), rows
+
+
+def build_csv_headers(
+    existing_headers: list[str],
+    execution_metrics: list[dict[str, Any]],
+) -> list[str]:
+    headers = []
+
+    for header in (
+        FIXED_HEADERS
+        + get_component_headers()
+    ):
+        if header not in headers:
+            headers.append(header)
+
+    # Les anciennes colonnes sont conservées pour préserver l'historique
+    # et la configuration des graphiques manuels.
+    for header in existing_headers:
+        if header not in headers:
+            headers.append(header)
+
+    # Une nouvelle Test Execution ajoute ses cinq colonnes à la fin.
+    for metrics in execution_metrics:
+        for header in get_execution_columns(
+            metrics["summary"]
+        ):
+            if header not in headers:
+                headers.append(header)
+
+    return headers
+
+
+def parse_row_date(
+    row: dict[str, str],
+) -> datetime | None:
+    date_value = str(
+        row.get(DATE_COLUMN, "")
+    ).strip()
+
+    try:
+        return datetime.strptime(
+            date_value,
+            "%d/%m/%Y",
+        )
+    except ValueError:
+        return None
+
+
+def retain_last_days(
+    rows_by_date: dict[str, dict[str, str]],
+) -> dict[str, dict[str, str]]:
+    dated_rows = []
+
+    for date_value, row in rows_by_date.items():
+        try:
+            parsed_date = datetime.strptime(
+                date_value,
+                "%d/%m/%Y",
+            )
+        except ValueError:
+            continue
+
+        dated_rows.append(
+            (
+                parsed_date,
+                date_value,
+                row,
+            )
+        )
+
+    dated_rows.sort(
+        key=lambda item: item[0]
+    )
+
+    retained = dated_rows[
+        -MAX_HISTORY_DAYS:
+    ]
+
+    return {
+        date_value: row
+        for _, date_value, row in retained
+    }
+
+
+def build_current_row(
+    existing_row: dict[str, str] | None,
+    test_plan_metrics: dict[str, Any],
+    execution_metrics: list[dict[str, Any]],
+    components: list[dict[str, str]],
+    snapshot_datetime: datetime,
+) -> dict[str, str]:
+    # Part de l'ancienne ligne afin de ne pas effacer une ancienne colonne
+    # qui n'est plus remontée par le Test Plan.
+    row = dict(
+        existing_row or {}
+    )
+
+    row[DATE_COLUMN] = (
+        snapshot_datetime.strftime(
+            "%d/%m/%Y"
+        )
+    )
+    row[UPDATE_TIME_COLUMN] = (
+        snapshot_datetime.strftime(
+            "%H:%M:%S"
+        )
+    )
+
+    row[TEST_PLAN_KEY_COLUMN] = (
+        test_plan_metrics["key"]
+    )
+    row[TEST_PLAN_NAME_COLUMN] = (
+        test_plan_metrics["summary"]
+    )
+
+    row[GLOBAL_TOTAL_COLUMN] = str(
+        test_plan_metrics["total"]
+    )
+    row[GLOBAL_PASS_COLUMN] = str(
+        test_plan_metrics["pass"]
+    )
+    row[GLOBAL_FAIL_COLUMN] = str(
+        test_plan_metrics["fail"]
+    )
+    row[GLOBAL_TODO_COLUMN] = str(
+        test_plan_metrics["todo"]
+    )
+    row[GLOBAL_RATE_COLUMN] = format_float(
+        test_plan_metrics["success_rate"]
+    )
+
+    add_components_to_row(
+        row,
+        components,
+    )
+
+    add_execution_metrics_to_row(
+        row,
+        execution_metrics,
+    )
+
+    return row
+
+
+def update_rows_for_current_day(
+    existing_rows: list[dict[str, str]],
+    current_row: dict[str, str],
+) -> list[dict[str, str]]:
+    rows_by_date: dict[str, dict[str, str]] = {}
+
+    for row in existing_rows:
+        parsed_date = parse_row_date(row)
+
+        if parsed_date is None:
+            continue
+
+        normalized_date = parsed_date.strftime(
+            "%d/%m/%Y"
+        )
+
+        rows_by_date[normalized_date] = row
+
+    current_date = current_row[
+        DATE_COLUMN
+    ]
+
+    if current_date in rows_by_date:
+        print(
+            f"🔄 Remplacement de la ligne CSV "
+            f"du {current_date}"
         )
     else:
         print(
-            f"🔄 Historique général : remplacement des valeurs "
-            f"de la date {today_iso}"
+            f"➕ Ajout de la ligne CSV "
+            f"du {current_date}"
         )
 
-    # Historique par Test Execution limité à 7 journées.
-    execution_history = update_execution_history(
-        page_body,
-        today_iso,
-        execution_stats,
+    rows_by_date[current_date] = (
+        current_row
     )
 
-    components_table = build_components_table(
-        components
-    )
-    chart_macro = build_chart_macro(history)
-    execution_history_table = build_execution_history_table(
-        execution_history
-    )
-    general_history_table = build_general_history_table(
-        history
+    rows_by_date = retain_last_days(
+        rows_by_date
     )
 
-    safe_summary = escape(str(summary))
-    safe_test_plan_key = escape(str(TEST_PLAN_KEY))
-    safe_jira_url = escape(str(JIRA_URL).rstrip("/"))
-
-    start_anchor = build_anchor_macro(
-        START_ANCHOR_NAME
-    )
-    end_anchor = build_anchor_macro(
-        END_ANCHOR_NAME
+    rows = list(
+        rows_by_date.values()
     )
 
-    return f"""
-{start_anchor}
-
-<h1>Dashboard Night Run Automation</h1>
-
-<p>
-    <strong>Test Plan :</strong>
-    {safe_summary}
-    (
-        <a href="{safe_jira_url}/browse/{safe_test_plan_key}">
-            <code>{safe_test_plan_key}</code>
-        </a>
-    )
-</p>
-
-<p>
-    <em>Dernière mise à jour automatique : {escape(last_update)}</em>
-</p>
-
-{components_table}
-
-<p><br /></p>
-
-<h2>Évolution globale PASS / FAIL</h2>
-
-{chart_macro}
-
-<p><br /></p>
-
-{execution_history_table}
-
-<p><br /></p>
-
-{general_history_table}
-
-{end_anchor}
-""".strip()
-
-
-# ---------------------------------------------------------------------------
-# NETTOYAGE DES ANCIENNES VERSIONS
-# ---------------------------------------------------------------------------
-
-def remove_legacy_daily_dashboard_blocks(page_body):
-    legacy_pattern = re.compile(
-        r"<h1>\s*Dashboard Night Run Automation\s*</h1>"
-        r".*?"
-        r"<h2>\s*Résultats journaliers\s*</h2>"
-        r"(?:"
-        r"\s*(?:<!--.*?-->\s*)?"
-        r"<h3>\s*Night run du\s+\d{2}/\d{2}/\d{4}\s*</h3>"
-        r"\s*<table\b.*?</table>"
-        r"\s*(?:<p>\s*<br\s*/?>\s*</p>)?"
-        r")+",
-        flags=re.DOTALL | re.IGNORECASE,
+    rows.sort(
+        key=lambda row: (
+            parse_row_date(row)
+            or datetime.min
+        )
     )
 
-    return legacy_pattern.subn(
-        "",
-        page_body,
+    return rows
+
+
+def generate_csv_content(
+    headers: list[str],
+    rows: list[dict[str, str]],
+) -> bytes:
+    buffer = io.StringIO(
+        newline=""
     )
 
-
-def remove_legacy_single_history_blocks(page_body):
-    legacy_pattern = re.compile(
-        r"<h1>\s*Dashboard Night Run Automation\s*</h1>"
-        r".*?"
-        r"<h[23]>\s*Historique quotidien\s*</h[23]>"
-        r"\s*<table\b.*?</table>"
-        r"(?:\s*<p>.*?Dernière mise à jour automatique.*?</p>)?",
-        flags=re.DOTALL | re.IGNORECASE,
+    writer = csv.DictWriter(
+        buffer,
+        fieldnames=headers,
+        delimiter=CSV_DELIMITER,
+        extrasaction="ignore",
+        lineterminator="\n",
     )
 
-    return legacy_pattern.subn(
-        "",
-        page_body,
-    )
+    writer.writeheader()
 
-
-# ---------------------------------------------------------------------------
-# MERGE
-# ---------------------------------------------------------------------------
-
-def merge_dashboard_into_page(existing_body, dashboard_html):
-    body = existing_body
-
-    body, managed_count = dashboard_block_pattern().subn(
-        "",
-        body,
-    )
-
-    body, legacy_daily_count = remove_legacy_daily_dashboard_blocks(
-        body
-    )
-    body, legacy_history_count = remove_legacy_single_history_blocks(
-        body
-    )
-
-    removed_count = (
-        managed_count
-        + legacy_daily_count
-        + legacy_history_count
-    )
-
-    print(
-        f"🧹 Blocs dashboard supprimés avant reconstruction : "
-        f"{removed_count}"
-    )
-
-    remaining_body = body.strip()
-
-    if not remaining_body:
-        return dashboard_html
-
-    return (
-        dashboard_html
-        + "<p><br /></p>"
-        + remaining_body
-    )
-
-
-# ---------------------------------------------------------------------------
-# CONFLUENCE - UPDATE PAGE
-# ---------------------------------------------------------------------------
-
-def update_confluence_page(
-    sess,
-    page_id,
-    html,
-    current_version,
-    title,
-):
-    """PUT : met à jour la page avec version + 1."""
-
-    url = f"{CONFLUENCE_URL}/rest/api/content/{page_id}"
-
-    payload = {
-        "id": str(page_id),
-        "type": "page",
-        "title": title,
-        "version": {
-            "number": current_version + 1,
-        },
-        "body": {
-            "storage": {
-                "value": html,
-                "representation": "storage",
+    for row in rows:
+        writer.writerow(
+            {
+                header: row.get(
+                    header,
+                    "",
+                )
+                for header in headers
             }
-        },
-    }
-
-    print(
-        f"📤 Envoi du PUT Confluence "
-        f"(version {current_version + 1}) ..."
-    )
-
-    resp = sess.put(
-        url,
-        json=payload,
-        timeout=30,
-    )
-
-    if resp.status_code not in (200, 201, 204):
-        raise Exception(
-            f"Erreur update Confluence "
-            f"({resp.status_code}) : {resp.text}"
         )
 
-    print("✅ Dashboard mis à jour avec succès.")
+    # utf-8-sig ajoute un BOM utile pour l'ouverture directe dans Excel.
+    return buffer.getvalue().encode(
+        "utf-8-sig"
+    )
 
 
-# ---------------------------------------------------------------------------
+# ===========================================================================
 # MAIN
-# ---------------------------------------------------------------------------
+# ===========================================================================
+
+def main() -> None:
+    confluence_session = (
+        make_confluence_session()
+    )
+
+    # 1. Récupération de toutes les données Xray.
+    test_plan_metrics = (
+        get_test_plan_metrics()
+    )
+
+    execution_metrics = (
+        get_all_test_execution_metrics()
+    )
+
+    # 2. Lecture des composants via DataManager.
+    components = (
+        load_components_from_excel()
+    )
+
+    # 3. Recherche de la page et de la pièce jointe.
+    page_id = find_page_id(
+        confluence_session
+    )
+
+    attachment = find_csv_attachment(
+        confluence_session,
+        page_id,
+    )
+
+    existing_csv_content = None
+
+    if attachment is not None:
+        print(
+            f"📥 Téléchargement de la pièce jointe "
+            f"existante : {CSV_FILENAME}"
+        )
+
+        existing_csv_content = (
+            download_attachment_content(
+                confluence_session,
+                page_id,
+                attachment,
+            )
+        )
+    else:
+        print(
+            f"ℹ️ La pièce jointe {CSV_FILENAME} "
+            "n'existe pas encore."
+        )
+
+    # 4. Lecture de l'historique CSV.
+    existing_headers, existing_rows = (
+        read_existing_csv(
+            existing_csv_content
+        )
+    )
+
+    print(
+        f"📚 Historique CSV relu : "
+        f"{len(existing_rows)} ligne(s)"
+    )
+
+    # 5. Snapshot du jour.
+    now = datetime.now().astimezone()
+
+    snapshot_datetime = (
+        now
+        + timedelta(
+            days=TEST_DAY_OFFSET
+        )
+    )
+
+    snapshot_date = (
+        snapshot_datetime.strftime(
+            "%d/%m/%Y"
+        )
+    )
+
+    existing_today_row = next(
+        (
+            row
+            for row in existing_rows
+            if str(
+                row.get(DATE_COLUMN, "")
+            ).strip() == snapshot_date
+        ),
+        None,
+    )
+
+    current_row = build_current_row(
+        existing_row=existing_today_row,
+        test_plan_metrics=test_plan_metrics,
+        execution_metrics=execution_metrics,
+        components=components,
+        snapshot_datetime=snapshot_datetime,
+    )
+
+    updated_rows = (
+        update_rows_for_current_day(
+            existing_rows=existing_rows,
+            current_row=current_row,
+        )
+    )
+
+    headers = build_csv_headers(
+        existing_headers=existing_headers,
+        execution_metrics=execution_metrics,
+    )
+
+    new_csv_content = generate_csv_content(
+        headers=headers,
+        rows=updated_rows,
+    )
+
+    # Copie locale.
+    LOCAL_CSV_PATH.write_bytes(
+        new_csv_content
+    )
+
+    print(
+        f"💾 CSV local généré : "
+        f"{LOCAL_CSV_PATH.resolve()}"
+    )
+
+    print(
+        f"📅 Jours conservés : "
+        f"{len(updated_rows)}/{MAX_HISTORY_DAYS}"
+    )
+
+    # 6. Création ou mise à jour de la pièce jointe.
+    if attachment is None:
+        create_csv_attachment(
+            session=confluence_session,
+            page_id=page_id,
+            csv_content=new_csv_content,
+        )
+    else:
+        update_csv_attachment(
+            session=confluence_session,
+            page_id=page_id,
+            attachment_id=str(
+                attachment["id"]
+            ),
+            csv_content=new_csv_content,
+        )
+
+    print(
+        "✅ Terminé : le corps de la page "
+        "Confluence n'a pas été modifié."
+    )
+
 
 if __name__ == "__main__":
-    sess = make_session()
-
     try:
-        # 1. Statistiques consolidées du Test Plan.
-        print("🚀 Extraction des statistiques JIRA ...")
-
-        jira_info = get_jira_stats(TEST_PLAN_KEY)
-        summary = jira_info["summary"]
-        stats = jira_info["stats"]
-
-        print(f"📊 Summary : {summary}")
-        print(f"📊 Stats : {stats}")
-
-        # 2. Pourcentage PASS de chaque Test Execution liée au Test Plan.
-        execution_stats = get_test_executions_pass_stats(
-            TEST_PLAN_KEY
-        )
-
-        # 3. Chargement des URL des composants depuis Excel.
-        print("🚀 Chargement des composants via DataManager ...")
-
-        components = load_components_from_excel()
-
-        # 4. Recherche de la page Confluence.
-        page_id = find_page_id(sess)
-
-        print(f"✅ Page trouvée - ID : {page_id}")
-
-        # 5. Version et titre exacts.
-        version, exact_title = get_page_info(
-            sess,
-            page_id,
-        )
-
-        print(
-            f"🔎 Page '{exact_title}' "
-            f"- version actuelle : {version}"
-        )
-
-        # 6. Contenu actuel.
-        current_body = get_page_body(
-            sess,
-            page_id,
-        )
-
-        # 7. Construction du dashboard.
-        dashboard_html = build_dashboard_html(
-            summary,
-            stats,
-            execution_stats,
-            components,
-            current_body,
-        )
-
-        # 8. Remplacement du dashboard unique.
-        full_page_body = merge_dashboard_into_page(
-            current_body,
-            dashboard_html,
-        )
-
-        # 9. Mise à jour Confluence.
-        update_confluence_page(
-            sess,
-            page_id,
-            full_page_body,
-            version,
-            exact_title,
-        )
-
+        main()
     except Exception as error:
-        print(f"❌ Une erreur est survenue : {error}")
+        print(
+            f"❌ Une erreur est survenue : "
+            f"{error}"
+        )
         sys.exit(1)
