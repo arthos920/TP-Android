@@ -8,7 +8,7 @@ import sys
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urljoin, urlparse
+from urllib.parse import quote, urlparse
 
 import requests
 import urllib3
@@ -37,7 +37,7 @@ JIRA_PROXY_URL = ""
 # Test Plan Xray ciblé.
 TEST_PLAN_KEY = ""
 
-# Champ Xray contenant les statistiques du Test Plan et des Test Executions.
+# Champ Xray contenant les statistiques consolidées.
 XRAY_STATS_CUSTOM_FIELD = "customfield_11527"
 
 
@@ -54,10 +54,10 @@ CONFLUENCE_PROXY_URL = ""
 CONFLUENCE_PAGE_TITLE = "Dashboard night run automation"
 CONFLUENCE_SPACE_KEY = "TEI"
 
-# Le même fichier est créé puis versionné sur la page.
+# La même pièce jointe est mise à jour à chaque lancement.
 CSV_FILENAME = "night_run_dashboard.csv"
 
-# Copie locale créée à chaque lancement pour faciliter le diagnostic.
+# Copie locale créée à chaque lancement.
 LOCAL_CSV_PATH = Path(CSV_FILENAME)
 
 
@@ -65,17 +65,18 @@ LOCAL_CSV_PATH = Path(CSV_FILENAME)
 # HISTORIQUE
 # ---------------------------------------------------------------------------
 
-# Nombre maximal de journées conservées dans le CSV.
+# Nombre maximal de journées conservées pour le Test Plan et les
+# Test Executions.
 MAX_HISTORY_DAYS = 7
 
-# Décalage uniquement destiné aux tests :
+# Décalage utilisé uniquement pour les tests :
 # 0 = aujourd'hui, 1 = J+1, 2 = J+2...
 TEST_DAY_OFFSET = 0
 
-# Séparateur adapté à Excel en environnement français.
+# Séparateur adapté à Excel et aux macros CSV en environnement français.
 CSV_DELIMITER = ";"
 
-# Les pourcentages sont écrits comme des nombres bruts :
+# Les pourcentages restent des nombres bruts dans le CSV :
 # 96.88 et non "96.88 %".
 CSV_FLOAT_DECIMALS = 2
 
@@ -83,8 +84,11 @@ CSV_FLOAT_DECIMALS = 2
 # ---------------------------------------------------------------------------
 # COMPOSANTS / DATAMANAGER
 #
-# Les données des composants sont conservées dans le CSV sous forme de
-# colonnes fixes. Mets INCLUDE_COMPONENTS_IN_CSV = False pour les retirer.
+# Les composants sont également stockés dans le CSV long avec :
+# Niveau = Composant
+#
+# Leur Date reste vide, car ils ne constituent pas un historique journalier.
+# À chaque lancement, les anciennes lignes Composant sont remplacées.
 # ---------------------------------------------------------------------------
 
 INCLUDE_COMPONENTS_IN_CSV = True
@@ -125,31 +129,38 @@ COMPONENT_SETTINGS = [
 
 
 # ===========================================================================
-# CONSTANTES DU CSV
+# FORMAT LONG DU CSV
 # ===========================================================================
 
 DATE_COLUMN = "Date"
 UPDATE_TIME_COLUMN = "Heure de mise à jour"
-TEST_PLAN_KEY_COLUMN = "Test Plan - Clé"
-TEST_PLAN_NAME_COLUMN = "Test Plan - Nom"
+LEVEL_COLUMN = "Niveau"
+NAME_COLUMN = "Nom"
+KEY_COLUMN = "Clé"
+URL_COLUMN = "URL"
+TOTAL_COLUMN = "Total"
+PASS_COLUMN = "PASS"
+FAIL_COLUMN = "FAIL"
+TODO_COLUMN = "TODO"
+SUCCESS_RATE_COLUMN = "Réussite (%)"
 
-GLOBAL_TOTAL_COLUMN = "Global - Total"
-GLOBAL_PASS_COLUMN = "Global - PASS"
-GLOBAL_FAIL_COLUMN = "Global - FAIL"
-GLOBAL_TODO_COLUMN = "Global - TODO"
-GLOBAL_RATE_COLUMN = "Global - Réussite (%)"
-
-FIXED_HEADERS = [
+CSV_HEADERS = [
     DATE_COLUMN,
     UPDATE_TIME_COLUMN,
-    TEST_PLAN_KEY_COLUMN,
-    TEST_PLAN_NAME_COLUMN,
-    GLOBAL_TOTAL_COLUMN,
-    GLOBAL_PASS_COLUMN,
-    GLOBAL_FAIL_COLUMN,
-    GLOBAL_TODO_COLUMN,
-    GLOBAL_RATE_COLUMN,
+    LEVEL_COLUMN,
+    NAME_COLUMN,
+    KEY_COLUMN,
+    URL_COLUMN,
+    TOTAL_COLUMN,
+    PASS_COLUMN,
+    FAIL_COLUMN,
+    TODO_COLUMN,
+    SUCCESS_RATE_COLUMN,
 ]
+
+LEVEL_TEST_PLAN = "Test Plan"
+LEVEL_TEST_EXECUTION = "Test Execution"
+LEVEL_COMPONENT = "Composant"
 
 ISSUE_KEY_PATTERN = re.compile(
     r"^[A-Z][A-Z0-9_]*-\d+$",
@@ -189,23 +200,26 @@ def jira_get(
 
 def make_confluence_session() -> requests.Session:
     """
-    Ne met volontairement pas Content-Type=application/json.
+    Ne définit pas Content-Type globalement.
 
-    Lors de l'upload du CSV, requests doit construire automatiquement
-    l'en-tête multipart/form-data.
+    requests construira automatiquement multipart/form-data lors de
+    l'envoi de la pièce jointe.
     """
 
     session = requests.Session()
     session.verify = False
+
     session.proxies.update(
         build_proxies(CONFLUENCE_PROXY_URL) or {}
     )
+
     session.headers.update(
         {
             "Authorization": f"Bearer {CONFLUENCE_TOKEN}",
             "Accept": "application/json",
         }
     )
+
     return session
 
 
@@ -219,7 +233,7 @@ def get_component_url(
     datafile: str = COMPONENTS_DATAFILE,
 ) -> str:
     """
-    Reprend la logique utilisée dans le module Keycloak :
+    Reprend la logique utilisée dans ton module Keycloak :
 
         DataManager(datafile=datafile, actor=obj_alias)
         returnExcelDict(obj_alias)
@@ -263,16 +277,13 @@ def get_component_url(
     return component_url
 
 
-def load_components_from_excel() -> list[dict[str, str]]:
+def build_component_rows() -> list[dict[str, str]]:
     if not INCLUDE_COMPONENTS_IN_CSV:
         return []
 
-    components = []
+    rows = []
 
-    for index, setting in enumerate(
-        COMPONENT_SETTINGS,
-        start=1,
-    ):
+    for setting in COMPONENT_SETTINGS:
         component_name = str(
             setting["name"]
         ).strip()
@@ -281,65 +292,30 @@ def load_components_from_excel() -> list[dict[str, str]]:
             setting["alias"]
         ).strip()
 
-        component_url_key = str(
+        url_key = str(
             setting["url_key"]
         ).strip()
 
         print(
-            f"🔎 DataManager composant {index} : "
-            f"{component_name} "
-            f"(alias={component_alias}, clé={component_url_key})"
+            f"🔎 DataManager : {component_name} "
+            f"(alias={component_alias}, clé={url_key})"
         )
 
         component_url = get_component_url(
             obj_alias=component_alias,
-            url_key=component_url_key,
+            url_key=url_key,
         )
 
-        components.append(
-            {
-                "index": str(index),
-                "name": component_name,
-                "url": component_url,
-            }
+        rows.append(
+            empty_long_row(
+                level=LEVEL_COMPONENT,
+                name=component_name,
+                key=component_alias,
+                url=component_url,
+            )
         )
 
-    return components
-
-
-def get_component_headers() -> list[str]:
-    if not INCLUDE_COMPONENTS_IN_CSV:
-        return []
-
-    headers = []
-
-    for index in range(
-        1,
-        len(COMPONENT_SETTINGS) + 1,
-    ):
-        headers.extend(
-            [
-                f"Composant {index} - Nom",
-                f"Composant {index} - URL",
-            ]
-        )
-
-    return headers
-
-
-def add_components_to_row(
-    row: dict[str, str],
-    components: list[dict[str, str]],
-) -> None:
-    for component in components:
-        index = component["index"]
-
-        row[f"Composant {index} - Nom"] = (
-            component["name"]
-        )
-        row[f"Composant {index} - URL"] = (
-            component["url"]
-        )
+    return rows
 
 
 # ===========================================================================
@@ -406,7 +382,7 @@ def build_metrics(
         + counts.get("NOT EXECUTED", 0)
     )
 
-    # Le total garde aussi les éventuels statuts personnalisés Xray.
+    # Le total garde également les éventuels statuts Xray personnalisés.
     total_count = sum(counts.values())
 
     completed_count = pass_count + fail_count
@@ -452,12 +428,8 @@ def get_issue_metrics_from_custom_field(
         fields.get("summary", issue_key)
     ).strip()
 
-    stats_data = fields.get(
-        XRAY_STATS_CUSTOM_FIELD
-    )
-
     stats = parse_xray_stats(
-        stats_data
+        fields.get(XRAY_STATS_CUSTOM_FIELD)
     )
 
     if not stats:
@@ -474,8 +446,7 @@ def get_test_runs(
     test_execution_key: str,
 ) -> list[dict[str, Any]]:
     """
-    Lit les Test Runs d'une Test Execution avec pagination lorsque
-    l'endpoint Xray la fournit.
+    Lit les Test Runs d'une Test Execution.
     """
 
     url = (
@@ -510,6 +481,7 @@ def get_test_runs(
                 or payload.get("values")
                 or []
             )
+
             total = int(
                 payload.get(
                     "total",
@@ -677,6 +649,7 @@ def get_test_execution_keys() -> list[str]:
     )
 
     response = jira_get(url)
+
     keys = extract_test_execution_keys(
         response.json()
     )
@@ -729,7 +702,6 @@ def get_all_test_execution_metrics() -> list[dict[str, Any]]:
             f"Réussite={metrics['success_rate']:.2f}%"
         )
 
-    # Le nom est unique selon la règle métier donnée.
     return sorted(
         results,
         key=lambda item: item["summary"].lower(),
@@ -737,46 +709,109 @@ def get_all_test_execution_metrics() -> list[dict[str, Any]]:
 
 
 # ===========================================================================
-# COLONNES DYNAMIQUES DES TEST EXECUTIONS
+# CONSTRUCTION DES LIGNES LONGUES
 # ===========================================================================
 
-def get_execution_columns(
-    execution_name: str,
-) -> list[str]:
-    return [
-        f"{execution_name} - Total",
-        f"{execution_name} - PASS",
-        f"{execution_name} - FAIL",
-        f"{execution_name} - TODO",
-        f"{execution_name} - Réussite (%)",
+def format_float(value: float) -> str:
+    return f"{float(value):.{CSV_FLOAT_DECIMALS}f}"
+
+
+def jira_issue_url(issue_key: str) -> str:
+    return (
+        f"{JIRA_URL.rstrip('/')}/browse/"
+        f"{issue_key}"
+    )
+
+
+def empty_long_row(
+    level: str = "",
+    name: str = "",
+    key: str = "",
+    url: str = "",
+) -> dict[str, str]:
+    return {
+        DATE_COLUMN: "",
+        UPDATE_TIME_COLUMN: "",
+        LEVEL_COLUMN: level,
+        NAME_COLUMN: name,
+        KEY_COLUMN: key,
+        URL_COLUMN: url,
+        TOTAL_COLUMN: "",
+        PASS_COLUMN: "",
+        FAIL_COLUMN: "",
+        TODO_COLUMN: "",
+        SUCCESS_RATE_COLUMN: "",
+    }
+
+
+def metrics_to_long_row(
+    metrics: dict[str, Any],
+    level: str,
+    snapshot_datetime: datetime,
+) -> dict[str, str]:
+    row = empty_long_row(
+        level=level,
+        name=str(metrics["summary"]),
+        key=str(metrics["key"]),
+        url=jira_issue_url(
+            str(metrics["key"])
+        ),
+    )
+
+    row[DATE_COLUMN] = (
+        snapshot_datetime.strftime(
+            "%d/%m/%Y"
+        )
+    )
+
+    row[UPDATE_TIME_COLUMN] = (
+        snapshot_datetime.strftime(
+            "%H:%M:%S"
+        )
+    )
+
+    row[TOTAL_COLUMN] = str(
+        metrics["total"]
+    )
+    row[PASS_COLUMN] = str(
+        metrics["pass"]
+    )
+    row[FAIL_COLUMN] = str(
+        metrics["fail"]
+    )
+    row[TODO_COLUMN] = str(
+        metrics["todo"]
+    )
+    row[SUCCESS_RATE_COLUMN] = format_float(
+        metrics["success_rate"]
+    )
+
+    return row
+
+
+def build_snapshot_rows(
+    test_plan_metrics: dict[str, Any],
+    execution_metrics: list[dict[str, Any]],
+    snapshot_datetime: datetime,
+) -> list[dict[str, str]]:
+    rows = [
+        metrics_to_long_row(
+            metrics=test_plan_metrics,
+            level=LEVEL_TEST_PLAN,
+            snapshot_datetime=snapshot_datetime,
+        )
     ]
 
+    rows.extend(
+        metrics_to_long_row(
+            metrics=metrics,
+            level=LEVEL_TEST_EXECUTION,
+            snapshot_datetime=snapshot_datetime,
+        )
+        for metrics in execution_metrics
+    )
 
-def add_execution_metrics_to_row(
-    row: dict[str, str],
-    execution_metrics: list[dict[str, Any]],
-) -> None:
-    for metrics in execution_metrics:
-        execution_name = metrics["summary"]
-        columns = get_execution_columns(
-            execution_name
-        )
-
-        row[columns[0]] = str(
-            metrics["total"]
-        )
-        row[columns[1]] = str(
-            metrics["pass"]
-        )
-        row[columns[2]] = str(
-            metrics["fail"]
-        )
-        row[columns[3]] = str(
-            metrics["todo"]
-        )
-        row[columns[4]] = format_float(
-            metrics["success_rate"]
-        )
+    return rows
 
 
 # ===========================================================================
@@ -786,10 +821,6 @@ def add_execution_metrics_to_row(
 def find_page_id(
     session: requests.Session,
 ) -> str:
-    """
-    Garde la recherche CQL utilisée précédemment.
-    """
-
     cql = (
         f'title ~ "{CONFLUENCE_PAGE_TITLE}" '
         f'AND space = "{CONFLUENCE_SPACE_KEY}"'
@@ -867,8 +898,7 @@ def make_absolute_confluence_url(
     link: str,
 ) -> str:
     """
-    Construit l'URL complète de téléchargement sans perdre le
-    context path Confluence.
+    Préserve le context path Confluence.
 
     Exemple :
         CONFLUENCE_URL = https://serveur/confluence
@@ -895,7 +925,6 @@ def make_absolute_confluence_url(
     context_path = parsed_base.path.rstrip("/")
     normalized_link = "/" + link.lstrip("/")
 
-    # Si le lien retourné contient déjà /confluence, ne pas le doubler.
     if (
         context_path
         and (
@@ -925,14 +954,13 @@ def download_attachment_content(
     )
 
     if download_link:
-        download_url = (
-            make_absolute_confluence_url(
-                download_link
-            )
+        download_url = make_absolute_confluence_url(
+            download_link
         )
     else:
         download_url = (
-            f"{CONFLUENCE_URL}/download/attachments/"
+            f"{CONFLUENCE_URL.rstrip('/')}"
+            f"/download/attachments/"
             f"{page_id}/{quote(CSV_FILENAME)}"
         )
 
@@ -969,7 +997,7 @@ def create_csv_attachment(
         },
         data={
             "comment": (
-                "Création automatique des données "
+                "Création automatique du CSV long "
                 "du dashboard night run"
             )
         },
@@ -1009,7 +1037,7 @@ def update_csv_attachment(
         },
         data={
             "comment": (
-                "Mise à jour automatique des données "
+                "Mise à jour automatique du CSV long "
                 "du dashboard night run"
             )
         },
@@ -1024,16 +1052,10 @@ def update_csv_attachment(
 
 
 # ===========================================================================
-# CSV
+# LECTURE / MIGRATION DU CSV
 # ===========================================================================
 
-def format_float(
-    value: float,
-) -> str:
-    return f"{float(value):.{CSV_FLOAT_DECIMALS}f}"
-
-
-def read_existing_csv(
+def read_csv_content(
     csv_content: bytes | None,
 ) -> tuple[list[str], list[dict[str, str]]]:
     if not csv_content:
@@ -1064,43 +1086,270 @@ def read_existing_csv(
     return list(reader.fieldnames), rows
 
 
-def build_csv_headers(
-    existing_headers: list[str],
-    execution_metrics: list[dict[str, Any]],
-) -> list[str]:
-    headers = []
-
-    for header in (
-        FIXED_HEADERS
-        + get_component_headers()
-    ):
-        if header not in headers:
-            headers.append(header)
-
-    # Les anciennes colonnes sont conservées pour préserver l'historique
-    # et la configuration des graphiques manuels.
-    for header in existing_headers:
-        if header not in headers:
-            headers.append(header)
-
-    # Une nouvelle Test Execution ajoute ses cinq colonnes à la fin.
-    for metrics in execution_metrics:
-        for header in get_execution_columns(
-            metrics["summary"]
-        ):
-            if header not in headers:
-                headers.append(header)
-
-    return headers
+def is_long_format(
+    headers: list[str],
+) -> bool:
+    return {
+        DATE_COLUMN,
+        LEVEL_COLUMN,
+        NAME_COLUMN,
+        TOTAL_COLUMN,
+        PASS_COLUMN,
+        FAIL_COLUMN,
+        TODO_COLUMN,
+        SUCCESS_RATE_COLUMN,
+    }.issubset(set(headers))
 
 
-def parse_row_date(
+def normalize_long_row(
     row: dict[str, str],
-) -> datetime | None:
-    date_value = str(
-        row.get(DATE_COLUMN, "")
-    ).strip()
+) -> dict[str, str]:
+    return {
+        header: str(
+            row.get(header, "")
+        ).strip()
+        for header in CSV_HEADERS
+    }
 
+
+def migrate_wide_csv_to_long(
+    headers: list[str],
+    wide_rows: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    """
+    Convertit automatiquement l'ancien CSV large vers le nouveau format long.
+
+    Ancien exemple :
+        Date;Global - PASS;Web - PASS;Web - Réussite (%)
+
+    Nouveau :
+        une ligne Test Plan + une ligne par Test Execution et par date.
+    """
+
+    if not wide_rows:
+        return []
+
+    print(
+        "🔄 Ancien format large détecté : "
+        "migration automatique vers le format long."
+    )
+
+    execution_names = []
+
+    for header in headers:
+        suffix = " - Total"
+
+        if (
+            header.endswith(suffix)
+            and header != "Global - Total"
+        ):
+            execution_name = header[
+                :-len(suffix)
+            ]
+
+            expected_columns = {
+                f"{execution_name} - Total",
+                f"{execution_name} - PASS",
+                f"{execution_name} - FAIL",
+                f"{execution_name} - TODO",
+                f"{execution_name} - Réussite (%)",
+            }
+
+            if expected_columns.issubset(
+                set(headers)
+            ):
+                execution_names.append(
+                    execution_name
+                )
+
+    long_rows = []
+
+    for wide_row in wide_rows:
+        date_value = str(
+            wide_row.get("Date", "")
+        ).strip()
+
+        if not date_value:
+            continue
+
+        update_time = str(
+            wide_row.get(
+                "Heure de mise à jour",
+                "",
+            )
+        ).strip()
+
+        test_plan_key = str(
+            wide_row.get(
+                "Test Plan - Clé",
+                TEST_PLAN_KEY,
+            )
+        ).strip()
+
+        test_plan_name = str(
+            wide_row.get(
+                "Test Plan - Nom",
+                TEST_PLAN_KEY,
+            )
+        ).strip()
+
+        plan_row = empty_long_row(
+            level=LEVEL_TEST_PLAN,
+            name=test_plan_name,
+            key=test_plan_key,
+            url=(
+                jira_issue_url(test_plan_key)
+                if test_plan_key
+                else ""
+            ),
+        )
+
+        plan_row.update(
+            {
+                DATE_COLUMN: date_value,
+                UPDATE_TIME_COLUMN: update_time,
+                TOTAL_COLUMN: str(
+                    wide_row.get(
+                        "Global - Total",
+                        "",
+                    )
+                ).strip(),
+                PASS_COLUMN: str(
+                    wide_row.get(
+                        "Global - PASS",
+                        "",
+                    )
+                ).strip(),
+                FAIL_COLUMN: str(
+                    wide_row.get(
+                        "Global - FAIL",
+                        "",
+                    )
+                ).strip(),
+                TODO_COLUMN: str(
+                    wide_row.get(
+                        "Global - TODO",
+                        "",
+                    )
+                ).strip(),
+                SUCCESS_RATE_COLUMN: str(
+                    wide_row.get(
+                        "Global - Réussite (%)",
+                        "",
+                    )
+                ).strip(),
+            }
+        )
+
+        long_rows.append(
+            plan_row
+        )
+
+        for execution_name in execution_names:
+            total_value = str(
+                wide_row.get(
+                    f"{execution_name} - Total",
+                    "",
+                )
+            ).strip()
+
+            pass_value = str(
+                wide_row.get(
+                    f"{execution_name} - PASS",
+                    "",
+                )
+            ).strip()
+
+            fail_value = str(
+                wide_row.get(
+                    f"{execution_name} - FAIL",
+                    "",
+                )
+            ).strip()
+
+            todo_value = str(
+                wide_row.get(
+                    f"{execution_name} - TODO",
+                    "",
+                )
+            ).strip()
+
+            rate_value = str(
+                wide_row.get(
+                    f"{execution_name} - Réussite (%)",
+                    "",
+                )
+            ).strip()
+
+            if not any(
+                (
+                    total_value,
+                    pass_value,
+                    fail_value,
+                    todo_value,
+                    rate_value,
+                )
+            ):
+                continue
+
+            execution_row = empty_long_row(
+                level=LEVEL_TEST_EXECUTION,
+                name=execution_name,
+            )
+
+            execution_row.update(
+                {
+                    DATE_COLUMN: date_value,
+                    UPDATE_TIME_COLUMN: update_time,
+                    TOTAL_COLUMN: total_value,
+                    PASS_COLUMN: pass_value,
+                    FAIL_COLUMN: fail_value,
+                    TODO_COLUMN: todo_value,
+                    SUCCESS_RATE_COLUMN: rate_value,
+                }
+            )
+
+            long_rows.append(
+                execution_row
+            )
+
+    print(
+        f"✅ Migration terminée : "
+        f"{len(long_rows)} ligne(s) longues créées."
+    )
+
+    return long_rows
+
+
+def load_existing_long_rows(
+    csv_content: bytes | None,
+) -> list[dict[str, str]]:
+    headers, rows = read_csv_content(
+        csv_content
+    )
+
+    if not rows:
+        return []
+
+    if is_long_format(headers):
+        return [
+            normalize_long_row(row)
+            for row in rows
+        ]
+
+    return migrate_wide_csv_to_long(
+        headers=headers,
+        wide_rows=rows,
+    )
+
+
+# ===========================================================================
+# MISE À JOUR ET RÉTENTION
+# ===========================================================================
+
+def parse_date(
+    date_value: str,
+) -> datetime | None:
     try:
         return datetime.strptime(
             date_value,
@@ -1110,159 +1359,260 @@ def parse_row_date(
         return None
 
 
-def retain_last_days(
-    rows_by_date: dict[str, dict[str, str]],
-) -> dict[str, dict[str, str]]:
-    dated_rows = []
+def long_row_identity(
+    row: dict[str, str],
+) -> tuple[str, str, str]:
+    """
+    Identité métier d'une ligne :
+        Date + Niveau + Clé
 
-    for date_value, row in rows_by_date.items():
-        try:
-            parsed_date = datetime.strptime(
-                date_value,
-                "%d/%m/%Y",
+    Si la Clé n'est pas disponible dans un ancien historique migré,
+    le Nom est utilisé.
+    """
+
+    key_or_name = (
+        row.get(KEY_COLUMN, "").strip()
+        or row.get(NAME_COLUMN, "").strip()
+    )
+
+    return (
+        row.get(DATE_COLUMN, "").strip(),
+        row.get(LEVEL_COLUMN, "").strip(),
+        key_or_name,
+    )
+
+
+def deduplicate_rows(
+    rows: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    rows_by_identity: dict[
+        tuple[str, str, str],
+        dict[str, str],
+    ] = {}
+
+    component_rows: dict[
+        tuple[str, str],
+        dict[str, str],
+    ] = {}
+
+    for row in rows:
+        level = row.get(
+            LEVEL_COLUMN,
+            "",
+        ).strip()
+
+        if level == LEVEL_COMPONENT:
+            component_identity = (
+                row.get(
+                    KEY_COLUMN,
+                    "",
+                ).strip(),
+                row.get(
+                    NAME_COLUMN,
+                    "",
+                ).strip(),
             )
-        except ValueError:
+
+            component_rows[
+                component_identity
+            ] = row
+
             continue
 
-        dated_rows.append(
-            (
-                parsed_date,
-                date_value,
-                row,
-            )
+        identity = long_row_identity(
+            row
         )
 
-    dated_rows.sort(
-        key=lambda item: item[0]
+        rows_by_identity[
+            identity
+        ] = row
+
+    return (
+        list(rows_by_identity.values())
+        + list(component_rows.values())
     )
 
-    retained = dated_rows[
-        -MAX_HISTORY_DAYS:
-    ]
 
-    return {
-        date_value: row
-        for _, date_value, row in retained
-    }
-
-
-def build_current_row(
-    existing_row: dict[str, str] | None,
-    test_plan_metrics: dict[str, Any],
-    execution_metrics: list[dict[str, Any]],
-    components: list[dict[str, str]],
-    snapshot_datetime: datetime,
-) -> dict[str, str]:
-    # Part de l'ancienne ligne afin de ne pas effacer une ancienne colonne
-    # qui n'est plus remontée par le Test Plan.
-    row = dict(
-        existing_row or {}
-    )
-
-    row[DATE_COLUMN] = (
-        snapshot_datetime.strftime(
-            "%d/%m/%Y"
-        )
-    )
-    row[UPDATE_TIME_COLUMN] = (
-        snapshot_datetime.strftime(
-            "%H:%M:%S"
-        )
-    )
-
-    row[TEST_PLAN_KEY_COLUMN] = (
-        test_plan_metrics["key"]
-    )
-    row[TEST_PLAN_NAME_COLUMN] = (
-        test_plan_metrics["summary"]
-    )
-
-    row[GLOBAL_TOTAL_COLUMN] = str(
-        test_plan_metrics["total"]
-    )
-    row[GLOBAL_PASS_COLUMN] = str(
-        test_plan_metrics["pass"]
-    )
-    row[GLOBAL_FAIL_COLUMN] = str(
-        test_plan_metrics["fail"]
-    )
-    row[GLOBAL_TODO_COLUMN] = str(
-        test_plan_metrics["todo"]
-    )
-    row[GLOBAL_RATE_COLUMN] = format_float(
-        test_plan_metrics["success_rate"]
-    )
-
-    add_components_to_row(
-        row,
-        components,
-    )
-
-    add_execution_metrics_to_row(
-        row,
-        execution_metrics,
-    )
-
-    return row
-
-
-def update_rows_for_current_day(
+def replace_snapshot_date(
     existing_rows: list[dict[str, str]],
-    current_row: dict[str, str],
+    snapshot_rows: list[dict[str, str]],
+    snapshot_date: str,
 ) -> list[dict[str, str]]:
-    rows_by_date: dict[str, dict[str, str]] = {}
+    """
+    Au même jour, toutes les anciennes lignes Test Plan/Test Execution
+    sont supprimées puis remplacées par le snapshot actuel.
+    """
+
+    retained_rows = []
+
+    removed_count = 0
 
     for row in existing_rows:
-        parsed_date = parse_row_date(row)
+        level = row.get(
+            LEVEL_COLUMN,
+            "",
+        ).strip()
 
-        if parsed_date is None:
+        date_value = row.get(
+            DATE_COLUMN,
+            "",
+        ).strip()
+
+        if (
+            level in {
+                LEVEL_TEST_PLAN,
+                LEVEL_TEST_EXECUTION,
+            }
+            and date_value == snapshot_date
+        ):
+            removed_count += 1
             continue
 
-        normalized_date = parsed_date.strftime(
-            "%d/%m/%Y"
+        retained_rows.append(
+            row
         )
 
-        rows_by_date[normalized_date] = row
-
-    current_date = current_row[
-        DATE_COLUMN
-    ]
-
-    if current_date in rows_by_date:
+    if removed_count:
         print(
-            f"🔄 Remplacement de la ligne CSV "
-            f"du {current_date}"
+            f"🔄 {removed_count} ancienne(s) ligne(s) "
+            f"du {snapshot_date} remplacée(s)."
         )
     else:
         print(
-            f"➕ Ajout de la ligne CSV "
-            f"du {current_date}"
+            f"➕ Nouveau snapshot pour le "
+            f"{snapshot_date}."
         )
 
-    rows_by_date[current_date] = (
-        current_row
+    return (
+        retained_rows
+        + snapshot_rows
     )
 
-    rows_by_date = retain_last_days(
-        rows_by_date
+
+def replace_component_rows(
+    rows: list[dict[str, str]],
+    component_rows: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    retained_rows = [
+        row
+        for row in rows
+        if row.get(
+            LEVEL_COLUMN,
+            "",
+        ).strip() != LEVEL_COMPONENT
+    ]
+
+    return (
+        retained_rows
+        + component_rows
     )
 
-    rows = list(
-        rows_by_date.values()
+
+def retain_last_history_days(
+    rows: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    available_dates = sorted(
+        {
+            row.get(
+                DATE_COLUMN,
+                "",
+            ).strip()
+            for row in rows
+            if (
+                row.get(
+                    LEVEL_COLUMN,
+                    "",
+                ).strip()
+                in {
+                    LEVEL_TEST_PLAN,
+                    LEVEL_TEST_EXECUTION,
+                }
+                and parse_date(
+                    row.get(
+                        DATE_COLUMN,
+                        "",
+                    ).strip()
+                )
+                is not None
+            )
+        },
+        key=lambda value: parse_date(value),
     )
 
-    rows.sort(
-        key=lambda row: (
-            parse_row_date(row)
-            or datetime.min
+    retained_dates = set(
+        available_dates[
+            -MAX_HISTORY_DAYS:
+        ]
+    )
+
+    return [
+        row
+        for row in rows
+        if (
+            row.get(
+                LEVEL_COLUMN,
+                "",
+            ).strip()
+            == LEVEL_COMPONENT
+            or row.get(
+                DATE_COLUMN,
+                "",
+            ).strip()
+            in retained_dates
         )
+    ]
+
+
+def sort_long_rows(
+    rows: list[dict[str, str]],
+) -> list[dict[str, str]]:
+    level_order = {
+        LEVEL_TEST_PLAN: 0,
+        LEVEL_TEST_EXECUTION: 1,
+        LEVEL_COMPONENT: 2,
+    }
+
+    def sort_key(
+        row: dict[str, str],
+    ) -> tuple[Any, ...]:
+        level = row.get(
+            LEVEL_COLUMN,
+            "",
+        ).strip()
+
+        parsed_date = parse_date(
+            row.get(
+                DATE_COLUMN,
+                "",
+            ).strip()
+        )
+
+        date_sort_value = (
+            parsed_date
+            if parsed_date is not None
+            else datetime.max
+        )
+
+        return (
+            date_sort_value,
+            level_order.get(level, 99),
+            row.get(
+                NAME_COLUMN,
+                "",
+            ).lower(),
+        )
+
+    return sorted(
+        rows,
+        key=sort_key,
     )
 
-    return rows
 
+# ===========================================================================
+# GÉNÉRATION DU CSV
+# ===========================================================================
 
 def generate_csv_content(
-    headers: list[str],
     rows: list[dict[str, str]],
 ) -> bytes:
     buffer = io.StringIO(
@@ -1271,7 +1621,7 @@ def generate_csv_content(
 
     writer = csv.DictWriter(
         buffer,
-        fieldnames=headers,
+        fieldnames=CSV_HEADERS,
         delimiter=CSV_DELIMITER,
         extrasaction="ignore",
         lineterminator="\n",
@@ -1286,11 +1636,11 @@ def generate_csv_content(
                     header,
                     "",
                 )
-                for header in headers
+                for header in CSV_HEADERS
             }
         )
 
-    # utf-8-sig ajoute un BOM utile pour l'ouverture directe dans Excel.
+    # BOM UTF-8 pour l'ouverture directe dans Excel.
     return buffer.getvalue().encode(
         "utf-8-sig"
     )
@@ -1305,7 +1655,7 @@ def main() -> None:
         make_confluence_session()
     )
 
-    # 1. Récupération de toutes les données Xray.
+    # 1. Lecture de l'état actuel dans Jira/Xray.
     test_plan_metrics = (
         get_test_plan_metrics()
     )
@@ -1314,55 +1664,7 @@ def main() -> None:
         get_all_test_execution_metrics()
     )
 
-    # 2. Lecture des composants via DataManager.
-    components = (
-        load_components_from_excel()
-    )
-
-    # 3. Recherche de la page et de la pièce jointe.
-    page_id = find_page_id(
-        confluence_session
-    )
-
-    attachment = find_csv_attachment(
-        confluence_session,
-        page_id,
-    )
-
-    existing_csv_content = None
-
-    if attachment is not None:
-        print(
-            f"📥 Téléchargement de la pièce jointe "
-            f"existante : {CSV_FILENAME}"
-        )
-
-        existing_csv_content = (
-            download_attachment_content(
-                confluence_session,
-                page_id,
-                attachment,
-            )
-        )
-    else:
-        print(
-            f"ℹ️ La pièce jointe {CSV_FILENAME} "
-            "n'existe pas encore."
-        )
-
-    # 4. Lecture de l'historique CSV.
-    existing_headers, existing_rows = (
-        read_existing_csv(
-            existing_csv_content
-        )
-    )
-
-    print(
-        f"📚 Historique CSV relu : "
-        f"{len(existing_rows)} ligne(s)"
-    )
-
-    # 5. Snapshot du jour.
+    # 2. Date du snapshot.
     now = datetime.now().astimezone()
 
     snapshot_datetime = (
@@ -1378,43 +1680,115 @@ def main() -> None:
         )
     )
 
-    existing_today_row = next(
-        (
-            row
-            for row in existing_rows
-            if str(
-                row.get(DATE_COLUMN, "")
-            ).strip() == snapshot_date
-        ),
-        None,
-    )
-
-    current_row = build_current_row(
-        existing_row=existing_today_row,
+    # 3. Construction des lignes longues du jour.
+    snapshot_rows = build_snapshot_rows(
         test_plan_metrics=test_plan_metrics,
         execution_metrics=execution_metrics,
-        components=components,
         snapshot_datetime=snapshot_datetime,
     )
 
-    updated_rows = (
-        update_rows_for_current_day(
-            existing_rows=existing_rows,
-            current_row=current_row,
+    component_rows = (
+        build_component_rows()
+    )
+
+    # 4. Recherche de la page et de la pièce jointe.
+    page_id = find_page_id(
+        confluence_session
+    )
+
+    attachment = find_csv_attachment(
+        confluence_session,
+        page_id,
+    )
+
+    existing_csv_content = None
+
+    if attachment is not None:
+        print(
+            f"📥 Téléchargement de "
+            f"{CSV_FILENAME}"
         )
+
+        existing_csv_content = (
+            download_attachment_content(
+                confluence_session,
+                page_id,
+                attachment,
+            )
+        )
+    else:
+        print(
+            f"ℹ️ La pièce jointe "
+            f"{CSV_FILENAME} n'existe pas encore."
+        )
+
+    # 5. Lecture ou migration de l'ancien CSV.
+    existing_rows = load_existing_long_rows(
+        existing_csv_content
     )
 
-    headers = build_csv_headers(
-        existing_headers=existing_headers,
-        execution_metrics=execution_metrics,
+    print(
+        f"📚 Lignes existantes relues : "
+        f"{len(existing_rows)}"
     )
 
-    new_csv_content = generate_csv_content(
-        headers=headers,
+    # 6. Remplacement complet du jour courant.
+    updated_rows = replace_snapshot_date(
+        existing_rows=existing_rows,
+        snapshot_rows=snapshot_rows,
+        snapshot_date=snapshot_date,
+    )
+
+    # 7. Remplacement des lignes Composant.
+    updated_rows = replace_component_rows(
         rows=updated_rows,
+        component_rows=component_rows,
     )
 
-    # Copie locale.
+    # 8. Déduplication et conservation des sept derniers jours.
+    updated_rows = deduplicate_rows(
+        updated_rows
+    )
+
+    updated_rows = retain_last_history_days(
+        updated_rows
+    )
+
+    updated_rows = sort_long_rows(
+        updated_rows
+    )
+
+    retained_dates = {
+        row.get(
+            DATE_COLUMN,
+            "",
+        ).strip()
+        for row in updated_rows
+        if row.get(
+            LEVEL_COLUMN,
+            "",
+        ).strip()
+        in {
+            LEVEL_TEST_PLAN,
+            LEVEL_TEST_EXECUTION,
+        }
+    }
+
+    print(
+        f"📅 Journées conservées : "
+        f"{len(retained_dates)}/{MAX_HISTORY_DAYS}"
+    )
+
+    print(
+        f"📄 Nombre total de lignes CSV : "
+        f"{len(updated_rows)}"
+    )
+
+    # 9. Génération du CSV.
+    new_csv_content = generate_csv_content(
+        updated_rows
+    )
+
     LOCAL_CSV_PATH.write_bytes(
         new_csv_content
     )
@@ -1424,12 +1798,7 @@ def main() -> None:
         f"{LOCAL_CSV_PATH.resolve()}"
     )
 
-    print(
-        f"📅 Jours conservés : "
-        f"{len(updated_rows)}/{MAX_HISTORY_DAYS}"
-    )
-
-    # 6. Création ou mise à jour de la pièce jointe.
+    # 10. Création ou mise à jour de la pièce jointe.
     if attachment is None:
         create_csv_attachment(
             session=confluence_session,
@@ -1447,8 +1816,8 @@ def main() -> None:
         )
 
     print(
-        "✅ Terminé : le corps de la page "
-        "Confluence n'a pas été modifié."
+        "✅ Terminé : CSV long mis à jour. "
+        "Le contenu de la page Confluence n'a pas été modifié."
     )
 
 
