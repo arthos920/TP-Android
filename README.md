@@ -1,146 +1,127 @@
-Une fois le dossier copié sur le PC entreprise, aucune installation Python, Appium, Java ou npm n’est nécessaire.
-1. Ouvrir PowerShell dans le dossier
-Par exemple :
-cd C:\QA\alumnium-multidevice-portable
-Évitez de l’exécuter depuis un lecteur réseau : le dossier doit être local et accessible en écriture.
-2. Configurer l’IA et Jira
-Modifiez qa_config.py :
-OPENAI_API_KEY = "votre-cle-entreprise"
-OPENAI_BASE_URL = "https://votre-endpoint/v1"
-OPENAI_MODEL = "magistral-2509"
-PROXY_URL = ""  # ou votre proxy
+$ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
 
-JIRA_MCP_URL = "https://votre-serveur-mcp-jira/..."
-JIRA_KEY = "PROJET-123"
-ALUMNIUM_MODEL et OPENAI_CUSTOM_URL sont dérivés automatiquement.
-Le fichier contenant la clé en clair, conservez le dossier dans un emplacement protégé.
-3. Tester Jira et le planner uniquement
-Aucun téléphone ni serveur Appium n’est utilisé à cette étape :
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -JiraPlanOnly
-Le résultat attendu est :
-Jira MCP
-→ lecture du ticket
-→ résumé
-→ classification
-→ plan JSON multi-device
-Le plan sera sauvegardé dans :
-artifacts\multidevice\<date>\generated-jira-plan.json
-4. Connecter les téléphones
-Sur chaque téléphone :
-- activer les options développeur ;
-- activer le débogage USB ;
-- déverrouiller l’écran ;
-- accepter la clé de débogage ADB ;
-- vérifier que l’application entreprise est installée.
-Lancez ensuite :
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\diagnostic.ps1
-Vous devez obtenir :
-List of devices attached
-R58M123456A    device
-R58M789012B    device
-L’avertissement indiquant que l’émulateur est absent est normal pour ce bundle.
-Si un téléphone affiche :
-unauthorized
-déverrouillez-le et acceptez la demande USB. S’il n’apparaît pas, il faut probablement installer son pilote USB constructeur sur Windows.
-5. Reporter les UDID dans la configuration
-Dans qa_config.py :
-DEVICES = {
-    "phone_1": {
-        "enabled": True,
-        "udid": "R58M123456A",
-        # ...
-    },
-    "phone_2": {
-        "enabled": True,
-        "udid": "R58M789012B",
-        # ...
-    },
+$PortableBundleRoot = $PSScriptRoot
+$PortableRuntimeRoot = Join-Path $PortableBundleRoot "runtime"
+$PortablePython = Join-Path $PortableRuntimeRoot "python\python.exe"
+$PortableNode = Join-Path $PortableRuntimeRoot "node\node.exe"
+$PortableAppiumEntry = Join-Path $PortableRuntimeRoot "node\node_modules\appium\index.js"
+$PortableJavaHome = Join-Path $PortableRuntimeRoot "java"
+$PortableAndroidHome = Join-Path $PortableRuntimeRoot "android-sdk"
+$PortableAdb = Join-Path $PortableAndroidHome "platform-tools\adb.exe"
+$PortableAppiumHome = Join-Path $PortableRuntimeRoot "appium-home"
+$PortableAppiumExtensionsManifest = Join-Path $PortableAppiumHome "node_modules\.cache\appium\extensions.yaml"
+# Le driver est place dans le meme node_modules que le coeur Appium. Cela lui
+# permet de resoudre son peerDependency "appium" sans lien symbolique ni chemin
+# propre a la machine ayant construit le bundle.
+$PortableUiAutomator2Driver = Join-Path $PortableRuntimeRoot "node\node_modules\appium-uiautomator2-driver"
+$LegacyUiAutomator2Driver = Join-Path $PortableAppiumHome "node_modules\appium-uiautomator2-driver"
+$PortableAndroidUserHome = Join-Path $PortableRuntimeRoot "android-user"
+
+# Migration automatique des premiers bundles deja copies en entreprise : ils
+# avaient le driver dans APPIUM_HOME, separe du coeur Appium. Aucun telechargement
+# n'est effectue ; le repertoire existant est simplement replace localement.
+if (
+    -not (Test-Path -LiteralPath $PortableUiAutomator2Driver) -and
+    (Test-Path -LiteralPath (Join-Path $LegacyUiAutomator2Driver "package.json"))
+) {
+    Move-Item -LiteralPath $LegacyUiAutomator2Driver -Destination $PortableUiAutomator2Driver
+    Write-Host "[portable] driver UiAutomator2 migre avec le coeur Appium"
 }
-Pour trois téléphones :
-"phone_3": {
-    "enabled": True,
-    "udid": "R58M345678C",
-    # ...
+
+$requiredPaths = @(
+    $PortablePython,
+    $PortableNode,
+    $PortableAppiumEntry,
+    (Join-Path $PortableJavaHome "bin\java.exe"),
+    $PortableAdb,
+    (Join-Path $PortableAppiumHome "package.json"),
+    $PortableAppiumExtensionsManifest,
+    (Join-Path $PortableUiAutomator2Driver "package.json")
+)
+
+foreach ($requiredPath in $requiredPaths) {
+    if (-not (Test-Path -LiteralPath $requiredPath)) {
+        throw "Bundle incomplet : fichier requis introuvable : $requiredPath"
+    }
 }
-Puis ajoutez un rôle :
-MULTI_DEVICE_ROLES = {
-    "caller": "phone_1",
-    "callee": "phone_2",
-    "observer": "phone_3",
+
+# Appium memorise installPath comme chemin absolu dans extensions.yaml. Ce
+# registre doit donc etre recalcule apres chaque copie/deplacement du bundle.
+$manifestLines = [System.IO.File]::ReadAllLines($PortableAppiumExtensionsManifest)
+$uiautomatorSectionFound = $false
+$installPathIndex = -1
+for ($index = 0; $index -lt $manifestLines.Length; $index++) {
+    $line = $manifestLines[$index]
+    if ($line -eq "  uiautomator2:") {
+        $uiautomatorSectionFound = $true
+        continue
+    }
+    if ($uiautomatorSectionFound -and $line -match '^  [^ ].*:$') {
+        break
+    }
+    if ($uiautomatorSectionFound -and $line -match '^    installPath:\s*') {
+        $installPathIndex = $index
+        break
+    }
 }
-6. Tester ADB et Appium sans IA
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -PreflightOnly
-Ce test doit confirmer :
-ADB OK
-APPIUM OK
-PREFLIGHT MULTI-DEVICE : SUCCES
-Appium est démarré et arrêté automatiquement.
-7. Tester Alumnium sur Settings
-Laissez temporairement :
-MULTI_DEVICE_START = "intent:android.settings.SETTINGS"
-Puis lancez :
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run.ps1 -PlanSource fixed
-Cette étape valide :
-endpoint IA
-→ Alumnium
-→ Appium
-→ deux téléphones
-→ Android Settings
-8. Configurer l’application entreprise
-Lorsque Settings fonctionne, remplacez le point de départ :
-MULTI_DEVICE_START = "com.entreprise.application"
-Ou avec une activité explicite :
-MULTI_DEVICE_START = "com.entreprise.application/.MainActivity"
-9. Lancer le scénario Jira complet
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run.ps1
-Le pipeline complet sera alors :
-Jira MCP
-→ modèle entreprise
-→ plan multi-device
-→ Alumnium
-→ Appium
-→ UiAutomator2
-→ téléphones physiques
-En cas d’échec, récupérez :
-logs\
-artifacts\multidevice\<date>\
-et la sortie PowerShell complète.
+if ($installPathIndex -lt 0) {
+    throw "Bundle incomplet : installPath UiAutomator2 introuvable dans $PortableAppiumExtensionsManifest"
+}
 
+$yamlDriverPath = $PortableUiAutomator2Driver.Replace("'", "''")
+$expectedInstallPath = "    installPath: '$yamlDriverPath'"
+if ($manifestLines[$installPathIndex] -ne $expectedInstallPath) {
+    $manifestLines[$installPathIndex] = $expectedInstallPath
+    $utf8WithoutBom = New-Object System.Text.UTF8Encoding($false)
+    [System.IO.File]::WriteAllLines(
+        $PortableAppiumExtensionsManifest,
+        [string[]]$manifestLines,
+        $utf8WithoutBom
+    )
+    Write-Host "[portable] registre UiAutomator2 relocalise vers $PortableUiAutomator2Driver"
+}
 
-15 août, 15:35
+# Valide aussi les peerDependencies npm. Un simple "driver list" peut afficher
+# le driver comme installe meme si son module ne peut pas charger le coeur
+# Appium. Cette importation echoue immediatement avec une cause explicite.
+$uiautomator2Entry = Join-Path $PortableUiAutomator2Driver "build\lib\index.js"
+if (-not (Test-Path -LiteralPath $uiautomator2Entry)) {
+    throw "Bundle incomplet : entree UiAutomator2 introuvable : $uiautomator2Entry"
+}
+$driverImportOutput = & $PortableNode --input-type=module -e `
+    "import {pathToFileURL} from 'node:url'; await import(pathToFileURL(process.argv[1]).href);" `
+    $uiautomator2Entry 2>&1
+if ($LASTEXITCODE -ne 0) {
+    throw "UiAutomator2 ne peut pas charger ses dependances npm :`n$($driverImportOutput -join [Environment]::NewLine)"
+}
+$PortableUiAutomator2ModuleReady = $true
 
+foreach ($writableDirectory in @(
+    $PortableAndroidUserHome,
+    (Join-Path $PortableBundleRoot "logs"),
+    (Join-Path $PortableBundleRoot "artifacts")
+)) {
+    if (-not (Test-Path -LiteralPath $writableDirectory)) {
+        New-Item -ItemType Directory -Path $writableDirectory | Out-Null
+    }
+}
 
+# Ces variables ne modifient pas Windows : elles vivent uniquement dans le
+# processus PowerShell courant et ses sous-processus.
+$env:JAVA_HOME = $PortableJavaHome
+$env:ANDROID_HOME = $PortableAndroidHome
+$env:ANDROID_SDK_ROOT = $PortableAndroidHome
+$env:ANDROID_USER_HOME = $PortableAndroidUserHome
+$env:APPIUM_HOME = $PortableAppiumHome
+$env:PYTHONNOUSERSITE = "1"
+$env:PYTHONDONTWRITEBYTECODE = "1"
 
-
-
-
-
-
-je dois lancer un server appium ?
-
-
-
-
-
-
-
-15 août, 15:36
-
-
-
-
-
-
-Non, pas manuellement.
-Cette commande démarre automatiquement l’Appium inclus dans le bundle, exécute le test, puis l’arrête :
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\run.ps1
-C’est également valable pour :
-.\run.ps1 -PreflightOnly
-.\run.ps1 -PlanSource fixed
-En mode suivant, Appium n’est pas démarré car aucun téléphone n’est utilisé :
-.\run.ps1 -JiraPlanOnly
-Si vous préférez voir Appium dans une console séparée, lancez d’abord :
-powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\start-appium.ps1
-Puis, dans un second PowerShell :
-.\run.ps1 -NoStartAppium
-Mais pour l’utilisation normale, une seule commande run.ps1 suffit.
+$portablePathEntries = @(
+    (Join-Path $PortableRuntimeRoot "python"),
+    (Join-Path $PortableRuntimeRoot "python\Scripts"),
+    (Join-Path $PortableRuntimeRoot "node"),
+    (Join-Path $PortableJavaHome "bin"),
+    (Join-Path $PortableAndroidHome "platform-tools")
+)
+$env:Path = ($portablePathEntries -join ";") + ";" + $env:Path
