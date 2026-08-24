@@ -8,6 +8,7 @@ hors MCP. Il ne cree aucune session Appium.
 from __future__ import annotations
 
 import json
+import time
 from typing import Any
 
 import httpx
@@ -180,9 +181,13 @@ async def request_json_object(
     required_keys: tuple[str, ...],
     label: str,
     max_tokens: int,
+    allow_repair: bool = True,
+    repair_max_tokens: int | None = None,
 ) -> dict[str, Any]:
     """Demande un JSON puis répare une réponse reasoning non structurée."""
-    response = await llm.chat.completions.create(
+    response = await timed_completion(
+        llm,
+        label=label,
         model=model,
         messages=messages,
         temperature=0.0,
@@ -200,6 +205,13 @@ async def request_json_object(
         return parsed
 
     finish_reason = getattr(response.choices[0], "finish_reason", None)
+    if not allow_repair:
+        preview = first_text[:400].replace("\r", " ").replace("\n", " ")
+        raise RuntimeError(
+            f"{label}: aucun objet JSON "
+            f"(finish_reason={finish_reason!r}). Apercu : {preview}"
+        )
+
     print(
         f"[llm-json] {label}: aucun JSON exploitable "
         f"(finish_reason={finish_reason!r}); tentative de reformatage.",
@@ -212,29 +224,18 @@ async def request_json_object(
         "N'ajoute ni thought, ni explication, ni balise Markdown. "
         f"Cles obligatoires au niveau racine : {', '.join(required_keys)}."
     )
-    repair_messages = [
-        *messages,
-        {"role": "assistant", "content": first_text[:16000]},
-        {"role": "user", "content": correction},
-    ]
-    repair_arguments: dict[str, Any] = {
-        "model": model,
-        "messages": repair_messages,
-        "temperature": 0.0,
-        "max_tokens": max(max_tokens, 4096),
-        "response_format": {"type": "json_object"},
-    }
-    try:
-        repaired_response = await llm.chat.completions.create(**repair_arguments)
-    except Exception as json_mode_error:
-        # Certaines gateways OpenAI-compatible ne supportent pas JSON mode.
-        print(
-            f"[llm-json] {label}: JSON mode non supporte "
-            f"({type(json_mode_error).__name__}); nouvelle tentative standard.",
-            flush=True,
-        )
-        repair_arguments.pop("response_format", None)
-        repaired_response = await llm.chat.completions.create(**repair_arguments)
+    # Le contexte de la tache est deja dans messages. Ne pas reinjecter le
+    # long bloc de raisonnement precedent : cela ralentissait fortement les
+    # modeles locaux et pouvait les pousser a recommencer le meme raisonnement.
+    repair_messages = [*messages, {"role": "user", "content": correction}]
+    repaired_response = await timed_completion(
+        llm,
+        label=f"{label} / reformatage",
+        model=model,
+        messages=repair_messages,
+        temperature=0.0,
+        max_tokens=repair_max_tokens or max_tokens,
+    )
 
     repaired_message = repaired_response.choices[0].message
     repaired_text = completion_message_text(repaired_message)
@@ -250,6 +251,37 @@ async def request_json_object(
         f"{label}: aucun objet JSON apres deux tentatives "
         f"(finish_reason={repaired_finish_reason!r}). Apercu : {preview}"
     )
+
+
+async def timed_completion(
+    llm: AsyncOpenAI,
+    *,
+    label: str,
+    **arguments: Any,
+) -> Any:
+    """Rend visible chaque attente réseau/modèle du planner."""
+    max_tokens = arguments.get("max_tokens", "defaut")
+    print(
+        f"[llm] START {label} (max_tokens={max_tokens})",
+        flush=True,
+    )
+    started = time.monotonic()
+    try:
+        response = await llm.chat.completions.create(**arguments)
+    except Exception:
+        elapsed = time.monotonic() - started
+        print(f"[llm] FAILED {label} ({elapsed:.1f}s)", flush=True)
+        raise
+    elapsed = time.monotonic() - started
+    finish_reason = None
+    if getattr(response, "choices", None):
+        finish_reason = getattr(response.choices[0], "finish_reason", None)
+    print(
+        f"[llm] END   {label} ({elapsed:.1f}s, "
+        f"finish_reason={finish_reason!r})",
+        flush=True,
+    )
+    return response
 
 
 def find_tool_name(tool_names: list[str], preferred: list[str]) -> str | None:
@@ -289,12 +321,15 @@ async def run_forced_tool_call(
     messages: list[dict[str, str]],
     model: str,
 ) -> Any:
-    response = await llm.chat.completions.create(
+    response = await timed_completion(
+        llm,
+        label="Selection du tool Jira",
         model=model,
         messages=messages,
         tools=openai_tools,
         tool_choice="auto",
         temperature=0.0,
+        max_tokens=600,
     )
     message = response.choices[0].message
     if not message.tool_calls:
@@ -371,7 +406,9 @@ async def jira_fetch_and_summarize(
             )
 
     issue_text = truncate(extract_text(issue_raw), max_chars)
-    response = await llm.chat.completions.create(
+    response = await timed_completion(
+        llm,
+        label="Resume Jira",
         model=model,
         messages=[
             {
@@ -424,9 +461,10 @@ async def classify_jira_test_type(
             ],
             required_keys=("test_type",),
             label="Classification Jira",
-            # Les modeles reasoning peuvent consommer une part importante de
-            # la sortie avant de produire le petit objet final.
-            max_tokens=1200,
+            # La classification n'est pas bloquante : si son petit JSON est
+            # absent, le type unknown est utilise sans payer un second appel.
+            max_tokens=400,
+            allow_repair=False,
         )
     except Exception as exc:
         # Une classification illisible ne doit pas faire perdre le diagnostic
@@ -531,6 +569,8 @@ async def build_multidevice_plan(
     jira_summary: str,
     jira_classification: dict[str, Any],
     available_roles: list[str],
+    max_tokens: int = 2500,
+    repair_max_tokens: int = 2000,
 ) -> dict[str, Any]:
     roles_json = json.dumps(available_roles, ensure_ascii=False)
     system = f"""Tu es un planner QA specialise dans Alumnium sur plusieurs telephones Android.
@@ -581,9 +621,11 @@ FORMAT :
         ],
         required_keys=("target", "steps"),
         label="Plan multi-device",
-        # 2500 etait trop court pour certains modeles Gemma reasoning : le
-        # raisonnement peut preceder le JSON et epuiser le budget de sortie.
-        max_tokens=6000,
+        # Le parsing accepte deja thought/Markdown. Un plafond trop eleve
+        # encourageait certains modeles reasoning a produire plusieurs
+        # minutes de texte avant le JSON.
+        max_tokens=max_tokens,
+        repair_max_tokens=repair_max_tokens,
     )
     return validate_multidevice_plan(raw_plan, available_roles)
 
@@ -601,6 +643,8 @@ async def fetch_jira_and_build_plan(
     jira_key: str,
     max_chars: int,
     available_roles: list[str],
+    planner_max_tokens: int = 2500,
+    json_repair_max_tokens: int = 2000,
 ) -> dict[str, Any]:
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY manquant dans qa_config.py.")
@@ -650,6 +694,8 @@ async def fetch_jira_and_build_plan(
             jira_summary=jira["issue_summary"],
             jira_classification=classification,
             available_roles=available_roles,
+            max_tokens=planner_max_tokens,
+            repair_max_tokens=json_repair_max_tokens,
         )
         return {
             **jira,
