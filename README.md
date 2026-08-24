@@ -1,704 +1,1167 @@
-"""Jira MCP -> LLM entreprise -> plan Alumnium mobile multi-device.
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""POC Alumnium/Appium coordonne sur plusieurs appareils Android.
 
-La connexion MCP et le tool-call reprennent la logique validee dans
-jira_alumnium_runner.py. Ce module n'importe ni Selenium, ni GitLab, ni Jira
-hors MCP. Il ne cree aucune session Appium.
+Ce script reste volontairement independant de Jira, Jira MCP, GitLab,
+Selenium et de toute logique metier. Le plan Settings est en dur. Plus tard,
+le planner Jira pourra produire le meme format avec des roles et des delais.
+
+Exemples PowerShell depuis le bundle portable :
+
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\\run.ps1
+
+    # Surcharger les associations de roles sans modifier le fichier config :
+    .\\run.ps1 -Role "caller=phone_1","callee=phone_2"
+
+    # Verifier uniquement la configuration, ADB et Appium :
+    .\\run.ps1 -PreflightOnly
 """
 
 from __future__ import annotations
 
+import argparse
+import asyncio
+import importlib.util
 import json
+import os
+import subprocess
+import sys
+import threading
 import time
-from typing import Any
-
-import httpx
-from mcp.client.session import ClientSession
-from mcp.client.streamable_http import streamable_http_client
-from openai import AsyncOpenAI
-
-
-TEST_TYPES = {
-    "private_call",
-    "video_call",
-    "conference_call",
-    "group_call",
-    "incoming_call",
-    "outgoing_call",
-    "web_admin",
-    "web_settings",
-    "hybrid",
-    "unknown",
-}
-
-MOBILE_TEST_TYPES = {
-    "private_call",
-    "video_call",
-    "conference_call",
-    "group_call",
-    "incoming_call",
-    "outgoing_call",
-    "unknown",
-}
+import traceback
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict, dataclass, field
+from datetime import datetime
+from pathlib import Path
+from types import ModuleType
+from typing import Any, Callable
 
 
-def normalize(value: Any) -> Any:
-    if value is None or isinstance(value, (str, int, float, bool)):
+PRINT_LOCK = threading.Lock()
+
+
+def log(message: str = "") -> None:
+    """Evite de melanger les lignes produites par plusieurs workers."""
+    with PRINT_LOCK:
+        print(message, flush=True)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description="Execute un plan Alumnium coordonne sur plusieurs Android."
+    )
+    parser.add_argument(
+        "--config",
+        default=str(Path(__file__).with_name("qa_config.py")),
+        help="Fichier Python de configuration (defaut : qa_config.py).",
+    )
+    parser.add_argument(
+        "--role",
+        action="append",
+        default=[],
+        metavar="ROLE=DEVICE",
+        help=(
+            "Association role/appareil. Peut etre repetee. Si presente, "
+            "remplace MULTI_DEVICE_ROLES du fichier config."
+        ),
+    )
+    parser.add_argument(
+        "--preflight-only",
+        action="store_true",
+        help="Valide config, ADB et Appium, sans creer de session ni appeler l'IA.",
+    )
+    parser.add_argument(
+        "--skip-ai-preflight",
+        action="store_true",
+        help="Saute uniquement l'appel IA simple effectue avant les sessions.",
+    )
+    parser.add_argument(
+        "--plan-source",
+        choices=("fixed", "jira"),
+        default=None,
+        help="Source du plan. Surcharge PLAN_SOURCE du fichier config.",
+    )
+    parser.add_argument(
+        "--jira-key",
+        default=None,
+        help="Cle Jira a utiliser. Surcharge JIRA_KEY du fichier config.",
+    )
+    parser.add_argument(
+        "--jira-plan-only",
+        action="store_true",
+        help="Recupere Jira et genere le plan sans ADB, Appium ni Alumnium.",
+    )
+    return parser.parse_args()
+
+
+def resolve_config_path(raw_path: str) -> Path:
+    path = Path(raw_path).expanduser()
+    candidates = (
+        [path]
+        if path.is_absolute()
+        else [Path.cwd() / path, Path(__file__).resolve().parent / path]
+    )
+    for candidate in candidates:
+        resolved = candidate.resolve()
+        if resolved.is_file():
+            return resolved
+    searched = "\n  - ".join(str(candidate.resolve()) for candidate in candidates)
+    raise FileNotFoundError(
+        f"Fichier de configuration introuvable : {raw_path}\n"
+        f"Chemins recherches :\n  - {searched}"
+    )
+
+
+def load_python_config(path: Path) -> ModuleType:
+    spec = importlib.util.spec_from_file_location("qa_multidevice_config", path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"Impossible de charger la configuration : {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+ARGS = parse_args()
+CONFIG_PATH = resolve_config_path(ARGS.config)
+CONFIG = load_python_config(CONFIG_PATH)
+
+
+def cfg(name: str, default: Any = None) -> Any:
+    return getattr(CONFIG, name, default)
+
+
+def env_or_config(name: str, default: Any = None) -> str:
+    value = os.environ.get(name, "").strip()
+    if value:
         return value
-    if isinstance(value, dict):
-        return {str(key): normalize(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [normalize(item) for item in value]
-    if hasattr(value, "model_dump"):
-        return normalize(value.model_dump())
-    if hasattr(value, "type") and hasattr(value, "text"):
-        return {"type": getattr(value, "type"), "text": getattr(value, "text")}
-    if hasattr(value, "__dict__"):
-        return normalize(value.__dict__)
-    return str(value)
+    configured = cfg(name, default)
+    return "" if configured is None else str(configured)
 
 
-def truncate(value: str, max_chars: int) -> str:
-    text = value or ""
-    if len(text) <= max_chars:
-        return text
-    return text[:max_chars] + "\n...[TRUNCATED]..."
-
-
-def extract_text(result: Any) -> str:
-    value = normalize(result)
-    if value is None:
-        return ""
-    if isinstance(value, str):
+def bool_value(value: Any) -> bool:
+    if isinstance(value, bool):
         return value
-    if isinstance(value, list):
-        parts: list[str] = []
-        for item in value:
-            if isinstance(item, dict) and isinstance(item.get("text"), str):
-                parts.append(item["text"])
-            else:
-                parts.append(extract_text(item))
-        return "\n".join(part for part in parts if part)
-    if isinstance(value, dict):
-        for key in (
-            "content",
-            "text",
-            "file_content",
-            "body",
-            "description",
-            "data",
-            "result",
-        ):
-            if key in value:
-                extracted = extract_text(value[key])
-                if extracted:
-                    return extracted
-        return json.dumps(value, ensure_ascii=False, indent=2)
-    return str(value)
+    normalized = str(value).strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"Valeur booleenne invalide : {value!r}")
 
 
-def extract_json_object(
-    text: str,
-    *,
-    required_keys: tuple[str, ...] = (),
-) -> dict[str, Any] | None:
-    """Extrait un objet JSON même après un bloc thought ou une fence Markdown.
-
-    Les modèles reasoning peuvent produire du texte avant/après l'objet final.
-    JSONDecoder.raw_decode permet de tester chaque accolade sans supprimer le
-    contenu valide ni tenter d'interpréter du pseudo-JSON Python.
-    """
-    source = (text or "").strip().lstrip("\ufeff")
-    if not source:
-        return None
-
-    try:
-        direct = json.loads(source)
-        if isinstance(direct, dict) and all(key in direct for key in required_keys):
-            return direct
-        if isinstance(direct, str):
-            nested = extract_json_object(direct, required_keys=required_keys)
-            if nested is not None:
-                return nested
-    except (json.JSONDecodeError, TypeError):
-        pass
-
-    decoder = json.JSONDecoder()
-    candidates: list[tuple[int, int, dict[str, Any]]] = []
-    for position, character in enumerate(source):
-        if character != "{":
-            continue
-        try:
-            value, consumed = decoder.raw_decode(source[position:])
-        except json.JSONDecodeError:
-            continue
-        if isinstance(value, dict) and all(key in value for key in required_keys):
-            candidates.append((position, consumed, value))
-
-    if not candidates:
-        return None
-
-    # La réponse finale est normalement le dernier objet complet. En cas de
-    # plusieurs candidats au même endroit, privilégier le plus grand.
-    _, _, selected = max(candidates, key=lambda item: (item[0], item[1]))
-    return selected
-
-
-def completion_message_parts(message: Any) -> list[str]:
-    """Normalise content et les champs reasoning non standard des gateways."""
-    parts: list[str] = []
-    for field_name in ("content", "reasoning_content", "reasoning"):
-        value = getattr(message, field_name, None)
-        if value is None:
-            continue
-        text = value.strip() if isinstance(value, str) else extract_text(value).strip()
-        if text and text not in parts:
-            parts.append(text)
-    return parts
-
-
-def completion_message_text(message: Any) -> str:
-    parts = completion_message_parts(message)
-    return "\n".join(parts)
-
-
-def extract_message_json(
-    message: Any, *, required_keys: tuple[str, ...]
-) -> dict[str, Any] | None:
-    # content contient normalement la réponse finale et doit gagner sur les
-    # champs reasoning_content/reasoning propres à certaines gateways.
-    for part in completion_message_parts(message):
-        parsed = extract_json_object(part, required_keys=required_keys)
-        if parsed is not None:
-            return parsed
-    return None
-
-
-async def request_json_object(
-    llm: AsyncOpenAI,
-    *,
-    model: str,
-    messages: list[dict[str, str]],
-    required_keys: tuple[str, ...],
-    label: str,
-    max_tokens: int,
-    allow_repair: bool = True,
-    repair_max_tokens: int | None = None,
-) -> dict[str, Any]:
-    """Demande un JSON puis répare une réponse reasoning non structurée."""
-    response = await timed_completion(
-        llm,
-        label=label,
-        model=model,
-        messages=messages,
-        temperature=0.0,
-        max_tokens=max_tokens,
-    )
-    message = response.choices[0].message
-    first_text = completion_message_text(message)
-    parsed = extract_message_json(message, required_keys=required_keys)
-    if parsed is not None:
-        if not first_text.lstrip().startswith("{"):
-            print(
-                f"[llm-json] {label}: JSON extrait apres un bloc de raisonnement.",
-                flush=True,
-            )
-        return parsed
-
-    finish_reason = getattr(response.choices[0], "finish_reason", None)
-    if not allow_repair:
-        preview = first_text[:400].replace("\r", " ").replace("\n", " ")
-        raise RuntimeError(
-            f"{label}: aucun objet JSON "
-            f"(finish_reason={finish_reason!r}). Apercu : {preview}"
-        )
-
-    print(
-        f"[llm-json] {label}: aucun JSON exploitable "
-        f"(finish_reason={finish_reason!r}); tentative de reformatage.",
-        flush=True,
-    )
-    correction = (
-        "Ta reponse precedente n'etait pas un objet JSON exploitable. "
-        "Reprends la tache et renvoie maintenant UNIQUEMENT l'objet JSON final. "
-        "Le premier caractere doit etre { et le dernier }. "
-        "N'ajoute ni thought, ni explication, ni balise Markdown. "
-        f"Cles obligatoires au niveau racine : {', '.join(required_keys)}."
-    )
-    # Le contexte de la tache est deja dans messages. Ne pas reinjecter le
-    # long bloc de raisonnement precedent : cela ralentissait fortement les
-    # modeles locaux et pouvait les pousser a recommencer le meme raisonnement.
-    repair_messages = [*messages, {"role": "user", "content": correction}]
-    repaired_response = await timed_completion(
-        llm,
-        label=f"{label} / reformatage",
-        model=model,
-        messages=repair_messages,
-        temperature=0.0,
-        max_tokens=repair_max_tokens or max_tokens,
-    )
-
-    repaired_message = repaired_response.choices[0].message
-    repaired_text = completion_message_text(repaired_message)
-    repaired = extract_message_json(repaired_message, required_keys=required_keys)
-    if repaired is not None:
-        return repaired
-
-    repaired_finish_reason = getattr(
-        repaired_response.choices[0], "finish_reason", None
-    )
-    preview = repaired_text[:800].replace("\r", " ").replace("\n", " ")
+REQUIRED_CONFIG_NAMES = (
+    "OPENAI_API_KEY",
+    "OPENAI_BASE_URL",
+    "OPENAI_MODEL",
+    "PROXY_URL",
+    "JIRA_MCP_URL",
+    "JIRA_KEY",
+    "PLAN_SOURCE",
+    "ALUMNIUM_MODEL",
+    "ALUMNIUM_LOG_LEVEL",
+    "ALUMNIUM_CHANGE_ANALYSIS",
+    "ALUMNIUM_RETRIES",
+    "START",
+    "NEW_COMMAND_TIMEOUT",
+    "APPIUM_SERVER_URL",
+    "DEVICES",
+    "MULTI_DEVICE_ROLES",
+)
+MISSING_CONFIG = [name for name in REQUIRED_CONFIG_NAMES if not hasattr(CONFIG, name)]
+if MISSING_CONFIG:
     raise RuntimeError(
-        f"{label}: aucun objet JSON apres deux tentatives "
-        f"(finish_reason={repaired_finish_reason!r}). Apercu : {preview}"
+        f"Configuration invalide ({CONFIG_PATH}) : variables manquantes : "
+        + ", ".join(MISSING_CONFIG)
     )
 
 
-async def timed_completion(
-    llm: AsyncOpenAI,
-    *,
-    label: str,
-    **arguments: Any,
-) -> Any:
-    """Rend visible chaque attente réseau/modèle du planner."""
-    max_tokens = arguments.get("max_tokens", "defaut")
-    print(
-        f"[llm] START {label} (max_tokens={max_tokens})",
-        flush=True,
-    )
-    started = time.monotonic()
-    try:
-        response = await llm.chat.completions.create(**arguments)
-    except Exception:
-        elapsed = time.monotonic() - started
-        print(f"[llm] FAILED {label} ({elapsed:.1f}s)", flush=True)
-        raise
-    elapsed = time.monotonic() - started
-    finish_reason = None
-    if getattr(response, "choices", None):
-        finish_reason = getattr(response.choices[0], "finish_reason", None)
-    print(
-        f"[llm] END   {label} ({elapsed:.1f}s, "
-        f"finish_reason={finish_reason!r})",
-        flush=True,
-    )
-    return response
+# alumnium-cli herite de l'environnement du processus Python. Toutes ces
+# variables doivent donc etre positionnees avant l'import de alumnium.
+for env_name in (
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "OPENAI_CUSTOM_URL",
+    "OPENAI_DEFAULT_HEADERS",
+    "ALUMNIUM_MODEL",
+    "ALUMNIUM_LOG_LEVEL",
+    "ALUMNIUM_CHANGE_ANALYSIS",
+    "ALUMNIUM_RETRIES",
+    "ALUMNIUM_CACHE",
+    "OPENAI_BASE_URL",
+    "OPENAI_MODEL",
+    "PROXY_URL",
+    "JIRA_MCP_URL",
+    "JIRA_KEY",
+):
+    configured_value = env_or_config(env_name)
+    if configured_value:
+        os.environ[env_name] = configured_value
+
+# OPENAI_BASE_URL est le nom utilise par le framework existant ; Alumnium
+# attend OPENAI_CUSTOM_URL. Une valeur explicite OPENAI_CUSTOM_URL gagne.
+if not os.environ.get("OPENAI_CUSTOM_URL", "").strip():
+    openai_base_url = env_or_config("OPENAI_BASE_URL")
+    if openai_base_url:
+        os.environ["OPENAI_CUSTOM_URL"] = openai_base_url
+
+os.environ["ALUMNIUM_LOG_LEVEL"] = os.environ["ALUMNIUM_LOG_LEVEL"].lower()
+os.environ["ALUMNIUM_CHANGE_ANALYSIS"] = str(
+    bool_value(os.environ["ALUMNIUM_CHANGE_ANALYSIS"])
+).lower()
+if "ALUMNIUM_CACHE" in os.environ:
+    os.environ["ALUMNIUM_CACHE"] = str(bool_value(os.environ["ALUMNIUM_CACHE"])).lower()
 
 
-def find_tool_name(tool_names: list[str], preferred: list[str]) -> str | None:
-    for preferred_name in preferred:
-        if preferred_name in tool_names:
-            return preferred_name
-    lowered = [name.lower() for name in tool_names]
-    for preferred_name in preferred:
-        token = preferred_name.lower()
-        for index, lowered_name in enumerate(lowered):
-            if token in lowered_name:
-                return tool_names[index]
-    return None
-
-
-def mcp_tools_to_openai(tools_response: Any) -> list[dict[str, Any]]:
-    tools = getattr(tools_response, "tools", tools_response)
-    return [
-        {
-            "type": "function",
-            "function": {
-                "name": tool.name,
-                "description": tool.description or "",
-                "parameters": tool.inputSchema
-                or {"type": "object", "properties": {}, "additionalProperties": True},
-            },
-        }
-        for tool in tools
-    ]
-
-
-async def run_forced_tool_call(
-    llm: AsyncOpenAI,
-    mcp: ClientSession,
-    openai_tools: list[dict[str, Any]],
-    expected_tool: str,
-    messages: list[dict[str, str]],
-    model: str,
-) -> Any:
-    response = await timed_completion(
-        llm,
-        label="Selection du tool Jira",
-        model=model,
-        messages=messages,
-        tools=openai_tools,
-        tool_choice="auto",
-        temperature=0.0,
-        max_tokens=600,
-    )
-    message = response.choices[0].message
-    if not message.tool_calls:
-        raise RuntimeError(f"Aucun tool_call Jira genere. Message: {message.content}")
-
-    tool_call = message.tool_calls[0]
-    tool_name = tool_call.function.name
-    arguments = json.loads(tool_call.function.arguments or "{}")
-    if tool_name != expected_tool:
-        raise RuntimeError(
-            f"Tool Jira inattendu : {tool_name} (attendu : {expected_tool})"
-        )
-
-    print(f"[jira-mcp] TOOL_CALL {tool_name} args={arguments}", flush=True)
-    return await mcp.call_tool(tool_name, arguments)
-
-
-async def jira_fetch_and_summarize(
-    llm: AsyncOpenAI,
-    *,
-    jira_mcp_url: str,
-    jira_key: str,
-    model: str,
-    max_chars: int,
-) -> dict[str, Any]:
-    async with streamable_http_client(jira_mcp_url) as streams:
-        if not isinstance(streams, tuple) or len(streams) < 2:
-            raise RuntimeError(f"Transport MCP inattendu : {streams!r}")
-        read_stream, write_stream = streams[0], streams[1]
-        async with ClientSession(read_stream, write_stream) as jira:
-            await jira.initialize()
-            tools_response = await jira.list_tools()
-            openai_tools = mcp_tools_to_openai(tools_response)
-            tool_names = [tool["function"]["name"] for tool in openai_tools]
-            issue_tool = find_tool_name(
-                tool_names,
-                preferred=[
-                    "get_issue",
-                    "jira_get_issue",
-                    "get_jira_issue",
-                    "get_issue_by_key",
-                    "issue_get",
-                ],
+def parse_role_overrides(raw_values: list[str]) -> dict[str, str]:
+    result: dict[str, str] = {}
+    for raw_value in raw_values:
+        role, separator, device_name = raw_value.partition("=")
+        role = role.strip()
+        device_name = device_name.strip()
+        if not separator or not role or not device_name:
+            raise ValueError(
+                f"--role invalide : {raw_value!r}. Format attendu : ROLE=DEVICE"
             )
-            if not issue_tool:
-                raise RuntimeError(
-                    "Aucun tool Jira de lecture de ticket trouve. "
-                    f"Tools disponibles : {tool_names[:40]}"
-                )
+        if role in result:
+            raise ValueError(f"Role duplique dans les arguments : {role}")
+        result[role] = device_name
+    return result
 
-            issue_raw = await run_forced_tool_call(
-                llm,
-                jira,
-                openai_tools,
-                issue_tool,
-                [
-                    {
-                        "role": "system",
-                        "content": (
-                            f"Tu dois appeler EXACTEMENT le tool {issue_tool} "
-                            "pour lire un ticket Jira."
-                        ),
-                    },
-                    {
-                        "role": "user",
-                        "content": (
-                            f"Recupere le ticket Jira '{jira_key}'. Utilise "
-                            "l'argument exact attendu par le tool, par exemple "
-                            "key ou issue_key."
-                        ),
-                    },
-                ],
-                model,
-            )
 
-    issue_text = truncate(extract_text(issue_raw), max_chars)
-    response = await timed_completion(
-        llm,
-        label="Resume Jira",
-        model=model,
-        messages=[
+ROLE_TO_DEVICE = parse_role_overrides(ARGS.role) or dict(CONFIG.MULTI_DEVICE_ROLES)
+DEVICES: dict[str, dict[str, Any]] = dict(CONFIG.DEVICES)
+PLAN_SOURCE = str(ARGS.plan_source or cfg("PLAN_SOURCE", "fixed")).strip().lower()
+if ARGS.jira_plan_only:
+    PLAN_SOURCE = "jira"
+if PLAN_SOURCE not in {"fixed", "jira"}:
+    raise ValueError(f"PLAN_SOURCE invalide : {PLAN_SOURCE!r}")
+
+LLM_API_KEY = env_or_config("OPENAI_API_KEY")
+LLM_BASE_URL = env_or_config("OPENAI_BASE_URL") or None
+LLM_MODEL = env_or_config("OPENAI_MODEL", "magistral-2509")
+PROXY_URL = env_or_config("PROXY_URL") or None
+JIRA_MCP_URL = env_or_config("JIRA_MCP_URL")
+JIRA_KEY = str(ARGS.jira_key or env_or_config("JIRA_KEY")).strip()
+LLM_VERIFY_TLS = bool_value(cfg("LLM_VERIFY_TLS", False))
+LLM_TIMEOUT = float(cfg("LLM_TIMEOUT", 180))
+MAX_CHARS = int(cfg("MAX_CHARS", 12000))
+FAIL_ON_MISSING_DATA = bool_value(cfg("FAIL_ON_MISSING_DATA", True))
+
+APPIUM_SERVER_URL_FROM_ENV = bool(os.environ.get("APPIUM_SERVER_URL", "").strip())
+APPIUM_SERVER_URL = env_or_config("APPIUM_SERVER_URL", CONFIG.APPIUM_SERVER_URL).rstrip("/")
+START = env_or_config("START", CONFIG.START)
+SCENARIO_START = str(cfg("MULTI_DEVICE_START", START))
+NEW_COMMAND_TIMEOUT = int(env_or_config("ANDROID_NEW_COMMAND_TIMEOUT", CONFIG.NEW_COMMAND_TIMEOUT))
+MAX_WORKERS = max(1, int(cfg("MAX_WORKERS", len(ROLE_TO_DEVICE))))
+FAIL_FAST = bool_value(cfg("FAIL_FAST", True))
+WAIT_TIMEOUT = float(cfg("MULTI_DEVICE_WAIT_TIMEOUT", 30))
+WAIT_INTERVAL = float(cfg("MULTI_DEVICE_WAIT_INTERVAL", 2))
+STEP_DELAY = float(cfg("MULTI_DEVICE_STEP_DELAY", 1))
+ARTIFACTS_ROOT = Path(__file__).resolve().parent / str(cfg("ARTIFACTS_DIR", "artifacts"))
+PLANNER = bool_value(cfg("ALUMNIUM_PLANNER", True))
+CHANGE_ANALYSIS = bool_value(cfg("ALUMNIUM_CHANGE_ANALYSIS", False))
+PLAN_CONTEXT: dict[str, Any] = {}
+
+
+# Le plan reste en dur pendant ce POC. Un bloc "parallel" execute ses sous-
+# etapes en meme temps. Chaque operation ne voit que l'UI de son propre role.
+FIXED_MULTI_DEVICE_TEST_PLAN: list[dict[str, Any]] = [
+    {
+        "parallel": [
             {
-                "role": "system",
-                "content": (
-                    "Tu es QA Automation. Resume le ticket Jira pour produire "
-                    "un test mobile multi-device. Retourne strictement les "
-                    "sections suivantes : Titre, Objectif, Pre-conditions, "
-                    "Roles/appareils, Etapes Given/When/Then, Donnees, "
-                    "Resultats attendus, Points d'attention."
+                "role": "caller",
+                "type": "check",
+                "instruction": "The main Android Settings screen is displayed",
+            },
+            {
+                "role": "callee",
+                "type": "check",
+                "instruction": "The main Android Settings screen is displayed",
+            },
+        ]
+    },
+    {
+        "role": "caller",
+        "type": "do",
+        "instruction": "Open the Battery settings",
+    },
+    {
+        "parallel": [
+            {
+                "role": "caller",
+                "type": "check",
+                "instruction": "The Battery settings screen is displayed",
+            },
+            {
+                "role": "callee",
+                "type": "check",
+                "instruction": "The main Android Settings screen is displayed",
+            },
+        ]
+    },
+    {
+        "role": "callee",
+        "type": "do",
+        "instruction": "Open the Network & internet settings",
+    },
+    {
+        "parallel": [
+            {
+                "role": "caller",
+                "type": "check",
+                "instruction": "The Battery settings screen is displayed",
+            },
+            {
+                "role": "callee",
+                "type": "check",
+                "instruction": "The Network & internet settings screen is displayed",
+            },
+        ]
+    },
+    {
+        "parallel": [
+            {
+                "role": "caller",
+                "type": "do",
+                "instruction": (
+                    "Tap the Navigate up button in the top-left corner to return "
+                    "to the main Settings screen"
                 ),
             },
             {
-                "role": "user",
-                "content": f"TICKET_KEY: {jira_key}\n\nCONTENU:\n{issue_text}",
+                "role": "callee",
+                "type": "do",
+                "instruction": (
+                    "Tap the Navigate up button in the top-left corner to return "
+                    "to the main Settings screen"
+                ),
             },
-        ],
-        temperature=0.2,
-        max_tokens=1200,
+        ]
+    },
+    {
+        "parallel": [
+            {
+                "role": "caller",
+                "type": "check",
+                "instruction": "The main Android Settings screen is displayed",
+            },
+            {
+                "role": "callee",
+                "type": "check",
+                "instruction": "The main Android Settings screen is displayed",
+            },
+        ]
+    },
+]
+
+# Remplace par le plan genere depuis Jira avant la validation des roles lorsque
+# PLAN_SOURCE=jira. Le plan fixe reste disponible pour le diagnostic Settings.
+MULTI_DEVICE_TEST_PLAN: list[dict[str, Any]] = FIXED_MULTI_DEVICE_TEST_PLAN
+
+
+@dataclass
+class StepResult:
+    number: str
+    role: str
+    kind: str
+    instruction: str
+    passed: bool
+    duration_seconds: float
+    detail: str = ""
+    error_type: str = ""
+    traceback: str = ""
+
+
+@dataclass
+class DeviceRuntime:
+    role: str
+    device_name: str
+    settings: dict[str, Any]
+    driver: Any = None
+    alumni: Any = None
+    stats: dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def udid(self) -> str:
+        return str(self.settings["udid"])
+
+    @property
+    def appium_url(self) -> str:
+        if APPIUM_SERVER_URL_FROM_ENV:
+            return APPIUM_SERVER_URL
+        return str(self.settings.get("appium_url", APPIUM_SERVER_URL)).rstrip("/")
+
+
+def command(*args: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        list(args), capture_output=True, text=True, timeout=timeout, check=False
     )
-    summary = (response.choices[0].message.content or "").strip()
-    if not summary:
-        raise RuntimeError("Le modele a retourne un resume Jira vide.")
-    return {
-        "jira_key": jira_key,
-        "issue_tool": issue_tool,
-        "issue_summary": summary,
+
+
+def adb(runtime: DeviceRuntime, *args: str, timeout: int = 60) -> subprocess.CompletedProcess[str]:
+    return command("adb", "-s", runtime.udid, *args, timeout=timeout)
+
+
+def parse_adb_devices() -> dict[str, str]:
+    result = command("adb", "devices")
+    if result.returncode != 0:
+        raise RuntimeError(f"adb devices a echoue :\n{result.stderr or result.stdout}")
+    states: dict[str, str] = {}
+    for line in result.stdout.splitlines()[1:]:
+        parts = line.split()
+        if len(parts) >= 2:
+            states[parts[0]] = parts[1]
+    return states
+
+
+def validate_role_configuration() -> dict[str, DeviceRuntime]:
+    if len(ROLE_TO_DEVICE) < 2:
+        raise RuntimeError("Le POC multi-device exige au moins deux roles.")
+
+    runtimes: dict[str, DeviceRuntime] = {}
+    for role, device_name in ROLE_TO_DEVICE.items():
+        if device_name not in DEVICES:
+            raise RuntimeError(
+                f"Le role {role!r} utilise un appareil inconnu {device_name!r}."
+            )
+        settings = dict(DEVICES[device_name])
+        if not bool_value(settings.get("enabled", True)):
+            raise RuntimeError(f"L'appareil {device_name!r} est desactive.")
+        required = (
+            "udid",
+            "system_port",
+            "chromedriver_port",
+            "webview_devtools_port",
+        )
+        missing = [name for name in required if name not in settings]
+        if missing:
+            raise RuntimeError(
+                f"Configuration incomplete pour {device_name!r} : {', '.join(missing)}"
+            )
+        if str(settings["udid"]).startswith("REPLACE_"):
+            raise RuntimeError(
+                f"UDID non configure pour {device_name!r}. Lancez diagnostic.ps1, "
+                "puis copiez le numero de serie affiche par 'adb devices -l' "
+                "dans qa_config.py."
+            )
+        runtimes[role] = DeviceRuntime(role, device_name, settings)
+
+    unique_fields = (
+        "udid",
+        "system_port",
+        "chromedriver_port",
+        "webview_devtools_port",
+    )
+    for field_name in unique_fields:
+        seen: dict[str, str] = {}
+        for role, runtime in runtimes.items():
+            value = str(runtime.settings[field_name])
+            if value in seen:
+                raise RuntimeError(
+                    f"Collision {field_name}={value} entre {seen[value]} et {role}."
+                )
+            seen[value] = role
+
+    plan_roles = {
+        step["role"]
+        for item in MULTI_DEVICE_TEST_PLAN
+        for step in item.get("parallel", [item])
     }
-
-
-async def classify_jira_test_type(
-    llm: AsyncOpenAI, *, model: str, jira_summary: str
-) -> dict[str, Any]:
-    try:
-        classification = await request_json_object(
-            llm,
-            model=model,
-            messages=[
-                {
-                    "role": "system",
-                    "content": (
-                        "Classe un ticket de test dans une seule valeur : "
-                        "private_call, video_call, conference_call, group_call, "
-                        "incoming_call, outgoing_call, web_admin, web_settings, "
-                        "hybrid ou unknown. Reponds uniquement avec un JSON valide "
-                        '{"test_type":"...","confidence":0.0,"reason":"..."}.'
-                    ),
-                },
-                {"role": "user", "content": f"Resume Jira:\n{jira_summary}"},
-            ],
-            required_keys=("test_type",),
-            label="Classification Jira",
-            # La classification n'est pas bloquante : si son petit JSON est
-            # absent, le type unknown est utilise sans payer un second appel.
-            max_tokens=400,
-            allow_repair=False,
-        )
-    except Exception as exc:
-        # Une classification illisible ne doit pas faire perdre le diagnostic
-        # du planner. Le type unknown reste admis pour un scénario mobile.
-        classification = {
-            "test_type": "unknown",
-            "confidence": 0.0,
-            "reason": f"Classification JSON indisponible : {exc}",
-        }
-    if classification.get("test_type") not in TEST_TYPES:
-        classification["test_type"] = "unknown"
-    try:
-        classification["confidence"] = float(
-            classification.get("confidence", 0.0)
-        )
-    except (TypeError, ValueError):
-        classification["confidence"] = 0.0
-    classification["reason"] = str(classification.get("reason", ""))
-    return classification
-
-
-def validate_multidevice_plan(
-    plan: dict[str, Any], available_roles: list[str]
-) -> dict[str, Any]:
-    if plan.get("target") != "mobile":
+    unknown_roles = sorted(plan_roles - set(runtimes))
+    if unknown_roles:
         raise RuntimeError(
-            f"Ce bundle accepte uniquement target='mobile', recu : {plan.get('target')!r}"
+            "Roles requis par le plan mais absents de la configuration : "
+            + ", ".join(unknown_roles)
+        )
+    return runtimes
+
+
+def appium_preflight(urls: set[str]) -> None:
+    import httpx
+
+    for url in sorted(urls):
+        response = httpx.get(f"{url}/status", timeout=10)
+        response.raise_for_status()
+        payload = response.json()
+        value = payload.get("value", payload)
+        if not value.get("ready"):
+            raise RuntimeError(f"Appium n'est pas pret sur {url} : {payload}")
+        log(f"[preflight] APPIUM OK  {url}  version={value.get('build', {}).get('version', '?')}")
+
+
+def devices_preflight(runtimes: dict[str, DeviceRuntime]) -> None:
+    states = parse_adb_devices()
+    for role, runtime in runtimes.items():
+        state = states.get(runtime.udid, "absent")
+        if state != "device":
+            raise RuntimeError(
+                f"ADB {role}/{runtime.udid} : etat {state!r}, attendu 'device'."
+            )
+        boot = adb(runtime, "shell", "getprop", "sys.boot_completed").stdout.strip()
+        if boot != "1":
+            raise RuntimeError(f"Android n'a pas fini son boot sur {runtime.udid}.")
+        log(
+            f"[preflight] ADB OK     role={role:<8} device={runtime.device_name:<24} "
+            f"udid={runtime.udid} systemPort={runtime.settings['system_port']}"
         )
 
-    role_set = set(available_roles)
 
-    def validate_step(step: Any, location: str) -> dict[str, Any]:
-        if not isinstance(step, dict):
-            raise RuntimeError(f"{location} doit etre un objet JSON.")
-        role = str(step.get("role", "")).strip()
-        kind = str(step.get("type", "")).strip().lower()
-        instruction = str(step.get("instruction", "")).strip()
-        if role not in role_set:
-            raise RuntimeError(
-                f"{location}: role {role!r} absent de {sorted(role_set)}."
-            )
-        if kind not in {"do", "check", "wait-check"}:
-            raise RuntimeError(
-                f"{location}: type {kind!r} non supporte (do/check/wait-check)."
-            )
-        if not instruction:
-            raise RuntimeError(f"{location}: instruction vide.")
-        normalized_step: dict[str, Any] = {
-            "role": role,
-            "type": kind,
-            "instruction": instruction,
-        }
-        if kind == "wait-check":
-            for option in ("timeout_seconds", "interval_seconds"):
-                if option in step:
-                    normalized_step[option] = float(step[option])
-        return normalized_step
+def ai_preflight() -> None:
+    """Valide une seule fois le provider avant de creer plusieurs sessions."""
+    import httpx
 
-    raw_steps = plan.get("steps")
-    if not isinstance(raw_steps, list) or not raw_steps:
-        raise RuntimeError("Le plan Jira ne contient aucune etape executable.")
+    model_value = os.environ["ALUMNIUM_MODEL"]
+    provider, separator, model = model_value.partition("/")
+    if not separator:
+        provider, model = model_value, model_value
 
-    normalized_steps: list[dict[str, Any]] = []
-    for index, item in enumerate(raw_steps, 1):
-        if isinstance(item, dict) and "parallel" in item:
-            parallel = item["parallel"]
-            if not isinstance(parallel, list) or not parallel:
-                raise RuntimeError(f"steps[{index}].parallel est vide ou invalide.")
-            normalized_steps.append(
-                {
-                    "parallel": [
-                        validate_step(step, f"steps[{index}].parallel[{minor}]")
-                        for minor, step in enumerate(parallel, 1)
-                    ]
-                }
-            )
-        else:
-            normalized_steps.append(validate_step(item, f"steps[{index}]"))
-
-    missing_data = plan.get("missing_data", [])
-    if not isinstance(missing_data, list):
-        missing_data = [str(missing_data)]
-    return {
-        "target": "mobile",
-        "goal": str(plan.get("goal", "")).strip(),
-        "required_roles": sorted(
-            {
-                step["role"]
-                for item in normalized_steps
-                for step in item.get("parallel", [item])
-            }
-        ),
-        "missing_data": [str(item) for item in missing_data if str(item).strip()],
-        "steps": normalized_steps,
-    }
-
-
-async def build_multidevice_plan(
-    llm: AsyncOpenAI,
-    *,
-    model: str,
-    jira_summary: str,
-    jira_classification: dict[str, Any],
-    available_roles: list[str],
-    max_tokens: int = 2500,
-    repair_max_tokens: int = 2000,
-) -> dict[str, Any]:
-    roles_json = json.dumps(available_roles, ensure_ascii=False)
-    system = f"""Tu es un planner QA specialise dans Alumnium sur plusieurs telephones Android.
-Transforme le ticket Jira en plan mobile executable et fidele.
-
-ROLES AUTORISES : {roles_json}
-
-REGLES :
-- N'invente aucune etape, identifiant, numero, compte, mot de passe ou donnee.
-- Si une donnee obligatoire manque, place-la dans missing_data.
-- Chaque etape doit utiliser exactement un role autorise.
-- Utilise "do" pour une action, "check" pour une assertion immediate et
-  "wait-check" lorsqu'un autre telephone doit attendre un evenement, par
-  exemple un appel entrant.
-- Utilise un bloc parallel uniquement pour des operations reellement simultanees.
-- Les instructions sont en langage naturel pour al.do() ou al.check().
-- Aucun XPath, CSS, Appium ID ou locator technique.
-- target doit toujours etre "mobile".
-- Reponds uniquement avec du JSON valide, sans markdown.
-
-FORMAT :
-{{
-  "target": "mobile",
-  "goal": "...",
-  "missing_data": [],
-  "steps": [
-    {{"role":"caller","type":"do","instruction":"..."}},
-    {{"parallel":[
-      {{"role":"caller","type":"check","instruction":"..."}},
-      {{"role":"callee","type":"wait-check","instruction":"...","timeout_seconds":30}}
-    ]}}
-  ]
-}}"""
-    payload = {
-        "jira_summary": jira_summary,
-        "jira_classification": jira_classification,
-        "available_roles": available_roles,
-    }
-    raw_plan = await request_json_object(
-        llm,
-        model=model,
-        messages=[
-            {"role": "system", "content": system},
-            {
-                "role": "user",
-                "content": json.dumps(payload, ensure_ascii=False, indent=2),
+    if provider == "anthropic":
+        key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
+        if not key:
+            raise RuntimeError("ANTHROPIC_API_KEY manquant pour le modele Anthropic.")
+        url = "https://api.anthropic.com/v1/messages"
+        log(f"[preflight] IA POST {url}  model={model}")
+        response = httpx.post(
+            url,
+            headers={
+                "x-api-key": key,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
             },
-        ],
-        required_keys=("target", "steps"),
-        label="Plan multi-device",
-        # Le parsing accepte deja thought/Markdown. Un plafond trop eleve
-        # encourageait certains modeles reasoning a produire plusieurs
-        # minutes de texte avant le JSON.
-        max_tokens=max_tokens,
-        repair_max_tokens=repair_max_tokens,
-    )
-    return validate_multidevice_plan(raw_plan, available_roles)
+            json={
+                "model": model,
+                "max_tokens": 16,
+                "messages": [{"role": "user", "content": "Reply with exactly: OK"}],
+            },
+            timeout=60,
+        )
+    elif provider == "openai":
+        key = os.environ.get("OPENAI_API_KEY", "").strip()
+        base_url = os.environ.get("OPENAI_CUSTOM_URL", "").strip()
+        if not key:
+            raise RuntimeError("OPENAI_API_KEY manquant pour le modele OpenAI-compatible.")
+        if not base_url:
+            base_url = "https://api.openai.com/v1"
+        url = f"{base_url.rstrip('/')}/chat/completions"
+        headers = {"Authorization": f"Bearer {key}", "Content-Type": "application/json"}
+        raw_default_headers = os.environ.get("OPENAI_DEFAULT_HEADERS", "").strip()
+        if raw_default_headers:
+            headers.update(json.loads(raw_default_headers))
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": [{"role": "user", "content": "Reply with exactly: OK"}],
+            "max_tokens": 16,
+        }
+        # Reproduit le comportement Alumnium 0.21.0 pour verifier les gateways
+        # locales avant que deux ou trois sessions envoient des requetes.
+        if "gpt-4o" not in model:
+            payload["reasoning"] = {"effort": "low", "summary": "auto"}
+        log(f"[preflight] IA POST {url}  model={model}")
+        response = httpx.post(url, headers=headers, json=payload, timeout=60)
+    else:
+        log(
+            f"[preflight] IA non implementee pour provider={provider!r}; "
+            "la validation sera faite par Alumni()."
+        )
+        return
+
+    log(f"[preflight] IA HTTP {response.status_code}")
+    if response.status_code >= 400:
+        raise RuntimeError(
+            f"Le provider IA a refuse le preflight : HTTP {response.status_code}\n"
+            f"{response.text[:2000]}"
+        )
 
 
-async def fetch_jira_and_build_plan(
-    *,
-    api_key: str,
-    base_url: str | None,
-    model: str,
-    proxy_url: str | None,
-    default_headers: dict[str, str] | None,
-    verify_tls: bool,
-    timeout: float,
-    jira_mcp_url: str,
-    jira_key: str,
-    max_chars: int,
-    available_roles: list[str],
-    planner_max_tokens: int = 2500,
-    json_repair_max_tokens: int = 2000,
-) -> dict[str, Any]:
-    if not api_key:
+def generate_plan_from_jira() -> dict[str, Any]:
+    """Execute Jira MCP puis le planner entreprise avant toute session Appium."""
+    if not LLM_API_KEY or LLM_API_KEY.startswith("REPLACE_"):
         raise RuntimeError("OPENAI_API_KEY manquant dans qa_config.py.")
-    if not model:
+    if not LLM_MODEL:
         raise RuntimeError("OPENAI_MODEL manquant dans qa_config.py.")
-    if not jira_mcp_url or not jira_key:
-        raise RuntimeError("JIRA_MCP_URL / JIRA_KEY manquants dans qa_config.py.")
-    if len(available_roles) < 2:
-        raise RuntimeError("Le planner multi-device exige au moins deux roles.")
+    if not JIRA_MCP_URL or JIRA_MCP_URL.startswith("REPLACE_"):
+        raise RuntimeError("JIRA_MCP_URL manquant dans qa_config.py.")
+    if not JIRA_KEY or JIRA_KEY.startswith("REPLACE_"):
+        raise RuntimeError("JIRA_KEY manquant dans qa_config.py.")
 
-    async with httpx.AsyncClient(
-        proxy=proxy_url,
-        verify=verify_tls,
-        follow_redirects=False,
-        timeout=timeout,
-    ) as http_client:
-        client_arguments: dict[str, Any] = {
-            "api_key": api_key,
-            "base_url": base_url,
-            "http_client": http_client,
+    raw_default_headers = env_or_config("OPENAI_DEFAULT_HEADERS")
+    default_headers: dict[str, str] | None = None
+    if raw_default_headers:
+        parsed_headers = json.loads(raw_default_headers)
+        if not isinstance(parsed_headers, dict):
+            raise RuntimeError("OPENAI_DEFAULT_HEADERS doit etre un objet JSON.")
+        default_headers = {
+            str(name): str(value) for name, value in parsed_headers.items()
         }
-        if default_headers:
-            client_arguments["default_headers"] = default_headers
-        llm = AsyncOpenAI(**client_arguments)
 
-        jira = await jira_fetch_and_summarize(
-            llm,
-            jira_mcp_url=jira_mcp_url,
-            jira_key=jira_key,
-            model=model,
-            max_chars=max_chars,
+    from jira_mcp_planner import fetch_jira_and_build_plan
+
+    log("\n" + "=" * 76)
+    log("JIRA MCP -> LLM PLANNER -> PLAN MULTI-DEVICE")
+    log("=" * 76)
+    log(f"JIRA_MCP_URL = {JIRA_MCP_URL}")
+    log(f"JIRA_KEY     = {JIRA_KEY}")
+    log(f"LLM_MODEL    = {LLM_MODEL}")
+    log(f"ROLES        = {', '.join(sorted(ROLE_TO_DEVICE))}")
+
+    context = asyncio.run(
+        fetch_jira_and_build_plan(
+            api_key=LLM_API_KEY,
+            base_url=LLM_BASE_URL,
+            model=LLM_MODEL,
+            proxy_url=PROXY_URL,
+            default_headers=default_headers,
+            verify_tls=LLM_VERIFY_TLS,
+            timeout=LLM_TIMEOUT,
+            jira_mcp_url=JIRA_MCP_URL,
+            jira_key=JIRA_KEY,
+            max_chars=MAX_CHARS,
+            available_roles=sorted(ROLE_TO_DEVICE),
         )
-        classification = await classify_jira_test_type(
-            llm,
-            model=model,
-            jira_summary=jira["issue_summary"],
-        )
-        if classification["test_type"] not in MOBILE_TEST_TYPES:
+    )
+
+    log("\n--- RESUME JIRA ---")
+    log(context["issue_summary"])
+    log("\n--- CLASSIFICATION ---")
+    log(json.dumps(context["classification"], ensure_ascii=False, indent=2))
+    log("\n--- GENERATED ALUMNIUM MULTI-DEVICE PLAN ---")
+    log(json.dumps(context["plan"], ensure_ascii=False, indent=2))
+    return context
+
+
+def go_to_start(runtime: DeviceRuntime) -> None:
+    display_size = runtime.settings.get("display_size")
+    display_density = runtime.settings.get("display_density")
+    if display_size:
+        resized = adb(runtime, "shell", "wm", "size", str(display_size))
+        if resized.returncode != 0:
             raise RuntimeError(
-                "Le ticket est classe comme non mobile ou hybride "
-                f"({classification['test_type']}). Ce bundle physique n'execute "
-                "que les plans mobiles."
+                f"Echec wm size sur {runtime.udid}: {resized.stderr or resized.stdout}"
             )
-        plan = await build_multidevice_plan(
-            llm,
-            model=model,
-            jira_summary=jira["issue_summary"],
-            jira_classification=classification,
-            available_roles=available_roles,
-            max_tokens=planner_max_tokens,
-            repair_max_tokens=json_repair_max_tokens,
+    if display_density:
+        redensified = adb(runtime, "shell", "wm", "density", str(display_density))
+        if redensified.returncode != 0:
+            raise RuntimeError(
+                f"Echec wm density sur {runtime.udid}: "
+                f"{redensified.stderr or redensified.stdout}"
+            )
+    if display_size or display_density:
+        log(
+            f"[adb:{runtime.role}] affichage normalise size={display_size or 'native'} "
+            f"density={display_density or 'native'}"
         )
-        return {
-            **jira,
-            "classification": classification,
-            "plan": plan,
+
+    if SCENARIO_START == "home":
+        result = adb(runtime, "shell", "input", "keyevent", "KEYCODE_HOME")
+    elif SCENARIO_START.startswith("intent:"):
+        action = SCENARIO_START.split(":", 1)[1].strip()
+        if not action:
+            raise RuntimeError("MULTI_DEVICE_START contient un intent vide.")
+        resolved = adb(
+            runtime,
+            "shell",
+            "cmd",
+            "package",
+            "resolve-activity",
+            "--brief",
+            "-a",
+            action,
+        )
+        component = next(
+            (line.strip() for line in reversed(resolved.stdout.splitlines()) if "/" in line),
+            "",
+        )
+        if resolved.returncode != 0 or not component:
+            raise RuntimeError(
+                f"Impossible de resoudre l'intent {action!r} sur {runtime.udid}:\n"
+                f"{resolved.stderr or resolved.stdout}"
+            )
+        package = component.split("/", 1)[0]
+        stopped = adb(runtime, "shell", "am", "force-stop", package)
+        if stopped.returncode != 0:
+            raise RuntimeError(
+                f"Echec force-stop {package} sur {runtime.udid}:\n"
+                f"{stopped.stderr or stopped.stdout}"
+            )
+        result = adb(
+            runtime,
+            "shell",
+            "am",
+            "start",
+            "-S",
+            "-W",
+            "-a",
+            action,
+            "-f",
+            "0x10008000",
+        )
+        log(
+            f"[adb:{runtime.role}] intent={action} resolu={component} "
+            f"sur {runtime.udid}"
+        )
+    elif "/" in SCENARIO_START:
+        package = SCENARIO_START.split("/", 1)[0]
+        adb(runtime, "shell", "am", "force-stop", package)
+        result = adb(runtime, "shell", "am", "start", "-W", "-n", SCENARIO_START)
+    else:
+        adb(runtime, "shell", "am", "force-stop", SCENARIO_START)
+        result = adb(
+            runtime,
+            "shell",
+            "monkey",
+            "-p",
+            SCENARIO_START,
+            "-c",
+            "android.intent.category.LAUNCHER",
+            "1",
+        )
+    if result.returncode != 0:
+        raise RuntimeError(
+            f"Impossible de positionner {runtime.role}/{runtime.udid} sur {SCENARIO_START}:\n"
+            f"{result.stderr or result.stdout}"
+        )
+    log(f"[adb:{runtime.role}] START={SCENARIO_START} sur {runtime.udid}")
+
+
+def build_runtime(runtime: DeviceRuntime, alumni_class: Any) -> None:
+    from appium import webdriver
+    from appium.options.android import UiAutomator2Options
+
+    settings = runtime.settings
+    options = UiAutomator2Options()
+    options.platform_name = "Android"
+    options.automation_name = "UiAutomator2"
+    options.udid = runtime.udid
+    options.no_reset = True
+    options.new_command_timeout = NEW_COMMAND_TIMEOUT
+    options.set_capability("appium:autoLaunch", False)
+    options.set_capability("appium:appWaitActivity", "*")
+    options.set_capability("appium:systemPort", int(settings["system_port"]))
+    options.set_capability("appium:chromedriverPort", int(settings["chromedriver_port"]))
+    options.set_capability("appium:webviewDevtoolsPort", int(settings["webview_devtools_port"]))
+
+    log(
+        f"[appium:{runtime.role}] creation session url={runtime.appium_url} "
+        f"udid={runtime.udid} systemPort={settings['system_port']}"
+    )
+    runtime.driver = webdriver.Remote(runtime.appium_url, options=options)
+    log(
+        f"[appium:{runtime.role}] SESSION OK id={runtime.driver.session_id} "
+        f"automation={runtime.driver.capabilities.get('automationName', '?')}"
+    )
+
+    log(f"[alumnium:{runtime.role}] initialisation...")
+    runtime.alumni = alumni_class(
+        runtime.driver,
+        planner=PLANNER,
+        change_analysis=CHANGE_ANALYSIS,
+    )
+    if runtime.alumni.driver.platform != "uiautomator2":
+        log(
+            f"[alumnium:{runtime.role}] correction plateforme "
+            f"{runtime.alumni.driver.platform} -> uiautomator2"
+        )
+        runtime.alumni.driver.platform = "uiautomator2"
+    log(
+        f"[alumnium:{runtime.role}] INIT OK session={runtime.alumni.client.session_id} "
+        f"server={runtime.alumni.client.base_url}"
+    )
+
+
+def run_parallel(
+    tasks: dict[str, Callable[[], Any]], max_workers: int | None = None
+) -> dict[str, Any]:
+    results: dict[str, Any] = {}
+    workers = min(max_workers or MAX_WORKERS, len(tasks))
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+        future_to_name = {executor.submit(task): name for name, task in tasks.items()}
+        for future in as_completed(future_to_name):
+            name = future_to_name[future]
+            results[name] = future.result()
+    return results
+
+
+def failure_artifacts(run_dir: Path, runtime: DeviceRuntime, number: str) -> None:
+    safe_role = "".join(char if char.isalnum() or char in "-_" else "_" for char in runtime.role)
+    prefix = run_dir / f"failure-{number.replace('.', '-')}-{safe_role}"
+    try:
+        runtime.driver.get_screenshot_as_file(str(prefix.with_suffix(".png")))
+    except Exception as exc:  # diagnostic secondaire
+        log(f"[artifact:{runtime.role}] screenshot impossible : {exc}")
+    try:
+        prefix.with_suffix(".xml").write_text(runtime.driver.page_source, encoding="utf-8")
+    except Exception as exc:  # diagnostic secondaire
+        log(f"[artifact:{runtime.role}] page source impossible : {exc}")
+
+
+def execute_step(
+    number: str,
+    step: dict[str, Any],
+    runtimes: dict[str, DeviceRuntime],
+    run_dir: Path,
+) -> StepResult:
+    role = str(step["role"])
+    kind = str(step["type"]).lower()
+    instruction = str(step["instruction"])
+    runtime = runtimes[role]
+    started = time.monotonic()
+    log(f"\n[{number}][{role}] {kind.upper()} {instruction}")
+
+    try:
+        if kind == "do":
+            result = runtime.alumni.do(instruction)
+            executed_tools = [
+                tool
+                for executed_step in getattr(result, "steps", [])
+                for tool in getattr(executed_step, "tools", [])
+            ]
+            if not executed_tools:
+                explanation = getattr(result, "explanation", str(result))
+                raise RuntimeError(
+                    "Alumnium n'a execute aucun outil pour cette instruction. "
+                    f"Explication du modele : {explanation}"
+                )
+            detail = (
+                f"{getattr(result, 'explanation', str(result))} | "
+                f"tools={executed_tools}"
+            )
+        elif kind == "check":
+            detail = str(runtime.alumni.check(instruction))
+        elif kind == "wait-check":
+            timeout = float(step.get("timeout_seconds", WAIT_TIMEOUT))
+            interval = float(step.get("interval_seconds", WAIT_INTERVAL))
+            deadline = time.monotonic() + timeout
+            attempts = 0
+            last_assertion = ""
+            while True:
+                attempts += 1
+                try:
+                    detail = str(runtime.alumni.check(instruction))
+                    detail = f"condition atteinte apres {attempts} tentative(s): {detail}"
+                    break
+                except AssertionError as exc:
+                    last_assertion = str(exc)
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError(
+                            f"Condition non atteinte apres {timeout:.1f}s et {attempts} "
+                            f"tentative(s). Derniere assertion : {last_assertion}"
+                        ) from exc
+                    time.sleep(interval)
+        else:
+            raise ValueError(f"Type d'etape inconnu : {kind!r}")
+
+        duration = time.monotonic() - started
+        log(f"[{number}][{role}] [PASS] {duration:.1f}s")
+        return StepResult(number, role, kind, instruction, True, duration, detail=detail)
+    except Exception as exc:  # on veut capturer toute la pile Alumnium/Appium
+        duration = time.monotonic() - started
+        full_traceback = traceback.format_exc()
+        error_detail = str(exc)
+        provider_detail = ""
+        # requests.HTTPError conserve la réponse du daemon Alumnium. Le corps
+        # contient l'erreur réelle du provider (timeout, json_schema, tools,
+        # paramètre refusé...), alors que raise_for_status() n'affiche que 500.
+        response = getattr(exc, "response", None)
+        if response is not None:
+            status_code = getattr(response, "status_code", "?")
+            response_url = getattr(response, "url", "")
+            try:
+                response_body = str(response.text).strip()
+            except Exception as body_error:  # diagnostic secondaire
+                response_body = f"<corps illisible: {body_error}>"
+            response_body = response_body[:6000] or "<corps vide>"
+            provider_detail = (
+                "ALUMNIUM SERVER RESPONSE\n"
+                f"status={status_code} url={response_url}\n"
+                f"body={response_body}"
+            )
+            error_detail = f"{error_detail}\n{provider_detail}"
+
+        log(
+            f"[{number}][{role}] [FAIL] {duration:.1f}s "
+            f"{type(exc).__name__}: {exc}"
+        )
+        if provider_detail:
+            log(f"[{number}][{role}] {provider_detail}")
+        log(full_traceback)
+        failure_artifacts(run_dir, runtime, number)
+        return StepResult(
+            number,
+            role,
+            kind,
+            instruction,
+            False,
+            duration,
+            error_type=type(exc).__name__,
+            detail=error_detail,
+            traceback=full_traceback,
+        )
+
+
+def execute_plan(
+    runtimes: dict[str, DeviceRuntime], run_dir: Path
+) -> list[StepResult]:
+    results: list[StepResult] = []
+    for major_number, item in enumerate(MULTI_DEVICE_TEST_PLAN, 1):
+        if "parallel" in item:
+            steps = list(item["parallel"])
+            log(f"\n--- BLOC PARALLELE #{major_number} ({len(steps)} appareils) ---")
+            tasks = {
+                f"{major_number}.{minor_number}": (
+                    lambda number=f"{major_number}.{minor_number}", step=step: execute_step(
+                        number, step, runtimes, run_dir
+                    )
+                )
+                for minor_number, step in enumerate(steps, 1)
+            }
+            block_results = run_parallel(tasks)
+            ordered = [block_results[f"{major_number}.{minor}"] for minor in range(1, len(steps) + 1)]
+            results.extend(ordered)
+            block_failed = any(not result.passed for result in ordered)
+            if block_failed and FAIL_FAST:
+                break
+        else:
+            result = execute_step(str(major_number), item, runtimes, run_dir)
+            results.append(result)
+            if not result.passed and FAIL_FAST:
+                break
+        time.sleep(STEP_DELAY)
+    return results
+
+
+def close_runtime(runtime: DeviceRuntime) -> None:
+    try:
+        if runtime.alumni is not None:
+            try:
+                runtime.stats = runtime.alumni.stats
+            except Exception as exc:
+                log(f"[stats:{runtime.role}] indisponibles : {exc}")
+            runtime.alumni.quit()
+        elif runtime.driver is not None:
+            runtime.driver.quit()
+        log(f"[cleanup:{runtime.role}] session fermee")
+    except Exception:
+        log(f"[cleanup:{runtime.role}] ECHEC\n{traceback.format_exc()}")
+
+
+def json_safe(value: Any) -> Any:
+    try:
+        json.dumps(value)
+        return value
+    except TypeError:
+        return str(value)
+
+
+def write_report(
+    run_dir: Path,
+    runtimes: dict[str, DeviceRuntime],
+    results: list[StepResult],
+    started_at: str,
+) -> Path:
+    payload = {
+        "started_at": started_at,
+        "finished_at": datetime.now().astimezone().isoformat(),
+        "config": str(CONFIG_PATH),
+        "plan_source": PLAN_SOURCE,
+        "jira": (
+            {
+                "jira_key": PLAN_CONTEXT.get("jira_key"),
+                "issue_tool": PLAN_CONTEXT.get("issue_tool"),
+                "issue_summary": PLAN_CONTEXT.get("issue_summary"),
+                "classification": PLAN_CONTEXT.get("classification"),
+            }
+            if PLAN_SOURCE == "jira"
+            else None
+        ),
+        "generated_plan": PLAN_CONTEXT.get(
+            "plan",
+            {
+                "target": "mobile",
+                "goal": "Fixed Android Settings multi-device smoke test",
+                "missing_data": [],
+                "steps": MULTI_DEVICE_TEST_PLAN,
+            },
+        ),
+        "model": os.environ.get("ALUMNIUM_MODEL", ""),
+        "appium_server": APPIUM_SERVER_URL,
+        "roles": {
+            role: {
+                "device_name": runtime.device_name,
+                "udid": runtime.udid,
+                "appium_url": runtime.appium_url,
+                "system_port": runtime.settings["system_port"],
+                "appium_session": getattr(runtime.driver, "session_id", None),
+                "stats": json_safe(runtime.stats),
+            }
+            for role, runtime in runtimes.items()
+        },
+        "summary": {
+            "passed": sum(result.passed for result in results),
+            "failed": sum(not result.passed for result in results),
+            "total": len(results),
+        },
+        "steps": [asdict(result) for result in results],
+    }
+    report_path = run_dir / "report.json"
+    report_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return report_path
+
+
+def print_configuration(runtimes: dict[str, DeviceRuntime]) -> None:
+    log("=" * 76)
+    log("smoke_alumnium_multidevice.py : POC coordonne multi-device")
+    log("=" * 76)
+    log(f"CONFIG_FILE          = {CONFIG_PATH}")
+    log(f"PLAN_SOURCE          = {PLAN_SOURCE}")
+    if PLAN_SOURCE == "jira":
+        log(f"JIRA_KEY             = {JIRA_KEY}")
+    log(f"ALUMNIUM_MODEL       = {os.environ['ALUMNIUM_MODEL']}")
+    log(f"ALUMNIUM_PLANNER     = {PLANNER}")
+    log(f"CHANGE_ANALYSIS      = {CHANGE_ANALYSIS}")
+    log(f"APPIUM_SERVER_URL    = {APPIUM_SERVER_URL}")
+    log(f"MULTI_DEVICE_START   = {SCENARIO_START}")
+    log(f"MAX_WORKERS          = {MAX_WORKERS}")
+    log(f"FAIL_FAST            = {FAIL_FAST}")
+    for role, runtime in runtimes.items():
+        log(
+            f"ROLE {role:<10} = {runtime.device_name:<24} udid={runtime.udid:<14} "
+            f"systemPort={runtime.settings['system_port']}"
+        )
+
+
+def main() -> int:
+    global MULTI_DEVICE_TEST_PLAN, PLAN_CONTEXT
+
+    started_at = datetime.now().astimezone().isoformat()
+    run_stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    run_dir = ARTIFACTS_ROOT / "multidevice" / run_stamp
+
+    # Le preflight infrastructure reste utilisable sans Jira ni endpoint IA.
+    if ARGS.preflight_only:
+        runtimes = validate_role_configuration()
+        print_configuration(runtimes)
+        devices_preflight(runtimes)
+        appium_preflight({runtime.appium_url for runtime in runtimes.values()})
+        log("\n>>> PREFLIGHT MULTI-DEVICE : SUCCES <<<")
+        return 0
+
+    if PLAN_SOURCE == "jira":
+        try:
+            PLAN_CONTEXT = generate_plan_from_jira()
+            MULTI_DEVICE_TEST_PLAN = list(PLAN_CONTEXT["plan"]["steps"])
+            run_dir.mkdir(parents=True, exist_ok=True)
+            plan_path = run_dir / "generated-jira-plan.json"
+            plan_path.write_text(
+                json.dumps(PLAN_CONTEXT, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            log(f"\n[artifact] Plan Jira : {plan_path}")
+        except Exception:
+            log("\n>>> ECHEC COUCHE JIRA MCP / LLM PLANNER <<<")
+            log(traceback.format_exc())
+            return 1
+
+        missing_data = PLAN_CONTEXT["plan"].get("missing_data", [])
+        if missing_data:
+            log("\n[WARN] Donnees obligatoires manquantes dans Jira :")
+            for item in missing_data:
+                log(f"  - {item}")
+            if FAIL_ON_MISSING_DATA and not ARGS.jira_plan_only:
+                log(
+                    "\n>>> EXECUTION BLOQUEE : completez Jira ou passez "
+                    "FAIL_ON_MISSING_DATA=False dans qa_config.py. <<<"
+                )
+                return 1
+
+        if ARGS.jira_plan_only:
+            log("\n>>> JIRA MCP + GENERATION DU PLAN : SUCCES <<<")
+            return 0
+    else:
+        PLAN_CONTEXT = {
+            "plan": {
+                "target": "mobile",
+                "goal": "Fixed Android Settings multi-device smoke test",
+                "missing_data": [],
+                "steps": MULTI_DEVICE_TEST_PLAN,
+            }
         }
+
+    runtimes = validate_role_configuration()
+    print_configuration(runtimes)
+
+    devices_preflight(runtimes)
+    appium_preflight({runtime.appium_url for runtime in runtimes.values()})
+
+    if not ARGS.skip_ai_preflight:
+        ai_preflight()
+
+    run_dir.mkdir(parents=True, exist_ok=True)
+
+    # L'import est differe : alumnium et le binaire alumnium-cli voient toutes
+    # les variables configurees au debut du processus.
+    from alumnium import Alumni
+
+    results: list[StepResult] = []
+    try:
+        log("\n--- POSITIONNEMENT DES APPAREILS ---")
+        run_parallel(
+            {
+                role: (lambda runtime=runtime: go_to_start(runtime))
+                for role, runtime in runtimes.items()
+            }
+        )
+        time.sleep(2.5)
+
+        log("\n--- CREATION DES SESSIONS APPIUM + ALUMNIUM ---")
+        run_parallel(
+            {
+                role: (
+                    lambda runtime=runtime: build_runtime(runtime, Alumni)
+                )
+                for role, runtime in runtimes.items()
+            }
+        )
+
+        log("\n--- EXECUTION DU PLAN COORDONNE ---")
+        results = execute_plan(runtimes, run_dir)
+    except Exception:
+        log("\n>>> ECHEC D'INITIALISATION/ORCHESTRATION <<<")
+        log(traceback.format_exc())
+    finally:
+        log("\n--- FERMETURE DES SESSIONS ---")
+        run_parallel(
+            {
+                role: (lambda runtime=runtime: close_runtime(runtime))
+                for role, runtime in runtimes.items()
+            }
+        )
+
+    report_path = write_report(run_dir, runtimes, results, started_at)
+    passed = sum(result.passed for result in results)
+    failed = sum(not result.passed for result in results)
+    expected = sum(
+        len(item.get("parallel", [item])) for item in MULTI_DEVICE_TEST_PLAN
+    )
+
+    log("\n" + "=" * 76)
+    log("RESUME MULTI-DEVICE")
+    log("=" * 76)
+    log(f"Etapes attendues : {expected}")
+    log(f"Etapes executees : {len(results)}")
+    log(f"PASS             : {passed}")
+    log(f"FAIL             : {failed}")
+    for role, runtime in runtimes.items():
+        totals = runtime.stats.get("total", {}) if isinstance(runtime.stats, dict) else {}
+        log(
+            f"TOKENS {role:<10}: input={totals.get('input_tokens', '?')} "
+            f"output={totals.get('output_tokens', '?')} total={totals.get('total_tokens', '?')}"
+        )
+    log(f"Rapport          : {report_path}")
+
+    success = failed == 0 and len(results) == expected
+    log("\n>>> " + ("SUCCES MULTI-DEVICE" if success else "ECHEC MULTI-DEVICE") + " <<<")
+    return 0 if success else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
