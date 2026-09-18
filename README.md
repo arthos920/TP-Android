@@ -1,21 +1,24 @@
 Salut Benoit,
 
-Oui je vois mieux ce que tu veux faire.
+Oui, ton plan me paraît cohérent.
 
-Je pense que je repartirais simplement d’un clone propre du repo GitLab correspondant à VM2, puis je créerais une branche dédiée pour intégrer les modifs de VM1.
+Je repartirais de main dans GitLab, qui correspond actuellement à l’arborescence de VM2, puis je créerais une branche dédiée pour intégrer les customisations de VM1.
 
-Pour l’export VM1, je l’extraierais à part puis je recopierais les fichiers dans les bons répertoires du repo, en gardant exactement la même arborescence. Avant de commit, je vérifierais bien avec git status et git diff que les fichiers apparaissent aux bons endroits et qu’on ne recrée pas un sous-dossier en plus comme sur ton premier essai.
+Pour l’export modified de VM1, je l’extraierais à part et je recopierais son contenu dans les répertoires correspondants du repo dans VS Code, en faisant attention à conserver les bons chemins. J’ai l’impression que c’est surtout à cette étape que ça a posé problème la première fois, puisque l’export s’est retrouvé comme un élément à part au lieu que son contenu soit intégré dans l’arborescence existante.
 
-Ensuite :
+Avant de commit/push, je vérifierais avec git status et git diff que les fichiers de VM1 apparaissent bien comme ajoutés ou modifiés aux endroits attendus.
 
-commit + push de la branche sur GitLab 
-sur VM2, récupération de cette branche
-test pour vérifier que les customisations de VM1 sont bien présentes et que tout fonctionne.
+Ensuite je ferais :
 
-Si c’est bon, on pourra ensuite merger et avoir une base Git commune pour VM1 et VM2.
+* commit + push de la branche sur GitLab ;
+* récupération de cette branche sur VM2 ;
+* vérification de l’arborescence et test sous Valid8.
 
-Pour le repo qui apparaît directement dans ton home, je pense qu’il vaut mieux éviter de s’en servir si le repo utilisé pour le déploiement est bien celui sous /home/protocolEngine/data/codebase/user/public, histoire de ne pas multiplier les clones.
+Une fois que c’est validé sur VM2, on pourra merger la branche dans main. Ça permettra ensuite d’avoir une version commune dans GitLab que VM1 et VM2 pourront récupérer.
 
-On peut regarder ensemble l’arborescence de l’export VM1 avant de refaire la manip, ça permettra de vérifier exactement où recopier les fichiers.
+Je pense que le plus important avant de refaire la manip est de regarder ensemble la structure exacte de l’export modified de VM1 et à quel niveau il doit être réinjecté dans le repo.
+
+Je peux regarder ça avec toi.
 
 Cordialement,
+Christ
