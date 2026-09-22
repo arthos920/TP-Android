@@ -1,14 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""Extrait les Test Runs des Test Executions portant une Fix Version.
+
+Python 3.10+ ; dépendances : requests, urllib3.
+
+Une ligne = Test Execution + Test Case + ID du Test Run Xray.
+Les dates viennent du Test Run, pas des champs created/updated de Jira.
+Une date absente reste vide. Les fuseaux fournis par Xray sont conservés.
+
+Le CSV complet est reconstruit à chaque lancement, puis la même pièce jointe
+Confluence est créée ou mise à jour. Les anciens snapshots de statistiques
+ne sont pas repris. Aucun filtre de date ni limite d'historique n'est appliqué.
+L'extraction reflète l'état courant des Test Runs accessibles : elle ne relit
+pas l'historique des changements de statut d'un même Test Run.
+"""
 
 import csv
 import io
-import re
 import sys
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlparse
 
 import requests
 import urllib3
@@ -21,101 +33,52 @@ urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 # CONFIGURATION
 # ===========================================================================
 
-# ---------------------------------------------------------------------------
-# JIRA / XRAY
-# ---------------------------------------------------------------------------
-
 JIRA_URL = ""
 JIRA_USER = ""
 JIRA_TOKEN = ""
-
-# Laisse vide si Jira n'utilise pas de proxy.
 JIRA_PROXY_URL = ""
 
-# Test Plan Xray ciblé.
-TEST_PLAN_KEY = ""
+# Filtre appliqué aux Test Executions, pas aux Test Cases.
+FIX_VERSION = "toto"
+TEST_EXECUTION_ISSUE_TYPE = "Test Execution"
 
-# Champ Xray contenant les statistiques consolidées.
-XRAY_STATS_CUSTOM_FIELD = "customfield_11527"
+# Vide = tous les projets accessibles ayant cette Fix Version.
+JIRA_PROJECT_KEY = ""
 
-
-# ---------------------------------------------------------------------------
-# CONFLUENCE
-# ---------------------------------------------------------------------------
+JIRA_PAGE_SIZE = 100
+# Ne doit pas dépasser la limite configurée dans Xray.
+XRAY_PAGE_SIZE = 100
 
 CONFLUENCE_URL = ""
 CONFLUENCE_TOKEN = ""
-
-# Laisse vide si Confluence n'utilise pas de proxy.
 CONFLUENCE_PROXY_URL = ""
 
 CONFLUENCE_PAGE_TITLE = "Dashboard night run automation"
 CONFLUENCE_SPACE_KEY = "TEI"
 
-# La même pièce jointe est mise à jour à chaque lancement.
+# Cette pièce jointe contiendra désormais le détail des Test Runs.
 CSV_FILENAME = "night_run_dashboard.csv"
-
-# Copie locale créée à chaque lancement.
 LOCAL_CSV_PATH = Path(CSV_FILENAME)
-
-
-# ---------------------------------------------------------------------------
-# DATE DU SNAPSHOT
-# ---------------------------------------------------------------------------
-
-# Décalage utilisé uniquement pour les tests :
-# 0 = aujourd'hui, 1 = J+1, 2 = J+2...
-TEST_DAY_OFFSET = 0
-
-# Séparateur adapté à Excel et aux macros CSV en environnement français.
 CSV_DELIMITER = ";"
 
-# Les pourcentages restent des nombres bruts dans le CSV :
-# 96.88 et non "96.88 %".
-CSV_FLOAT_DECIMALS = 2
-
-
-# ===========================================================================
-# FORMAT LONG DU CSV
-# ===========================================================================
-
-DATE_COLUMN = "Date"
-UPDATE_TIME_COLUMN = "Heure de mise à jour"
-LEVEL_COLUMN = "Niveau"
-NAME_COLUMN = "Nom"
-KEY_COLUMN = "Clé"
-URL_COLUMN = "URL"
-TOTAL_COLUMN = "Total"
-PASS_COLUMN = "PASS"
-FAIL_COLUMN = "FAIL"
-TODO_COLUMN = "TODO"
-SUCCESS_RATE_COLUMN = "Réussite (%)"
-
 CSV_HEADERS = [
-    DATE_COLUMN,
-    UPDATE_TIME_COLUMN,
-    LEVEL_COLUMN,
-    NAME_COLUMN,
-    KEY_COLUMN,
-    URL_COLUMN,
-    TOTAL_COLUMN,
-    PASS_COLUMN,
-    FAIL_COLUMN,
-    TODO_COLUMN,
-    SUCCESS_RATE_COLUMN,
+    "Fix version",
+    "Test Execution",
+    "Nom Test Execution",
+    "Test Case",
+    "Nom Test Case",
+    "ID Test Run",
+    "Statut",
+    "Date début",
+    "Date fin",
+    "Date extraction",
+    "URL Test Execution",
+    "URL Test Case",
 ]
 
-LEVEL_TEST_PLAN = "Test Plan"
-LEVEL_TEST_EXECUTION = "Test Execution"
-
-ISSUE_KEY_PATTERN = re.compile(
-    r"^[A-Z][A-Z0-9_]*-\d+$",
-    re.IGNORECASE,
-)
-
 
 # ===========================================================================
-# HTTP
+# HTTP - LOGIQUE DE CONNEXION REPRISE SANS MODIFICATION
 # ===========================================================================
 
 def build_proxies(proxy_url: str) -> dict[str, str] | None:
@@ -170,548 +133,272 @@ def make_confluence_session() -> requests.Session:
 
 
 # ===========================================================================
-# XRAY - STATISTIQUES
+# JIRA - TEST EXECUTIONS FILTRÉES PAR FIX VERSION
 # ===========================================================================
 
-def parse_xray_stats(
-    stats_data: dict[str, Any] | None,
-) -> dict[str, dict[str, float]]:
-    stats: dict[str, dict[str, float]] = {}
-
-    if not stats_data:
-        return stats
-
-    for status in stats_data.get("statuses", []):
-        status_name = str(
-            status.get("name", "")
-        ).upper().strip()
-
-        if not status_name:
-            continue
-
-        stats[status_name] = {
-            "count": float(
-                status.get("statusCount", 0) or 0
-            ),
-            "percent": float(
-                status.get("statusPercent", 0) or 0
-            ),
-        }
-
-    return stats
+def jql_string(value: str) -> str:
+    escaped = value.replace("\\", "\\\\").replace('"', '\\"')
+    return f'"{escaped}"'
 
 
-def normalize_status_name(value: Any) -> str:
-    if isinstance(value, dict):
-        value = (
-            value.get("name")
-            or value.get("status")
-            or value.get("key")
-        )
+def build_jql() -> str:
+    if not FIX_VERSION.strip():
+        raise ValueError("Renseigner FIX_VERSION.")
 
-    return str(value or "UNKNOWN").upper().strip()
+    clauses = [
+        f"issuetype = {jql_string(TEST_EXECUTION_ISSUE_TYPE)}",
+        f"fixVersion = {jql_string(FIX_VERSION)}",
+    ]
+    if JIRA_PROJECT_KEY.strip():
+        clauses.append(f"project = {jql_string(JIRA_PROJECT_KEY)}")
 
-
-def build_metrics(
-    issue_key: str,
-    summary: str,
-    stats: dict[str, dict[str, float]],
-) -> dict[str, Any]:
-    counts = {
-        status_name: int(
-            status_value.get("count", 0)
-        )
-        for status_name, status_value in stats.items()
-    }
-
-    pass_count = counts.get("PASS", 0)
-    fail_count = counts.get("FAIL", 0)
-
-    todo_count = (
-        counts.get("TODO", 0)
-        + counts.get("TO DO", 0)
-        + counts.get("NOT EXECUTED", 0)
-    )
-
-    # Le total garde également les éventuels statuts Xray personnalisés.
-    total_count = sum(counts.values())
-
-    completed_count = pass_count + fail_count
-
-    success_rate = (
-        round(
-            pass_count / completed_count * 100,
-            CSV_FLOAT_DECIMALS,
-        )
-        if completed_count
-        else 0.0
-    )
-
-    return {
-        "key": issue_key,
-        "summary": summary,
-        "total": total_count,
-        "pass": pass_count,
-        "fail": fail_count,
-        "todo": todo_count,
-        "success_rate": success_rate,
-    }
+    return " AND ".join(clauses) + " ORDER BY key ASC"
 
 
-def get_issue_metrics_from_custom_field(
-    issue_key: str,
-) -> dict[str, Any] | None:
-    url = f"{JIRA_URL}/rest/api/2/issue/{issue_key}"
-
-    response = jira_get(
-        url,
-        params={
-            "fields": (
-                f"summary,{XRAY_STATS_CUSTOM_FIELD}"
-            ),
-        },
-    )
-
-    issue = response.json()
-    fields = issue.get("fields", {})
-
-    summary = str(
-        fields.get("summary", issue_key)
-    ).strip()
-
-    stats = parse_xray_stats(
-        fields.get(XRAY_STATS_CUSTOM_FIELD)
-    )
-
-    if not stats:
-        return None
-
-    return build_metrics(
-        issue_key=issue_key,
-        summary=summary,
-        stats=stats,
-    )
-
-
-def get_test_runs(
-    test_execution_key: str,
-) -> list[dict[str, Any]]:
-    """
-    Lit les Test Runs d'une Test Execution.
-    """
-
-    url = (
-        f"{JIRA_URL}/rest/raven/1.0/api/testexec/"
-        f"{test_execution_key}/test"
-    )
+def get_test_executions() -> list[dict[str, Any]]:
+    jql = build_jql()
+    print(f"Recherche Jira : {jql}")
 
     results: list[dict[str, Any]] = []
-    start = 0
-    limit = 100
+    seen_keys: set[str] = set()
+    start_at = 0
 
     while True:
-        response = jira_get(
-            url,
+        payload = jira_get(
+            f"{JIRA_URL}/rest/api/2/search",
             params={
-                "start": start,
-                "limit": limit,
+                "jql": jql,
+                "fields": "summary",
+                "startAt": start_at,
+                "maxResults": JIRA_PAGE_SIZE,
             },
+        ).json()
+
+        if not isinstance(payload, dict) or not isinstance(payload.get("issues"), list):
+            raise ValueError("Réponse Jira inattendue pour la recherche.")
+
+        issues = payload["issues"]
+        total = int(payload["total"])
+        if not issues:
+            if start_at < total:
+                raise ValueError("Pagination Jira interrompue avant la fin des résultats.")
+            break
+
+        for issue in issues:
+            key = issue["key"]
+            if key in seen_keys:
+                raise ValueError(f"Pagination Jira répétée pour {key}. Relancer l'extraction.")
+            seen_keys.add(key)
+            results.append(issue)
+
+        # Jira peut renvoyer moins de résultats que maxResults.
+        start_at += len(issues)
+        if start_at >= total:
+            break
+
+    if not results:
+        raise ValueError(
+            f"Aucune Test Execution accessible pour la Fix Version {FIX_VERSION!r}. "
+            "Le CSV n'a pas été modifié."
         )
 
-        payload = response.json()
+    print(f"{len(results)} Test Execution(s) trouvée(s).")
+    return results
 
-        if isinstance(payload, list):
-            current_results = payload
-            total = len(payload)
 
-        elif isinstance(payload, dict):
-            current_results = (
-                payload.get("results")
-                or payload.get("tests")
-                or payload.get("entries")
-                or payload.get("values")
-                or []
-            )
+# ===========================================================================
+# XRAY - ASSOCIATIONS ET DÉTAIL DES TEST RUNS
+# ===========================================================================
 
-            total = int(
-                payload.get(
-                    "total",
-                    len(current_results),
+def unpack_test_run_page(
+    payload: Any,
+) -> tuple[list[dict[str, Any]], int | None, bool]:
+    """Accepte la liste Xray v1 et les réponses enveloppées avec métadonnées."""
+    total = None
+    is_last = False
+
+    if isinstance(payload, list):
+        items = payload
+    elif isinstance(payload, dict):
+        items = None
+        for name in ("results", "tests", "entries", "values"):
+            if name in payload:
+                items = payload[name]
+                break
+        if payload.get("total") is not None:
+            total = int(payload["total"])
+        is_last = payload.get("isLast") is True
+    else:
+        items = None
+
+    if not isinstance(items, list) or any(not isinstance(item, dict) for item in items):
+        raise ValueError("Réponse Xray inattendue pour la liste des tests.")
+
+    return items, total, is_last
+
+
+def get_test_runs(test_execution_key: str) -> list[dict[str, Any]]:
+    url = f"{JIRA_URL}/rest/raven/1.0/api/testexec/{test_execution_key}/test"
+    results: list[dict[str, Any]] = []
+    seen: set[tuple[str, str]] = set()
+    page = 1
+    expected_total = None
+
+    while True:
+        payload = jira_get(
+            url,
+            params={"page": page, "limit": XRAY_PAGE_SIZE},
+        ).json()
+        items, total, is_last = unpack_test_run_page(payload)
+        if total is not None:
+            expected_total = total
+
+        if not items:
+            if expected_total is not None and len(results) < expected_total:
+                raise ValueError(f"Liste Xray incomplète pour {test_execution_key}.")
+            break
+
+        for item in items:
+            test_key = str(item.get("key") or item.get("testKey") or "").strip()
+            run_id = str(item.get("id") or item.get("testRunId") or "").strip()
+            if not test_key:
+                raise ValueError(f"Clé de Test Case absente dans {test_execution_key}.")
+
+            identity = (test_key, run_id)
+            if identity in seen:
+                raise ValueError(
+                    f"Pagination Xray répétée pour {test_execution_key}, page {page}. "
+                    "Vérifier la prise en charge du paramètre page par votre version Xray."
                 )
-            )
+            seen.add(identity)
+            results.append({"test_key": test_key, "run_id": run_id})
 
-        else:
-            current_results = []
-            total = 0
-
-        current_results = [
-            result
-            for result in current_results
-            if isinstance(result, dict)
-        ]
-
-        results.extend(
-            current_results
-        )
-
-        if not current_results:
+        if expected_total is not None and len(results) >= expected_total:
+            break
+        if is_last:
+            if expected_total is not None and len(results) < expected_total:
+                raise ValueError(f"Dernière page Xray incomplète pour {test_execution_key}.")
             break
 
-        start += len(current_results)
-
-        if start >= total:
-            break
-
-        if len(current_results) < limit:
-            break
+        # Une liste sans total nécessite de poursuivre jusqu'à une page vide.
+        # Ne pas utiliser len(items) < XRAY_PAGE_SIZE : le serveur peut limiter
+        # lui-même la taille des pages.
+        page += 1
 
     return results
 
 
-def get_test_execution_metrics_from_runs(
+def get_test_run_details(
     test_execution_key: str,
+    test_key: str,
+    run_id: str,
 ) -> dict[str, Any]:
-    issue_url = (
-        f"{JIRA_URL}/rest/api/2/issue/"
-        f"{test_execution_key}"
-    )
-
-    issue_response = jira_get(
-        issue_url,
-        params={"fields": "summary"},
-    )
-
-    summary = str(
-        issue_response.json()
-        .get("fields", {})
-        .get("summary", test_execution_key)
-    ).strip()
-
-    status_counts: dict[str, int] = {}
-
-    for test_run in get_test_runs(
-        test_execution_key
-    ):
-        status = normalize_status_name(
-            test_run.get("status")
-            or test_run.get("testRunStatus")
-            or test_run.get("executionStatus")
+    """Le détail du run expose startedOn/finishedOn en dates absolues."""
+    url = f"{JIRA_URL}/rest/raven/1.0/api/testrun"
+    if run_id:
+        response = jira_get(f"{url}/{run_id}")
+    else:
+        response = jira_get(
+            url,
+            params={
+                "testExecIssueKey": test_execution_key,
+                "testIssueKey": test_key,
+            },
         )
 
-        status_counts[status] = (
-            status_counts.get(status, 0) + 1
-        )
+    run = response.json()
+    if not isinstance(run, dict) or not run.get("status"):
+        raise ValueError(f"Détail ou statut Xray absent pour {test_execution_key}/{test_key}.")
 
-    stats = {
-        status_name: {
-            "count": count,
-            "percent": 0,
-        }
-        for status_name, count in status_counts.items()
-    }
+    for field, expected in (("testExecKey", test_execution_key), ("testKey", test_key)):
+        if run.get(field) and str(run[field]) != expected:
+            raise ValueError(f"Test Run incohérent pour {test_execution_key}/{test_key}.")
+    if run_id and run.get("id") is not None and str(run["id"]) != run_id:
+        raise ValueError(f"ID Test Run incohérent pour {test_execution_key}/{test_key}.")
 
-    return build_metrics(
-        issue_key=test_execution_key,
-        summary=summary,
-        stats=stats,
-    )
+    return run
 
 
-def get_test_plan_metrics() -> dict[str, Any]:
-    print(
-        f" Statistiques du Test Plan "
-        f"{TEST_PLAN_KEY}"
-    )
-
-    metrics = get_issue_metrics_from_custom_field(
-        TEST_PLAN_KEY
-    )
-
-    if metrics is None:
-        raise ValueError(
-            f"Le champ {XRAY_STATS_CUSTOM_FIELD} est absent "
-            f"ou vide sur le Test Plan {TEST_PLAN_KEY}."
-        )
-
-    return metrics
+def normalize_status_name(value: Any) -> str:
+    if isinstance(value, dict):
+        value = value.get("name") or value.get("status") or value.get("key")
+    return str(value or "UNKNOWN").upper().strip()
 
 
-def extract_test_execution_keys(
-    payload: Any,
-) -> list[str]:
-    if isinstance(payload, dict):
-        for container_name in (
-            "testExecutions",
-            "results",
-            "issues",
-            "values",
-            "entries",
-        ):
-            if container_name in payload:
-                payload = payload[container_name]
-                break
-        else:
-            payload = [payload]
-
-    if not isinstance(payload, list):
-        raise ValueError(
-            "Format Xray inattendu pour les Test Executions."
-        )
-
-    keys: list[str] = []
-
-    for item in payload:
-        candidate = None
-
-        if isinstance(item, str):
-            candidate = item
-
-        elif isinstance(item, dict):
-            candidate = (
-                item.get("key")
-                or item.get("issueKey")
-                or item.get("testExecutionKey")
-            )
-
-        if (
-            candidate
-            and ISSUE_KEY_PATTERN.match(
-                str(candidate)
-            )
-        ):
-            keys.append(
-                str(candidate).upper()
-            )
-
-    return list(
-        dict.fromkeys(keys)
-    )
-
-
-def get_test_execution_keys() -> list[str]:
-    url = (
-        f"{JIRA_URL}/rest/raven/1.0/api/testplan/"
-        f"{TEST_PLAN_KEY}/testexecution"
-    )
-
-    print(
-        f" Test Executions liées au Test Plan "
-        f"{TEST_PLAN_KEY}"
-    )
-
-    response = jira_get(url)
-
-    keys = extract_test_execution_keys(
-        response.json()
-    )
-
-    if not keys:
-        raise ValueError(
-            f"Aucune Test Execution trouvée pour "
-            f"{TEST_PLAN_KEY}."
-        )
-
-    print(
-        f" {len(keys)} Test Execution(s) : "
-        + ", ".join(keys)
-    )
-
-    return keys
-
-
-def get_all_test_execution_metrics() -> list[dict[str, Any]]:
-    results = []
-
-    for test_execution_key in get_test_execution_keys():
-        metrics = get_issue_metrics_from_custom_field(
-            test_execution_key
-        )
-
-        if metrics is None:
-            print(
-                f" Champ Xray absent sur "
-                f"{test_execution_key}. "
-                "Lecture des Test Runs."
-            )
-
-            metrics = (
-                get_test_execution_metrics_from_runs(
-                    test_execution_key
-                )
-            )
-
-        results.append(
-            metrics
-        )
-
-        print(
-            f" {metrics['summary']} : "
-            f"Total={metrics['total']} | "
-            f"PASS={metrics['pass']} | "
-            f"FAIL={metrics['fail']} | "
-            f"TODO={metrics['todo']} | "
-            f"Réussite={metrics['success_rate']:.2f}%"
-        )
-
-    return sorted(
-        results,
-        key=lambda item: item["summary"].lower(),
-    )
-
-
-# ===========================================================================
-# CONSTRUCTION DES LIGNES LONGUES
-# ===========================================================================
-
-def format_float(value: float) -> str:
-    return f"{float(value):.{CSV_FLOAT_DECIMALS}f}"
+def get_test_case_summary(test_key: str, cache: dict[str, str]) -> str:
+    # Seul le nom est mutualisé : jamais le statut ou les dates d'exécution.
+    if test_key not in cache:
+        payload = jira_get(
+            f"{JIRA_URL}/rest/api/2/issue/{test_key}",
+            params={"fields": "summary"},
+        ).json()
+        cache[test_key] = str(payload.get("fields", {}).get("summary") or test_key)
+    return cache[test_key]
 
 
 def jira_issue_url(issue_key: str) -> str:
-    return (
-        f"{JIRA_URL.rstrip('/')}/browse/"
-        f"{issue_key}"
-    )
+    return f"{JIRA_URL.rstrip('/')}/browse/{issue_key}"
 
 
-def empty_long_row(
-    level: str = "",
-    name: str = "",
-    key: str = "",
-    url: str = "",
-) -> dict[str, str]:
-    return {
-        DATE_COLUMN: "",
-        UPDATE_TIME_COLUMN: "",
-        LEVEL_COLUMN: level,
-        NAME_COLUMN: name,
-        KEY_COLUMN: key,
-        URL_COLUMN: url,
-        TOTAL_COLUMN: "",
-        PASS_COLUMN: "",
-        FAIL_COLUMN: "",
-        TODO_COLUMN: "",
-        SUCCESS_RATE_COLUMN: "",
-    }
-
-
-def metrics_to_long_row(
-    metrics: dict[str, Any],
-    level: str,
-    snapshot_datetime: datetime,
-) -> dict[str, str]:
-    row = empty_long_row(
-        level=level,
-        name=str(metrics["summary"]),
-        key=str(metrics["key"]),
-        url=jira_issue_url(
-            str(metrics["key"])
-        ),
-    )
-
-    row[DATE_COLUMN] = (
-        snapshot_datetime.strftime(
-            "%d/%m/%Y"
-        )
-    )
-
-    row[UPDATE_TIME_COLUMN] = (
-        snapshot_datetime.strftime(
-            "%H:%M:%S"
-        )
-    )
-
-    row[TOTAL_COLUMN] = str(
-        metrics["total"]
-    )
-    row[PASS_COLUMN] = str(
-        metrics["pass"]
-    )
-    row[FAIL_COLUMN] = str(
-        metrics["fail"]
-    )
-    row[TODO_COLUMN] = str(
-        metrics["todo"]
-    )
-    row[SUCCESS_RATE_COLUMN] = format_float(
-        metrics["success_rate"]
-    )
-
-    return row
-
-
-def build_snapshot_rows(
-    test_plan_metrics: dict[str, Any],
-    execution_metrics: list[dict[str, Any]],
-    snapshot_datetime: datetime,
+def build_extraction_rows(
+    executions: list[dict[str, Any]],
+    extracted_at: datetime,
 ) -> list[dict[str, str]]:
-    rows = [
-        metrics_to_long_row(
-            metrics=test_plan_metrics,
-            level=LEVEL_TEST_PLAN,
-            snapshot_datetime=snapshot_datetime,
-        )
-    ]
+    rows: list[dict[str, str]] = []
+    summary_cache: dict[str, str] = {}
+    extraction_date = extracted_at.isoformat(timespec="seconds")
 
-    rows.extend(
-        metrics_to_long_row(
-            metrics=metrics,
-            level=LEVEL_TEST_EXECUTION,
-            snapshot_datetime=snapshot_datetime,
-        )
-        for metrics in execution_metrics
-    )
+    for index, execution in enumerate(executions, start=1):
+        execution_key = execution["key"]
+        execution_name = str(execution.get("fields", {}).get("summary") or execution_key)
+        associations = get_test_runs(execution_key)
+        print(f"[{index}/{len(executions)}] {execution_key} : {len(associations)} Test Run(s).")
+
+        for association in associations:
+            test_key = association["test_key"]
+            run = get_test_run_details(execution_key, test_key, association["run_id"])
+
+            # Chaque association conserve ses propres résultat et dates.
+            # Le même Test Case dans deux Test Executions donne deux lignes.
+            rows.append({
+                "Fix version": FIX_VERSION,
+                "Test Execution": execution_key,
+                "Nom Test Execution": execution_name,
+                "Test Case": test_key,
+                "Nom Test Case": get_test_case_summary(test_key, summary_cache),
+                "ID Test Run": str(run.get("id") or association["run_id"]),
+                "Statut": normalize_status_name(run["status"]),
+                "Date début": str(run.get("startedOn") or ""),
+                "Date fin": str(run.get("finishedOn") or ""),
+                "Date extraction": extraction_date,
+                "URL Test Execution": jira_issue_url(execution_key),
+                "URL Test Case": jira_issue_url(test_key),
+            })
 
     return rows
 
 
 # ===========================================================================
-# CONFLUENCE - PAGE ET PIÈCE JOINTE
+# CONFLUENCE - MÊME RECHERCHE DE PAGE ET MÊME ENVOI MULTIPART
 # ===========================================================================
 
-def find_page_id(
-    session: requests.Session,
-) -> str:
+def find_page_id(session: requests.Session) -> str:
     cql = (
         f'title ~ "{CONFLUENCE_PAGE_TITLE}" '
         f'AND space = "{CONFLUENCE_SPACE_KEY}"'
     )
-
-    url = (
-        f"{CONFLUENCE_URL}/rest/api/search"
-    )
-
     response = session.get(
-        url,
-        params={
-            "cql": cql,
-            "start": 0,
-            "limit": 10,
-        },
+        f"{CONFLUENCE_URL}/rest/api/search",
+        params={"cql": cql, "start": 0, "limit": 10},
         timeout=30,
     )
     response.raise_for_status()
-
-    results = response.json().get(
-        "results",
-        [],
-    )
-
+    results = response.json().get("results", [])
     if not results:
-        raise ValueError(
-            f"Page Confluence "
-            f"'{CONFLUENCE_PAGE_TITLE}' introuvable."
-        )
+        raise ValueError(f"Page Confluence '{CONFLUENCE_PAGE_TITLE}' introuvable.")
 
-    page_id = str(
-        results[0]["content"]["id"]
-    )
-
-    print(
-        f" Page Confluence trouvée : "
-        f"{page_id}"
-    )
-
+    page_id = str(results[0]["content"]["id"])
+    print(f"Page Confluence trouvée : {page_id}")
     return page_id
 
 
@@ -719,109 +406,16 @@ def find_csv_attachment(
     session: requests.Session,
     page_id: str,
 ) -> dict[str, Any] | None:
-    url = (
-        f"{CONFLUENCE_URL}/rest/api/content/"
-        f"{page_id}/child/attachment"
-    )
-
     response = session.get(
-        url,
-        params={
-            "filename": CSV_FILENAME,
-            "limit": 200,
-            "expand": "version",
-        },
+        f"{CONFLUENCE_URL}/rest/api/content/{page_id}/child/attachment",
+        params={"filename": CSV_FILENAME, "limit": 200, "expand": "version"},
         timeout=30,
     )
     response.raise_for_status()
-
-    for attachment in response.json().get(
-        "results",
-        [],
-    ):
+    for attachment in response.json().get("results", []):
         if attachment.get("title") == CSV_FILENAME:
             return attachment
-
     return None
-
-
-def make_absolute_confluence_url(
-    link: str,
-) -> str:
-    """
-    Préserve le context path Confluence.
-
-    Exemple :
-        CONFLUENCE_URL = https://serveur/confluence
-        link = /download/attachments/123/fichier.csv
-
-    Résultat :
-        https://serveur/confluence/download/attachments/123/fichier.csv
-    """
-
-    if link.startswith(
-        ("http://", "https://")
-    ):
-        return link
-
-    parsed_base = urlparse(
-        CONFLUENCE_URL.rstrip("/")
-    )
-
-    origin = (
-        f"{parsed_base.scheme}://"
-        f"{parsed_base.netloc}"
-    )
-
-    context_path = parsed_base.path.rstrip("/")
-    normalized_link = "/" + link.lstrip("/")
-
-    if (
-        context_path
-        and (
-            normalized_link == context_path
-            or normalized_link.startswith(
-                context_path + "/"
-            )
-        )
-    ):
-        return origin + normalized_link
-
-    return (
-        origin
-        + context_path
-        + normalized_link
-    )
-
-
-def download_attachment_content(
-    session: requests.Session,
-    page_id: str,
-    attachment: dict[str, Any],
-) -> bytes:
-    download_link = (
-        attachment.get("_links", {})
-        .get("download")
-    )
-
-    if download_link:
-        download_url = make_absolute_confluence_url(
-            download_link
-        )
-    else:
-        download_url = (
-            f"{CONFLUENCE_URL.rstrip('/')}"
-            f"/download/attachments/"
-            f"{page_id}/{quote(CSV_FILENAME)}"
-        )
-
-    response = session.get(
-        download_url,
-        timeout=30,
-    )
-    response.raise_for_status()
-
-    return response.content
 
 
 def create_csv_attachment(
@@ -829,37 +423,15 @@ def create_csv_attachment(
     page_id: str,
     csv_content: bytes,
 ) -> None:
-    url = (
-        f"{CONFLUENCE_URL}/rest/api/content/"
-        f"{page_id}/child/attachment"
-    )
-
     response = session.post(
-        url,
-        headers={
-            "X-Atlassian-Token": "no-check",
-        },
-        files={
-            "file": (
-                CSV_FILENAME,
-                io.BytesIO(csv_content),
-                "text/csv",
-            )
-        },
-        data={
-            "comment": (
-                "Création automatique du CSV long "
-                "du dashboard night run"
-            )
-        },
+        f"{CONFLUENCE_URL}/rest/api/content/{page_id}/child/attachment",
+        headers={"X-Atlassian-Token": "no-check"},
+        files={"file": (CSV_FILENAME, io.BytesIO(csv_content), "text/csv")},
+        data={"comment": f"Extraction Xray des Test Runs - Fix Version {FIX_VERSION}"},
         timeout=60,
     )
     response.raise_for_status()
-
-    print(
-        f" Pièce jointe créée : "
-        f"{CSV_FILENAME}"
-    )
+    print(f"Pièce jointe créée : {CSV_FILENAME}")
 
 
 def update_csv_attachment(
@@ -868,454 +440,55 @@ def update_csv_attachment(
     attachment_id: str,
     csv_content: bytes,
 ) -> None:
-    url = (
-        f"{CONFLUENCE_URL}/rest/api/content/"
-        f"{page_id}/child/attachment/"
-        f"{attachment_id}/data"
-    )
-
     response = session.post(
-        url,
-        headers={
-            "X-Atlassian-Token": "no-check",
-        },
-        files={
-            "file": (
-                CSV_FILENAME,
-                io.BytesIO(csv_content),
-                "text/csv",
-            )
-        },
-        data={
-            "comment": (
-                "Mise à jour automatique du CSV long "
-                "du dashboard night run"
-            )
-        },
+        f"{CONFLUENCE_URL}/rest/api/content/{page_id}/child/attachment/{attachment_id}/data",
+        headers={"X-Atlassian-Token": "no-check"},
+        files={"file": (CSV_FILENAME, io.BytesIO(csv_content), "text/csv")},
+        data={"comment": f"Extraction Xray des Test Runs - Fix Version {FIX_VERSION}"},
         timeout=60,
     )
     response.raise_for_status()
-
-    print(
-        f" Nouvelle version de la pièce jointe : "
-        f"{CSV_FILENAME}"
-    )
+    print(f"Nouvelle version de la pièce jointe : {CSV_FILENAME}")
 
 
 # ===========================================================================
-# LECTURE DU CSV
+# CSV ET MAIN
 # ===========================================================================
 
-def read_csv_content(
-    csv_content: bytes | None,
-) -> tuple[list[str], list[dict[str, str]]]:
-    if not csv_content:
-        return [], []
-
-    text = csv_content.decode(
-        "utf-8-sig"
-    )
-
-    reader = csv.DictReader(
-        io.StringIO(text),
-        delimiter=CSV_DELIMITER,
-    )
-
-    if not reader.fieldnames:
-        return [], []
-
-    rows = [
-        {
-            str(key): (
-                "" if value is None else str(value)
-            )
-            for key, value in row.items()
-        }
-        for row in reader
-    ]
-
-    return list(reader.fieldnames), rows
-
-
-def is_long_format(
-    headers: list[str],
-) -> bool:
-    return {
-        DATE_COLUMN,
-        LEVEL_COLUMN,
-        NAME_COLUMN,
-        TOTAL_COLUMN,
-        PASS_COLUMN,
-        FAIL_COLUMN,
-        TODO_COLUMN,
-        SUCCESS_RATE_COLUMN,
-    }.issubset(set(headers))
-
-
-def normalize_long_row(
-    row: dict[str, str],
-) -> dict[str, str]:
-    return {
-        header: str(
-            row.get(header, "")
-        ).strip()
-        for header in CSV_HEADERS
-    }
-
-
-def load_existing_long_rows(
-    csv_content: bytes | None,
-) -> list[dict[str, str]]:
-    headers, rows = read_csv_content(
-        csv_content
-    )
-
-    if not rows:
-        return []
-
-    if not is_long_format(headers):
-        raise ValueError(
-            "Le CSV existant n'est pas au format long attendu. "
-            "La migration automatique de l'ancien format a été supprimée."
-        )
-
-    return [
-        normalize_long_row(row)
-        for row in rows
-    ]
-
-
-# ===========================================================================
-# MISE À JOUR DU CSV
-# ===========================================================================
-
-def parse_date(
-    date_value: str,
-) -> datetime | None:
-    try:
-        return datetime.strptime(
-            date_value,
-            "%d/%m/%Y",
-        )
-    except ValueError:
-        return None
-
-
-def long_row_identity(
-    row: dict[str, str],
-) -> tuple[str, str, str]:
-    """
-    Identité métier d'une ligne :
-        Date + Niveau + Clé
-
-    Si la Clé est vide, le Nom est utilisé comme solution de secours.
-    """
-
-    key_or_name = (
-        row.get(KEY_COLUMN, "").strip()
-        or row.get(NAME_COLUMN, "").strip()
-    )
-
-    return (
-        row.get(DATE_COLUMN, "").strip(),
-        row.get(LEVEL_COLUMN, "").strip(),
-        key_or_name,
-    )
-
-
-def deduplicate_rows(
-    rows: list[dict[str, str]],
-) -> list[dict[str, str]]:
-    rows_by_identity: dict[
-        tuple[str, str, str],
-        dict[str, str],
-    ] = {}
-
-    for row in rows:
-        identity = long_row_identity(row)
-        rows_by_identity[identity] = row
-
-    return list(rows_by_identity.values())
-
-
-def replace_snapshot_date(
-    existing_rows: list[dict[str, str]],
-    snapshot_rows: list[dict[str, str]],
-    snapshot_date: str,
-) -> list[dict[str, str]]:
-    """
-    Au même jour, toutes les anciennes lignes Test Plan/Test Execution
-    sont supprimées puis remplacées par le snapshot actuel.
-    """
-
-    retained_rows = []
-
-    removed_count = 0
-
-    for row in existing_rows:
-        level = row.get(
-            LEVEL_COLUMN,
-            "",
-        ).strip()
-
-        date_value = row.get(
-            DATE_COLUMN,
-            "",
-        ).strip()
-
-        if (
-            level in {
-                LEVEL_TEST_PLAN,
-                LEVEL_TEST_EXECUTION,
-            }
-            and date_value == snapshot_date
-        ):
-            removed_count += 1
-            continue
-
-        retained_rows.append(
-            row
-        )
-
-    if removed_count:
-        print(
-            f" {removed_count} ancienne(s) ligne(s) "
-            f"du {snapshot_date} remplacée(s)."
-        )
-    else:
-        print(
-            f" Nouveau snapshot pour le "
-            f"{snapshot_date}."
-        )
-
-    return (
-        retained_rows
-        + snapshot_rows
-    )
-
-
-def sort_long_rows(
-    rows: list[dict[str, str]],
-) -> list[dict[str, str]]:
-    level_order = {
-        LEVEL_TEST_PLAN: 0,
-        LEVEL_TEST_EXECUTION: 1,
-    }
-
-    def sort_key(
-        row: dict[str, str],
-    ) -> tuple[Any, ...]:
-        level = row.get(
-            LEVEL_COLUMN,
-            "",
-        ).strip()
-
-        parsed_date = parse_date(
-            row.get(
-                DATE_COLUMN,
-                "",
-            ).strip()
-        )
-
-        date_sort_value = (
-            parsed_date
-            if parsed_date is not None
-            else datetime.max
-        )
-
-        return (
-            date_sort_value,
-            level_order.get(level, 99),
-            row.get(
-                NAME_COLUMN,
-                "",
-            ).lower(),
-        )
-
-    return sorted(
-        rows,
-        key=sort_key,
-    )
-
-
-# ===========================================================================
-# GÉNÉRATION DU CSV
-# ===========================================================================
-
-def generate_csv_content(
-    rows: list[dict[str, str]],
-) -> bytes:
-    buffer = io.StringIO(
-        newline=""
-    )
-
+def generate_csv_content(rows: list[dict[str, str]]) -> bytes:
+    buffer = io.StringIO(newline="")
     writer = csv.DictWriter(
         buffer,
         fieldnames=CSV_HEADERS,
         delimiter=CSV_DELIMITER,
-        extrasaction="ignore",
         lineterminator="\n",
     )
-
     writer.writeheader()
+    writer.writerows(rows)
+    return buffer.getvalue().encode("utf-8-sig")
 
-    for row in rows:
-        writer.writerow(
-            {
-                header: row.get(
-                    header,
-                    "",
-                )
-                for header in CSV_HEADERS
-            }
-        )
-
-    # BOM UTF-8 pour l'ouverture directe dans Excel.
-    return buffer.getvalue().encode(
-        "utf-8-sig"
-    )
-
-
-# ===========================================================================
-# MAIN
-# ===========================================================================
 
 def main() -> None:
-    confluence_session = (
-        make_confluence_session()
-    )
+    confluence_session = make_confluence_session()
 
-    # 1. Lecture de l'état actuel dans Jira/Xray.
-    test_plan_metrics = (
-        get_test_plan_metrics()
-    )
+    # L'extraction doit aboutir entièrement avant toute écriture du CSV.
+    extracted_at = datetime.now().astimezone()
+    executions = get_test_executions()
+    rows = build_extraction_rows(executions, extracted_at)
+    csv_content = generate_csv_content(rows)
 
-    execution_metrics = (
-        get_all_test_execution_metrics()
-    )
+    LOCAL_CSV_PATH.write_bytes(csv_content)
+    print(f"CSV local généré : {LOCAL_CSV_PATH.resolve()} ({len(rows)} lignes).")
 
-    # 2. Date du snapshot.
-    now = datetime.now().astimezone()
-
-    snapshot_datetime = (
-        now
-        + timedelta(
-            days=TEST_DAY_OFFSET
-        )
-    )
-
-    snapshot_date = (
-        snapshot_datetime.strftime(
-            "%d/%m/%Y"
-        )
-    )
-
-    # 3. Construction des lignes longues du jour.
-    snapshot_rows = build_snapshot_rows(
-        test_plan_metrics=test_plan_metrics,
-        execution_metrics=execution_metrics,
-        snapshot_datetime=snapshot_datetime,
-    )
-
-
-    # 4. Recherche de la page et de la pièce jointe.
-    page_id = find_page_id(
-        confluence_session
-    )
-
-    attachment = find_csv_attachment(
-        confluence_session,
-        page_id,
-    )
-
-    existing_csv_content = None
-
-    if attachment is not None:
-        print(
-            f" Téléchargement de "
-            f"{CSV_FILENAME}"
-        )
-
-        existing_csv_content = (
-            download_attachment_content(
-                confluence_session,
-                page_id,
-                attachment,
-            )
-        )
-    else:
-        print(
-            f" La pièce jointe "
-            f"{CSV_FILENAME} n'existe pas encore."
-        )
-
-    # 5. Lecture du CSV existant.
-    existing_rows = load_existing_long_rows(
-        existing_csv_content
-    )
-
-    print(
-        f" Lignes existantes relues : "
-        f"{len(existing_rows)}"
-    )
-
-    # 6. Remplacement complet du jour courant.
-    updated_rows = replace_snapshot_date(
-        existing_rows=existing_rows,
-        snapshot_rows=snapshot_rows,
-        snapshot_date=snapshot_date,
-    )
-
-
-    # 7. Déduplication puis tri.
-    # Aucun historique n'est supprimé : toutes les dates déjà présentes
-    # dans le CSV sont conservées.
-    updated_rows = deduplicate_rows(
-        updated_rows
-    )
-
-    updated_rows = sort_long_rows(
-        updated_rows
-    )
-
-    print(
-        f" Nombre total de lignes CSV : "
-        f"{len(updated_rows)}"
-    )
-
-    # 8. Génération du CSV.
-    new_csv_content = generate_csv_content(
-        updated_rows
-    )
-
-    LOCAL_CSV_PATH.write_bytes(
-        new_csv_content
-    )
-
-    print(
-        f" CSV local généré : "
-        f"{LOCAL_CSV_PATH.resolve()}"
-    )
-
-    # 9. Création ou mise à jour de la pièce jointe.
+    page_id = find_page_id(confluence_session)
+    attachment = find_csv_attachment(confluence_session, page_id)
     if attachment is None:
-        create_csv_attachment(
-            session=confluence_session,
-            page_id=page_id,
-            csv_content=new_csv_content,
-        )
+        create_csv_attachment(confluence_session, page_id, csv_content)
     else:
-        update_csv_attachment(
-            session=confluence_session,
-            page_id=page_id,
-            attachment_id=str(
-                attachment["id"]
-            ),
-            csv_content=new_csv_content,
-        )
+        update_csv_attachment(confluence_session, page_id, str(attachment["id"]), csv_content)
 
     print(
-        " Terminé : CSV long mis à jour. "
+        f"Terminé : {len(executions)} Test Execution(s), {len(rows)} Test Run(s). "
         "Le contenu de la page Confluence n'a pas été modifié."
     )
 
@@ -1324,8 +497,5 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as error:
-        print(
-            f" Une erreur est survenue : "
-            f"{error}"
-        )
+        print(f"Une erreur est survenue : {error}")
         sys.exit(1)
