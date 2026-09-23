@@ -13,6 +13,7 @@ Colonnes attendues : Status, Release, Jira Project, Confluence Page,
 Beg. Date (ou Beg_Date), End Date. Seules les lignes Enable sont traitées.
 Pour chaque ligne, deux fichiers sont envoyés à la page Confluence indiquée :
 <release>_brut.csv et <release>_post_processing.csv.
+Avec DEBUG = True, tous les CSV sont envoyés à DEBUG_CONFLUENCE_PAGE_ID.
 La période du post-processing va de Beg. Date à End Date, bornes incluses.
 
 Les deux CSV sont reconstruits à chaque lancement et envoyés à Confluence.
@@ -20,7 +21,7 @@ Le post-processing est calculé exclusivement à partir du CSV brut généré.
 Pour chaque jour, il retient le dernier statut daté de chaque Test Case.
 TOTAL est le nombre de Test Cases distincts du brut, fixe sur toute la période.
 Avant le premier statut daté, le test est compté TODO par convention.
-Les jours futurs restent vides, sauf Date et TOTAL.
+Les jours futurs restent vides, sauf date et TOTAL.
 EXECUTED_IN_DAY = (PASS du jour - PASS de la veille)
                 + (FAIL du jour - FAIL de la veille).
 Cette variation signée peut être négative et ne compte pas les relances.
@@ -74,10 +75,16 @@ CONFLUENCE_CONFIG_PAGE_ID = ""
 CONFLUENCE_CONFIG_PAGE_TITLE = "JIRA extraction needs for reporting"
 CONFLUENCE_CONFIG_SPACE_KEY = "TEI"
 
+# Mode test : tous les CSV sont envoyés sur cette unique page Confluence.
+# Renseigner son ID numérique avant de lancer le script en mode debug.
+# False = utiliser la colonne Confluence Page de chaque ligne du tableau.
+DEBUG = True
+DEBUG_CONFLUENCE_PAGE_ID = ""
+
 # Copies locales regroupées par ID de page de destination pour éviter les
 # collisions si deux pages utilisent le même nom de release.
 OUTPUT_DIRECTORY = Path("jira_exports")
-CSV_DELIMITER = ";"
+CSV_DELIMITER = ","
 REPORT_TIMEZONE = "Europe/Paris"
 
 CSV_HEADERS = [
@@ -96,7 +103,7 @@ CSV_HEADERS = [
 ]
 
 POST_PROCESSING_HEADERS = [
-    "Date", "NA", "PASS", "FAIL", "ABORTED", "TODO", "EXECUTING",
+    "date", "NA", "PASS", "FAIL", "ABORTED", "TODO", "EXECUTING",
     "TOTAL", "EXECUTED_IN_DAY",
 ]
 
@@ -651,7 +658,7 @@ def build_post_processing_rows(
     current_day = first_day
     while current_day <= last_day:
         row = {header: "" for header in POST_PROCESSING_HEADERS}
-        row["Date"] = current_day.strftime("%d/%m/%Y")
+        row["date"] = current_day.isoformat()
         row["TOTAL"] = str(len(test_keys))
 
         if current_day <= today:
@@ -866,6 +873,15 @@ def release_filename_stem(release: str) -> str:
 
 
 def get_enabled_jobs(session: requests.Session) -> tuple[list[dict[str, Any]], list[str]]:
+    debug_page_id = str(DEBUG_CONFLUENCE_PAGE_ID).strip() if DEBUG else ""
+    if DEBUG:
+        if not re.fullmatch(r"[0-9]+", debug_page_id):
+            raise ValueError(
+                "DEBUG est activé : renseigner DEBUG_CONFLUENCE_PAGE_ID avec "
+                "l'ID numérique de la page de test. Aucun CSV n'a été envoyé."
+            )
+        print(f"DEBUG actif : tous les CSV seront envoyés sur la page {debug_page_id}.")
+
     page_id = CONFLUENCE_CONFIG_PAGE_ID.strip()
     if page_id and not page_id.isdigit():
         raise ValueError("CONFLUENCE_CONFIG_PAGE_ID doit contenir uniquement l'ID numérique.")
@@ -887,7 +903,10 @@ def get_enabled_jobs(session: requests.Session) -> tuple[list[dict[str, Any]], l
     conflicts: set[tuple[str, str]] = set()
     for job in jobs:
         try:
-            job["page_id"] = resolve_target_page(session, job["page_cell"], default_space)
+            job["page_id"] = (
+                debug_page_id if DEBUG
+                else resolve_target_page(session, job["page_cell"], default_space)
+            )
             stem = release_filename_stem(job["release"])
             job["raw_filename"] = f"{stem}_brut.csv"
             job["post_filename"] = f"{stem}_post_processing.csv"
