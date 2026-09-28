@@ -1,264 +1,220 @@
 param (
-    [Parameter(Mandatory=$true)]
-    [datetime]$TestStart,
-
-    [Parameter(Mandatory=$true)]
-    [datetime]$TestEnd,
-
-    [string]$LogPath = ""
+    [Parameter(Mandatory = $true)]
+    [string]$OutputXml
 )
 
-Write-Host ""
-Write-Host "========================================="
-Write-Host "  ANALYSE TELEPHONES ADB / ANYWHEREUSB"
-Write-Host "========================================="
-Write-Host ""
-Write-Host "Debut du test : $TestStart"
-Write-Host "Fin du test   : $TestEnd"
-Write-Host ""
+# Message permettant d'identifier une prise de PTT.
+# Insensible aux majuscules/minuscules et accepte du texte
+# supplémentaire entre PTT et pressed.
+$PttRegex = '(?i)\bPTT\b[\s\S]*?\bpressed\b'
 
-# ============================================================
-# 1. RECUPERATION DES TELEPHONES ACTUELLEMENT VUS PAR ADB
-# ============================================================
-
-$devices = adb devices |
-    Select-String "\sdevice$" |
-    ForEach-Object {
-        ($_ -split "\s+")[0]
-    }
-
-if (-not $devices) {
-    Write-Host "Aucun telephone actuellement detecte par ADB."
-}
-else {
-    Write-Host "$($devices.Count) telephone(s) actuellement detecte(s) par ADB."
+# Compteurs
+$counts = [ordered]@{
+    driver1 = 0
+    driver2 = 0
+    driver3 = 0
+    driver4 = 0
+    driver5 = 0
+    driver6 = 0
+    UNKNOWN = 0
 }
 
-Write-Host ""
+$total = 0
 
-$results = @()
+# Stack des owners des keywords actuellement parcourus
+$kwOwners = [System.Collections.Generic.List[string]]::new()
 
-# ============================================================
-# 2. ANALYSE DE CHAQUE TELEPHONE
-# ============================================================
+# Etat de lecture d'un <msg>
+$inMsg = $false
+$msgText = [System.Text.StringBuilder]::new()
+$msgDriver = "UNKNOWN"
 
-foreach ($serial in $devices) {
 
-    Write-Host "-----------------------------------------"
-    Write-Host "Analyse : $serial"
-    Write-Host "-----------------------------------------"
+function Get-CurrentDriver {
 
-    # Etat ADB
-    try {
-        $state = (adb -s $serial get-state 2>$null).Trim()
-    }
-    catch {
-        $state = "ERROR"
-    }
+    param (
+        [System.Collections.Generic.List[string]]$Owners
+    )
 
-    # Modele du telephone
-    try {
-        $model = (adb -s $serial shell getprop ro.product.model 2>$null).Trim()
-    }
-    catch {
-        $model = "UNKNOWN"
-    }
+    # On part du keyword le plus proche du message
+    # et on remonte jusqu'à trouver driver1 ... driver6
+    for ($i = $Owners.Count - 1; $i -ge 0; $i--) {
 
-    # Recherche du périphérique correspondant dans Windows
-    $pnp = Get-PnpDevice -ErrorAction SilentlyContinue |
-        Where-Object {
-            $_.InstanceId -like "*$serial*"
-        } |
-        Select-Object -First 1
+        $owner = $Owners[$i]
 
-    $arrival = $null
-    $connectedFor = "UNKNOWN"
-    $reconnectionDuringTest = "UNKNOWN"
-
-    if ($pnp) {
-
-        try {
-            $arrival = (
-                Get-PnpDeviceProperty `
-                    -InstanceId $pnp.InstanceId `
-                    -KeyName "DEVPKEY_Device_LastArrivalDate" `
-                    -ErrorAction Stop
-            ).Data
-        }
-        catch {
-            $arrival = $null
-        }
-
-        if ($arrival) {
-
-            $duration = New-TimeSpan -Start $arrival -End (Get-Date)
-
-            $connectedFor = "{0}j {1}h {2}min {3}s" -f `
-                $duration.Days,
-                $duration.Hours,
-                $duration.Minutes,
-                $duration.Seconds
-
-            if (($arrival -ge $TestStart) -and ($arrival -le $TestEnd)) {
-                $reconnectionDuringTest = "OUI - reconnexion possible"
-            }
-            else {
-                $reconnectionDuringTest = "NON"
-            }
+        if ($owner -match '(?i)^driver\s*([1-6])$') {
+            return "driver$($Matches[1])"
         }
     }
-    else {
-        Write-Host "Impossible d'associer automatiquement le serial ADB au peripherique Windows."
-    }
 
-    Write-Host "ADB ID               : $serial"
-    Write-Host "Modele                : $model"
-    Write-Host "Etat ADB              : $state"
-    Write-Host "Derniere arrivee VM   : $arrival"
-    Write-Host "Present depuis        : $connectedFor"
-    Write-Host "Arrivee pendant test  : $reconnectionDuringTest"
-    Write-Host ""
-
-    $results += [PSCustomObject]@{
-        ADB_ID                    = $serial
-        Model                     = $model
-        ADB_State                 = $state
-        LastArrival               = $arrival
-        ConnectedFor              = $connectedFor
-        ArrivalDuringTest         = $reconnectionDuringTest
-    }
+    return "UNKNOWN"
 }
 
-# ============================================================
-# 3. TABLEAU RECAPITULATIF
-# ============================================================
+
+# Vérification du fichier
+if (-not (Test-Path $OutputXml)) {
+    Write-Host "Fichier introuvable : $OutputXml"
+    exit 1
+}
+
+
+$resolvedPath = (Resolve-Path $OutputXml).Path
 
 Write-Host ""
-Write-Host "========================================="
-Write-Host "RESUME"
-Write-Host "========================================="
+Write-Host "Analyse de : $resolvedPath"
 Write-Host ""
 
-$results | Format-Table -AutoSize
 
-# ============================================================
-# 4. EVENEMENTS WINDOWS PNP / USB PENDANT LE TEST
-# ============================================================
+$settings = [System.Xml.XmlReaderSettings]::new()
+$settings.IgnoreWhitespace = $false
+$settings.DtdProcessing = [System.Xml.DtdProcessing]::Ignore
 
-Write-Host ""
-Write-Host "========================================="
-Write-Host "EVENEMENTS WINDOWS PENDANT LE TEST"
-Write-Host "========================================="
-Write-Host ""
+$reader = $null
 
 try {
 
-    $windowsEvents = Get-WinEvent -FilterHashtable @{
-        LogName   = "System"
-        StartTime = $TestStart
-        EndTime   = $TestEnd
-    } -ErrorAction Stop |
-    Where-Object {
-        $_.ProviderName -match "Kernel-PnP|UserPnp|USB|DriverFramework"
-    } |
-    Select-Object TimeCreated, Id, ProviderName, Message
+    $reader = [System.Xml.XmlReader]::Create(
+        $resolvedPath,
+        $settings
+    )
 
-    if ($windowsEvents) {
+    while ($reader.Read()) {
 
-        foreach ($event in $windowsEvents) {
+        # =====================================================
+        # ELEMENT OUVRANT
+        # =====================================================
 
-            Write-Host "-----------------------------------------"
-            Write-Host "Date     : $($event.TimeCreated)"
-            Write-Host "ID       : $($event.Id)"
-            Write-Host "Provider : $($event.ProviderName)"
-            Write-Host "Message  : $($event.Message)"
-        }
+        if ($reader.NodeType -eq [System.Xml.XmlNodeType]::Element) {
 
-    }
-    else {
-        Write-Host "Aucun evenement PnP/USB trouve pendant la periode."
-    }
+            # Entrée dans un keyword Robot Framework
+            if ($reader.Name -eq "kw") {
 
-}
-catch {
-    Write-Host "Impossible de lire les evenements Windows :"
-    Write-Host $_.Exception.Message
-}
+                $owner = $reader.GetAttribute("owner")
 
-# ============================================================
-# 5. ANALYSE OPTIONNELLE DES LOGS ROBOT / APPIUM
-# ============================================================
+                if ($null -eq $owner) {
+                    $owner = ""
+                }
 
-if ($LogPath -ne "") {
+                $kwOwners.Add($owner)
 
-    Write-Host ""
-    Write-Host "========================================="
-    Write-Host "RECHERCHE DANS LES LOGS ROBOT / APPIUM"
-    Write-Host "========================================="
-    Write-Host ""
+                # Cas très rare : <kw ... />
+                if ($reader.IsEmptyElement) {
+                    $kwOwners.RemoveAt($kwOwners.Count - 1)
+                }
+            }
 
-    if (Test-Path $LogPath) {
+            # Entrée dans un message
+            elseif ($reader.Name -eq "msg") {
 
-        $patterns = @(
-            "device offline",
-            "device not found",
-            "no devices/emulators found",
-            "connection reset",
-            "socket hang up",
-            "ADB.*offline",
-            "ADB.*not found",
-            "NoSuchElementException"
-        )
+                $inMsg = $true
 
-        $logFiles = Get-ChildItem `
-            -Path $LogPath `
-            -Recurse `
-            -File `
-            -Include *.log,*.txt,*.xml `
-            -ErrorAction SilentlyContinue
+                $msgText.Clear() | Out-Null
 
-        foreach ($pattern in $patterns) {
-
-            $matches = $logFiles |
-                Select-String `
-                    -Pattern $pattern `
-                    -CaseSensitive:$false `
-                    -ErrorAction SilentlyContinue
-
-            if ($matches) {
-
-                Write-Host ""
-                Write-Host "ERREUR TROUVEE : $pattern"
-                Write-Host ""
-
-                $matches |
-                    Select-Object Path, LineNumber, Line |
-                    Format-Table -Wrap
+                # On mémorise le driver actif au moment du message
+                $msgDriver = Get-CurrentDriver -Owners $kwOwners
             }
         }
 
+
+        # =====================================================
+        # CONTENU DU MESSAGE
+        # =====================================================
+
+        elseif (
+            $inMsg -and (
+                $reader.NodeType -eq [System.Xml.XmlNodeType]::Text -or
+                $reader.NodeType -eq [System.Xml.XmlNodeType]::CDATA -or
+                $reader.NodeType -eq [System.Xml.XmlNodeType]::SignificantWhitespace
+            )
+        ) {
+
+            $msgText.Append($reader.Value) | Out-Null
+        }
+
+
+        # =====================================================
+        # ELEMENT FERMANT
+        # =====================================================
+
+        elseif ($reader.NodeType -eq [System.Xml.XmlNodeType]::EndElement) {
+
+            # Fin d'un message
+            if ($reader.Name -eq "msg" -and $inMsg) {
+
+                $text = $msgText.ToString()
+
+                # Exemple :
+                # PTT pressed (long hold started)
+                if ($text -match $PttRegex) {
+
+                    $total++
+
+                    if ($counts.Contains($msgDriver)) {
+                        $counts[$msgDriver]++
+                    }
+                    else {
+                        $counts["UNKNOWN"]++
+                    }
+                }
+
+                $inMsg = $false
+                $msgText.Clear() | Out-Null
+                $msgDriver = "UNKNOWN"
+            }
+
+            # Sortie d'un keyword
+            elseif ($reader.Name -eq "kw") {
+
+                if ($kwOwners.Count -gt 0) {
+                    $kwOwners.RemoveAt($kwOwners.Count - 1)
+                }
+            }
+        }
     }
-    else {
-        Write-Host "Le dossier de logs n'existe pas : $LogPath"
+}
+catch {
+
+    Write-Host ""
+    Write-Host "Erreur pendant l'analyse du XML :"
+    Write-Host $_.Exception.Message
+
+    exit 1
+}
+finally {
+
+    if ($null -ne $reader) {
+        $reader.Close()
     }
 }
 
-# ============================================================
-# 6. EXPORT CSV
-# ============================================================
 
-$csvFile = ".\phone_connection_report.csv"
-
-$results |
-    Export-Csv `
-        -Path $csvFile `
-        -Delimiter ";" `
-        -NoTypeInformation `
-        -Encoding UTF8
+# ============================================================
+# RESULTAT
+# ============================================================
 
 Write-Host ""
 Write-Host "========================================="
-Write-Host "FIN DE L'ANALYSE"
+Write-Host "        NOMBRE DE PTT PRIS"
 Write-Host "========================================="
 Write-Host ""
-Write-Host "Rapport CSV : $csvFile"
+
+$result = foreach ($i in 1..6) {
+
+    $driver = "driver$i"
+
+    [PSCustomObject]@{
+        Driver = $driver
+        PTT    = $counts[$driver]
+    }
+}
+
+$result | Format-Table -AutoSize
+
+Write-Host "-----------------------------------------"
+Write-Host "TOTAL PTT : $total"
+
+if ($counts["UNKNOWN"] -gt 0) {
+    Write-Host "PTT sans driver identifie : $($counts["UNKNOWN"])"
+}
+
+Write-Host ""
