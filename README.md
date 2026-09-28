@@ -1,1762 +1,522 @@
-param (
+#requires -Version 5.1
+
+<#
+Appel normal :
+    Controle des acteurs avec retry toutes les 5 secondes.
+
+Appel -AfterJob :
+    Utilise dans after_script du meme job GitLab.
+    Remet les tests a TODO uniquement si CI_JOB_STATUS vaut failed.
+
+ISSUE_KEY doit etre la cle de la Test Execution concernee.
+
+Le statut controle est celui de ce job.
+Un echec dans un autre job execute ensuite n'est pas traite ici.
+#>
+
+param(
     [Parameter(Mandatory = $true)]
-    [string]$OutputXml,
+    [string]$ISSUE_KEY,
 
-    [switch]$ExportCsv,
+    [Parameter(Mandatory = $true)]
+    [string]$LAB,
 
-    # Duree reelle du test : HH:MM:SS
-    # Peut depasser 24h, par exemple 86:18:13
-    [string]$ActualDuration = "86:18:13",
+    [Parameter(Mandatory = $true)]
+    [string]$URL,
 
-    # Duree theorique prevue du test
-    [double]$PlannedHours = 120,
+    [Parameter(Mandatory = $true)]
+    [string]$EMAIL,
 
-    # Duree moyenne d'une iteration complete
-    [double]$IterationSeconds = 44
+    [switch]$AfterJob
 )
 
+$ErrorActionPreference = 'Stop'
 
-# ============================================================
-# CONFIGURATION
-# ============================================================
-
-# Keyword Robot Framework correspondant a une tentative PTT
-$PttKeywordRegex = '(?i)^\s*Use\s+Ptt\s+Release\s*$'
-
-# Message indiquant que le PTT a reellement ete pris.
-# Accepte par exemple :
-#
-# PTT pressed
-# PTT pressed (long hold started)
-#
-$PttPressedRegex = '(?is)\bPTT\b.*?\bpressed\b'
+# Les codes de sortie des programmes sont controles explicitement.
+$PSNativeCommandUseErrorActionPreference = $false
 
 
-# ============================================================
-# FONCTIONS
-# ============================================================
+# ----------------------------------------------------------------------
+# Verification du statut du job lors de l'appel depuis after_script
+# ----------------------------------------------------------------------
 
-function Convert-ToDateTime {
+if ($AfterJob) {
+    $jobStatus = [string]$env:CI_JOB_STATUS
 
-    param (
-        [string]$Value
+    if ([string]::IsNullOrWhiteSpace($jobStatus)) {
+        Write-Error `
+            'CI_JOB_STATUS is missing. Use -AfterJob from the GitLab after_script section.' `
+            -ErrorAction Continue
+
+        exit 1
+    }
+
+    if ($jobStatus -ne 'failed') {
+        Write-Host "Job status is '$jobStatus': no Jira reset."
+        exit 0
+    }
+
+    Write-Host 'GitLab job failed: reset its Test Execution to TODO.'
+}
+
+
+# ----------------------------------------------------------------------
+# Configuration Jira
+# Reprendre les valeurs de ton script Jira qui fonctionne
+# ----------------------------------------------------------------------
+
+$JIRA_URL = 'xxxxx'
+$JIRA_USERNAME = 'xxxx'
+$JIRA_PASSWORD = 'xxxx'
+
+$curlPath = 'curl.exe'
+
+$proxy = $env:HTTPS_PROXY
+
+if ([string]::IsNullOrWhiteSpace($proxy)) {
+    $proxy = $env:HTTP_PROXY
+}
+
+# Si ton script utilise un proxy explicite, renseigner sa valeur ici :
+# $proxy = 'http://ton-proxy:port'
+
+$jiraPageSize = 100
+
+
+# ----------------------------------------------------------------------
+# Requete Jira avec curl
+# ----------------------------------------------------------------------
+
+function Invoke-JiraRequest {
+    param(
+        [ValidateSet('GET', 'PUT')]
+        [string]$Method,
+
+        [string]$RequestUrl
     )
 
-    if ([string]::IsNullOrWhiteSpace($Value)) {
-        return $null
+    $responseFile = Join-Path `
+        $script:jiraTempDirectory `
+        'response.json'
+
+    Remove-Item `
+        -LiteralPath $responseFile `
+        -Force `
+        -ErrorAction SilentlyContinue
+
+    # Authentification, redirections, cookies et proxy.
+    $curlArgs = @(
+        '-k', '-sS', '-L',
+        '-c', $script:jiraCookieFile,
+        '-b', $script:jiraCookieFile,
+        '-o', $responseFile,
+        '-w', 'HTTP_CODE=%{http_code}',
+        '-u', "${JIRA_USERNAME}:${JIRA_PASSWORD}",
+        '-H', 'Accept: application/json',
+        '-H', 'Content-Type: application/json',
+        '-X', $Method,
+        '--connect-timeout', '30',
+        '--max-time', '120'
+    )
+
+    if (-not [string]::IsNullOrWhiteSpace($proxy)) {
+        $curlArgs += @('--proxy', $proxy)
     }
 
-    try {
+    $curlArgs += $RequestUrl
 
-        return [datetime]::Parse(
-            $Value,
-            [System.Globalization.CultureInfo]::InvariantCulture,
-            [System.Globalization.DateTimeStyles]::RoundtripKind
+    $httpInfo = (& $curlPath @curlArgs) -join ''
+    $curlExitCode = $LASTEXITCODE
+
+    if ($curlExitCode -ne 0) {
+        throw "curl failed: exit $curlExitCode; $Method $RequestUrl"
+    }
+
+    # Verifier egalement le statut HTTP.
+    if ($httpInfo -notmatch 'HTTP_CODE=(\d{3})\s*$') {
+        throw "Missing HTTP status: $Method $RequestUrl"
+    }
+
+    $httpStatus = [int]$Matches[1]
+
+    if ($httpStatus -lt 200 -or $httpStatus -ge 300) {
+        throw "Jira HTTP $httpStatus : $Method $RequestUrl"
+    }
+
+    if (-not (Test-Path -LiteralPath $responseFile)) {
+        throw 'curl response file missing.'
+    }
+
+    # Lecture UTF-8 et retrait du BOM.
+    $bytes = [System.IO.File]::ReadAllBytes($responseFile)
+
+    if (
+        $bytes.Length -ge 3 -and
+        $bytes[0] -eq 0xEF -and
+        $bytes[1] -eq 0xBB -and
+        $bytes[2] -eq 0xBF
+    ) {
+        return [System.Text.Encoding]::UTF8.GetString(
+            $bytes,
+            3,
+            $bytes.Length - 3
         )
     }
-    catch {
 
+    return [System.Text.Encoding]::UTF8.GetString($bytes)
+}
+
+
+# ----------------------------------------------------------------------
+# Recuperation de tous les tests de la Test Execution
+# ----------------------------------------------------------------------
+
+function Get-JiraTests {
+    $testKeys = New-Object 'System.Collections.Generic.List[string]'
+    $seenKeys = @{}
+
+    $executionKey = [uri]::EscapeDataString($ISSUE_KEY)
+    $page = 1
+
+    while ($true) {
+        $testsApiUrl = "$script:jiraRoot/rest/raven/1.0/api/testexec/$executionKey/test?page=$page&limit=$jiraPageSize"
+
+        $rawResponse = (
+            Invoke-JiraRequest `
+                -Method GET `
+                -RequestUrl $testsApiUrl
+        ).Trim()
+
+        if ([string]::IsNullOrWhiteSpace($rawResponse)) {
+            throw "Empty Jira response, page $page."
+        }
+
+        $decoded = ConvertFrom-Json `
+            -InputObject $rawResponse `
+            -ErrorAction Stop
+
+        # Tableau direct ou objet contenant une propriete tests.
+        if ($rawResponse.StartsWith('[')) {
+            $tests = @(
+                $decoded |
+                    Where-Object { $null -ne $_ }
+            )
+        }
+        elseif (
+            $null -ne $decoded -and
+            $decoded.PSObject.Properties['tests']
+        ) {
+            $tests = @(
+                $decoded.tests |
+                    Where-Object { $null -ne $_ }
+            )
+        }
+        else {
+            throw "Unexpected Jira response format, page $page."
+        }
+
+        if ($tests.Count -eq 0) {
+            break
+        }
+
+        $newKeys = 0
+
+        foreach ($test in $tests) {
+            $testKey = [string]$test.key
+
+            if ([string]::IsNullOrWhiteSpace($testKey)) {
+                throw "Test without a key, page $page. No updates performed."
+            }
+
+            if (-not $seenKeys.ContainsKey($testKey)) {
+                $seenKeys[$testKey] = $true
+                $testKeys.Add($testKey)
+                $newKeys++
+            }
+        }
+
+        Write-Host "Jira page $page : $($tests.Count) tests; $($testKeys.Count) unique keys."
+
+        if ($newKeys -eq 0) {
+            throw 'Jira returned a repeated page. Check pagination; no updates performed.'
+        }
+
+        # Continuer jusqu'a une page vide.
+        $page++
+    }
+
+    return $testKeys.ToArray()
+}
+
+
+# ----------------------------------------------------------------------
+# Passage a TODO des Test Runs de cette Test Execution
+# ----------------------------------------------------------------------
+
+function Set-JiraTestsTodo {
+    $testKeys = @(Get-JiraTests)
+
+    if ($testKeys.Count -eq 0) {
+        throw "No tests found for Test Execution $ISSUE_KEY."
+    }
+
+    Write-Host "Test Execution $ISSUE_KEY : $($testKeys.Count) tests found."
+
+    # Identifier les Test Runs avant de modifier leurs statuts.
+    $runs = New-Object 'System.Collections.Generic.List[object]'
+
+    $executionKey = [uri]::EscapeDataString($ISSUE_KEY)
+
+    foreach ($testKey in $testKeys) {
+        $encodedTestKey = [uri]::EscapeDataString($testKey)
+
+        $runUrl = "$script:jiraRoot/rest/raven/1.0/api/testrun?testExecIssueKey=$executionKey&testIssueKey=$encodedTestKey"
+
+        $rawRun = Invoke-JiraRequest `
+            -Method GET `
+            -RequestUrl $runUrl
+
+        $run = ConvertFrom-Json `
+            -InputObject $rawRun `
+            -ErrorAction Stop
+
+        # Verifier que le Test Run appartient au bon test
+        # et a la bonne Test Execution.
+        if (
+            $null -eq $run -or
+            [string]$run.id -notmatch '^[1-9][0-9]*$' -or
+            $run.testKey -ne $testKey -or
+            $run.testExecKey -ne $ISSUE_KEY
+        ) {
+            throw "Invalid Test Run for $ISSUE_KEY / $testKey. No updates performed."
+        }
+
+        $runs.Add($run)
+    }
+
+    $updated = 0
+    $alreadyTodo = 0
+
+    $failedKeys = New-Object 'System.Collections.Generic.List[string]'
+
+    foreach ($run in $runs) {
         try {
-            return [datetime]::Parse($Value)
+            if ([string]$run.status -eq 'TODO') {
+                $alreadyTodo++
+
+                Write-Host "$($run.testKey) : already TODO."
+
+                continue
+            }
+
+            $statusUrl = "$script:jiraRoot/rest/raven/1.0/api/testrun/$($run.id)/status"
+
+            $null = Invoke-JiraRequest `
+                -Method PUT `
+                -RequestUrl "${statusUrl}?status=TODO"
+
+            # Relire le statut pour verifier la modification.
+            $actualStatus = (
+                Invoke-JiraRequest `
+                    -Method GET `
+                    -RequestUrl $statusUrl
+            ).Trim().Trim('"')
+
+            if ($actualStatus -ne 'TODO') {
+                throw "Status after update is '$actualStatus', expected TODO."
+            }
+
+            $updated++
+
+            Write-Host "$($run.testKey) : $($run.status) -> TODO (run $($run.id))."
         }
         catch {
-            return $null
+            $failedKeys.Add([string]$run.testKey)
+
+            Write-Warning "$($run.testKey) : $($_.Exception.Message)"
         }
     }
+
+    Write-Host "Summary $ISSUE_KEY : total=$($runs.Count); updated=$updated; already TODO=$alreadyTodo; errors=$($failedKeys.Count)."
+
+    if ($failedKeys.Count -gt 0) {
+        throw "TODO reset incomplete. Failed tests: $($failedKeys -join ', ')"
+    }
 }
 
 
-function Get-Driver {
+# ----------------------------------------------------------------------
+# Traitement Jira apres l'echec du job
+# ----------------------------------------------------------------------
 
-    param (
-        [string]$Owner
-    )
+if ($AfterJob) {
+    $script:jiraTempDirectory = $null
+    $resetExitCode = 0
 
-    if ($Owner -match '(?i)^driver\s*([1-6])$') {
-        return "driver$($Matches[1])"
+    try {
+        if (
+            $JIRA_URL -notmatch '^https?://' -or
+            [string]::IsNullOrWhiteSpace($JIRA_USERNAME) -or
+            $JIRA_USERNAME -eq 'xxxx' -or
+            [string]::IsNullOrWhiteSpace($JIRA_PASSWORD) -or
+            $JIRA_PASSWORD -eq 'xxxx'
+        ) {
+            throw 'Configure JIRA_URL, JIRA_USERNAME and JIRA_PASSWORD in this script.'
+        }
+
+        $curlPath = (
+            Get-Command `
+                $curlPath `
+                -CommandType Application `
+                -ErrorAction Stop
+        ).Source
+
+        $script:jiraRoot = $JIRA_URL.TrimEnd('/')
+
+        $script:jiraTempDirectory = Join-Path `
+            ([System.IO.Path]::GetTempPath()) `
+            ("jira_todo_" + [guid]::NewGuid().ToString('N'))
+
+        $null = New-Item `
+            -ItemType Directory `
+            -Path $script:jiraTempDirectory
+
+        $script:jiraCookieFile = Join-Path `
+            $script:jiraTempDirectory `
+            'jira_session_cookies.txt'
+
+        Write-Host "Reset Jira tests to TODO: execution=$ISSUE_KEY; pipeline=$URL"
+
+        Set-JiraTestsTodo
+    }
+    catch {
+        Write-Error `
+            "Jira TODO reset failed: $($_.Exception.Message)" `
+            -ErrorAction Continue
+
+        $resetExitCode = 1
+    }
+    finally {
+        if ($script:jiraTempDirectory) {
+            Remove-Item `
+                -LiteralPath $script:jiraTempDirectory `
+                -Recurse `
+                -Force `
+                -ErrorAction SilentlyContinue
+        }
     }
 
-    return $null
+    exit $resetExitCode
 }
 
 
-function Format-Duration {
+# ----------------------------------------------------------------------
+# Controle des acteurs
+# ----------------------------------------------------------------------
 
-    param (
-        [double]$Seconds
-    )
-
-    if ($Seconds -lt 0) {
-        $Seconds = 0
-    }
-
-    $span = [TimeSpan]::FromSeconds($Seconds)
-
-    $hours = [math]::Floor(
-        $span.TotalHours
-    )
-
-    return "{0}h {1}min {2}s" -f `
-        $hours,
-        $span.Minutes,
-        $span.Seconds
-}
-
-
-# ============================================================
-# VERIFICATION DU FICHIER
-# ============================================================
-
-if (-not (Test-Path $OutputXml)) {
-
-    Write-Host ""
-    Write-Host "Fichier introuvable : $OutputXml"
-    exit 1
-}
-
-$OutputXml = (Resolve-Path $OutputXml).Path
-
-
-# ============================================================
-# CONVERSION DE LA DUREE REELLE
-# ============================================================
-
-if ($ActualDuration -match '^(\d+):(\d{1,2}):(\d{1,2})$') {
-
-    $actualHours = [int]$Matches[1]
-    $actualMinutes = [int]$Matches[2]
-    $actualSecondsPart = [int]$Matches[3]
-
-    $actualSeconds = `
-        ($actualHours * 3600) +
-        ($actualMinutes * 60) +
-        $actualSecondsPart
-}
-else {
-
-    Write-Host ""
-    Write-Host "Format ActualDuration incorrect."
-    Write-Host "Format attendu : HH:MM:SS"
-    Write-Host "Exemple : 86:18:13"
-    exit 1
-}
-
-
-$plannedSeconds = $PlannedHours * 3600
-
-
-# ============================================================
-# INITIALISATION
-# ============================================================
-
-$attempts = @{}
-
-$pttTotals = @{}
-
-$failTotals = @{}
-
-$daily = @{}
-
-foreach ($i in 1..6) {
-
-    $driver = "driver$i"
-
-    $attempts[$driver] = New-Object System.Collections.ArrayList
-
-    $pttTotals[$driver] = 0
-
-    $failTotals[$driver] = 0
-}
-
-
-# Keyword PTT actuellement analyse
-$activePtt = $null
-
-# Etat de lecture d'un message <msg>
-$inMsg = $false
-
-$msgText = New-Object System.Text.StringBuilder
-
-$msgTime = $null
-
-
-# Premier et dernier timestamp observes
-$firstKnownTime = $null
-$lastKnownTime = $null
-
-
-# ============================================================
-# LECTURE DU OUTPUT.XML EN STREAMING
-# ============================================================
-
-Write-Host ""
-Write-Host "=========================================="
-Write-Host "        ANALYSE ROBOT FRAMEWORK"
-Write-Host "=========================================="
-Write-Host ""
-Write-Host "Fichier : $OutputXml"
-Write-Host ""
-
-
-$settings = New-Object System.Xml.XmlReaderSettings
-
-$settings.IgnoreWhitespace = $false
-
-$settings.DtdProcessing = [System.Xml.DtdProcessing]::Ignore
-
-
-$reader = $null
-
+Write-Output '===== CHECK ACTORS LAUNCH ====='
+Write-Output "LAB       : $LAB"
+Write-Output "ISSUE_KEY : $ISSUE_KEY"
+Write-Output "PIPELINE  : $URL"
+Write-Output "EMAIL     : $EMAIL"
 
 try {
+    # Repertoire du script.
+    $scriptDirectory = Split-Path -Parent $MyInvocation.MyCommand.Path
 
-    $reader = [System.Xml.XmlReader]::Create(
-        $OutputXml,
-        $settings
-    )
+    Write-Output "Script directory: $scriptDirectory"
 
+    # Chargement de lab_config.json.
+    $configFilePath = Join-Path `
+        -Path $scriptDirectory `
+        -ChildPath 'lab_config.json'
 
-    while ($reader.Read()) {
+    if (-not (Test-Path -LiteralPath $configFilePath)) {
+        throw "Configuration file not found: $configFilePath"
+    }
 
+    $config = Get-Content `
+        -LiteralPath $configFilePath `
+        -Raw |
+        ConvertFrom-Json
 
-        # ====================================================
-        # ELEMENT OUVRANT
-        # ====================================================
+    if (-not ($config.PSObject.Properties.Name -contains $LAB)) {
+        throw "Configuration for lab '$LAB' not found in lab_config.json"
+    }
 
-        if (
-            $reader.NodeType -eq
-            [System.Xml.XmlNodeType]::Element
-        ) {
+    $labConfig = $config.$LAB
 
+    $robotCampaignDirectory = $labConfig.robotCampaignDirectory
+    $checkActorFile = $labConfig.checkActorFile
+    $robotPath = $labConfig.robotPath
+    $listenerPath = $labConfig.listenerPath
+    $pythonPath = $labConfig.pythonPath
 
-            # ------------------------------------------------
-            # KEYWORD
-            # ------------------------------------------------
+    Write-Output "Robot path               : $robotPath"
+    Write-Output "Robot campaign directory : $robotCampaignDirectory"
+    Write-Output "Check actor file         : $checkActorFile"
 
-            if ($reader.Name -eq "kw") {
+    if (-not (Test-Path -LiteralPath $robotCampaignDirectory)) {
+        throw "Robot campaign directory not found: $robotCampaignDirectory"
+    }
 
-                $name = $reader.GetAttribute("name")
+    $workspace = Get-Location
 
-                $owner = $reader.GetAttribute("owner")
+    # Dossier des resultats Robot.
+    $RESULTS_DIR = Join-Path $workspace 'results'
 
-                $driver = Get-Driver -Owner $owner
+    if (-not (Test-Path -LiteralPath $RESULTS_DIR)) {
+        $null = New-Item `
+            -ItemType Directory `
+            -Path $RESULTS_DIR
+    }
 
+    Write-Output "Robot results directory: $RESULTS_DIR"
+    Write-Output "gitlab workspace: $workspace"
 
-                # Detection du keyword :
-                #
-                # <kw name="Use Ptt Release" owner="driverX">
-                #
-                if (
-                    $null -eq $activePtt -and
-                    $null -ne $driver -and
-                    $name -match $PttKeywordRegex
-                ) {
+    Push-Location $robotCampaignDirectory
 
-                    $activePtt = [PSCustomObject]@{
+    try {
+        $outputFile = Join-Path $RESULTS_DIR 'check_actors.xml'
+        $logFile = Join-Path $RESULTS_DIR 'log_actors.html'
+        $reportFile = Join-Path $RESULTS_DIR 'report_actors.html'
 
-                        Driver = $driver
+        $robotExitCode = 1
 
-                        Depth = $reader.Depth
+        while ($robotExitCode -ne 0) {
+            Write-Output 'Launching Robot Framework...'
 
-                        Start = $null
+            & $robotPath `
+                -L debug `
+                --outputdir $RESULTS_DIR `
+                --output check_actors.xml `
+                --log log_actors.html `
+                --report report_actors.html `
+                $checkActorFile
 
-                        Status = "UNKNOWN"
+            $robotExitCode = $LASTEXITCODE
 
-                        Pressed = $false
+            Write-Output "Robot exit code: $robotExitCode"
 
-                        PressedTime = $null
-                    }
-                }
-            }
+            if ($robotExitCode -ne 0) {
+                Write-Output 'Robot failed. Retrying in 5 seconds...'
 
-
-            # ------------------------------------------------
-            # MESSAGE
-            # ------------------------------------------------
-
-            elseif (
-                $reader.Name -eq "msg" -and
-                $null -ne $activePtt
-            ) {
-
-                $inMsg = $true
-
-                $msgText.Clear() |
-                    Out-Null
-
-                $msgTime = Convert-ToDateTime `
-                    -Value $reader.GetAttribute("time")
-            }
-
-
-            # ------------------------------------------------
-            # STATUS DIRECT DU KEYWORD Use Ptt Release
-            #
-            # On ne prend pas le status des sous-keywords.
-            # ------------------------------------------------
-
-            elseif (
-                $reader.Name -eq "status" -and
-                $null -ne $activePtt -and
-                $reader.Depth -eq ($activePtt.Depth + 1)
-            ) {
-
-                $status = $reader.GetAttribute("status")
-
-                $start = $reader.GetAttribute("start")
-
-
-                if (
-                    -not
-                    [string]::IsNullOrWhiteSpace($status)
-                ) {
-
-                    $activePtt.Status = $status.ToUpper()
-                }
-
-
-                $startDate = Convert-ToDateTime `
-                    -Value $start
-
-
-                if ($null -ne $startDate) {
-
-                    $activePtt.Start = $startDate
-                }
-            }
-        }
-
-
-        # ====================================================
-        # TEXTE DU MESSAGE
-        # ====================================================
-
-        elseif (
-            $inMsg -and
-            (
-                $reader.NodeType -eq
-                [System.Xml.XmlNodeType]::Text -or
-
-                $reader.NodeType -eq
-                [System.Xml.XmlNodeType]::CDATA -or
-
-                $reader.NodeType -eq
-                [System.Xml.XmlNodeType]::SignificantWhitespace
-            )
-        ) {
-
-            $msgText.Append(
-                $reader.Value
-            ) |
-                Out-Null
-        }
-
-
-        # ====================================================
-        # ELEMENT FERMANT
-        # ====================================================
-
-        elseif (
-            $reader.NodeType -eq
-            [System.Xml.XmlNodeType]::EndElement
-        ) {
-
-
-            # ------------------------------------------------
-            # FIN DU MESSAGE
-            # ------------------------------------------------
-
-            if (
-                $reader.Name -eq "msg" -and
-                $inMsg -and
-                $null -ne $activePtt
-            ) {
-
-                $text = $msgText.ToString()
-
-
-                # Message confirmant une prise de PTT
-                if ($text -match $PttPressedRegex) {
-
-                    # Une tentative ne compte qu'une fois
-                    if (-not $activePtt.Pressed) {
-
-                        $activePtt.Pressed = $true
-
-
-                        if ($null -ne $msgTime) {
-
-                            $activePtt.PressedTime = $msgTime
-                        }
-                    }
-                }
-
-
-                $inMsg = $false
-
-                $msgText.Clear() |
-                    Out-Null
-
-                $msgTime = $null
-            }
-
-
-            # ------------------------------------------------
-            # FIN DU KEYWORD Use Ptt Release
-            # ------------------------------------------------
-
-            elseif (
-                $reader.Name -eq "kw" -and
-                $null -ne $activePtt -and
-                $reader.Depth -eq $activePtt.Depth
-            ) {
-
-
-                # Si le status ne contient pas de date,
-                # on prend l'heure du message PTT.
-                if (
-                    $null -eq $activePtt.Start -and
-                    $null -ne $activePtt.PressedTime
-                ) {
-
-                    $activePtt.Start =
-                        $activePtt.PressedTime
-                }
-
-
-                # --------------------------------------------
-                # PREMIER / DERNIER TIMESTAMP
-                # --------------------------------------------
-
-                if ($null -ne $activePtt.Start) {
-
-                    if (
-                        $null -eq $firstKnownTime -or
-                        $activePtt.Start -lt $firstKnownTime
-                    ) {
-
-                        $firstKnownTime =
-                            $activePtt.Start
-                    }
-
-
-                    if (
-                        $null -eq $lastKnownTime -or
-                        $activePtt.Start -gt $lastKnownTime
-                    ) {
-
-                        $lastKnownTime =
-                            $activePtt.Start
-                    }
-                }
-
-
-                # --------------------------------------------
-                # SAUVEGARDE DE LA TENTATIVE
-                # --------------------------------------------
-
-                $attempt = [PSCustomObject]@{
-
-                    Driver =
-                        $activePtt.Driver
-
-                    Start =
-                        $activePtt.Start
-
-                    Status =
-                        $activePtt.Status
-
-                    Pressed =
-                        $activePtt.Pressed
-
-                    PressedTime =
-                        $activePtt.PressedTime
-                }
-
-
-                [void]$attempts[
-                    $activePtt.Driver
-                ].Add(
-                    $attempt
-                )
-
-
-                # --------------------------------------------
-                # PTT REELLEMENT PRIS
-                # --------------------------------------------
-
-                if ($activePtt.Pressed) {
-
-                    $pttTotals[
-                        $activePtt.Driver
-                    ]++
-
-
-                    $dateForCount =
-                        $activePtt.PressedTime
-
-
-                    if ($null -eq $dateForCount) {
-
-                        $dateForCount =
-                            $activePtt.Start
-                    }
-
-
-                    if ($null -ne $dateForCount) {
-
-                        $day =
-                            $dateForCount.ToString(
-                                "yyyy-MM-dd"
-                            )
-
-
-                        if (
-                            -not
-                            $daily.ContainsKey($day)
-                        ) {
-
-                            $daily[$day] = @{
-
-                                driver1 = 0
-
-                                driver2 = 0
-
-                                driver3 = 0
-
-                                driver4 = 0
-
-                                driver5 = 0
-
-                                driver6 = 0
-                            }
-                        }
-
-
-                        $daily[$day][
-                            $activePtt.Driver
-                        ]++
-                    }
-                }
-
-
-                # --------------------------------------------
-                # FAIL DU KEYWORD
-                # --------------------------------------------
-
-                if (
-                    $activePtt.Status -eq "FAIL"
-                ) {
-
-                    $failTotals[
-                        $activePtt.Driver
-                    ]++
-                }
-
-
-                $activePtt = $null
+                Start-Sleep -Seconds 5
             }
         }
     }
+    finally {
+        Pop-Location
+    }
+
+    Write-Output 'Robot tests PASSED'
+
+    exit 0
 }
 catch {
-
-    Write-Host ""
-    Write-Host "Erreur pendant la lecture du XML :"
-    Write-Host $_.Exception.Message
+    Write-Error `
+        "Check actors failed: $($_.Exception.Message)" `
+        -ErrorAction Continue
 
     exit 1
 }
-finally {
-
-    if ($null -ne $reader) {
-
-        $reader.Close()
-    }
-}
-
-
-# ============================================================
-# TOTAL PTT
-# ============================================================
-
-Write-Host ""
-Write-Host "=========================================="
-Write-Host "          NOMBRE TOTAL DE PTT"
-Write-Host "=========================================="
-Write-Host ""
-
-
-$totalPtt = 0
-
-$totalRows = @()
-
-
-foreach ($i in 1..6) {
-
-    $driver = "driver$i"
-
-    $count = $pttTotals[$driver]
-
-    $totalPtt += $count
-
-
-    $totalRows += [PSCustomObject]@{
-
-        Driver = $driver
-
-        PTT = $count
-    }
-}
-
-
-$totalRows |
-    Format-Table -AutoSize
-
-
-Write-Host "------------------------------------------"
-Write-Host "TOTAL PTT : $totalPtt"
-Write-Host ""
-
-
-# ============================================================
-# PTT PAR JOUR
-# ============================================================
-
-Write-Host ""
-Write-Host "=========================================="
-Write-Host "             PTT PAR JOUR"
-Write-Host "=========================================="
-Write-Host ""
-
-
-$dailyRows = @()
-
-
-foreach (
-    $day in
-    ($daily.Keys | Sort-Object)
-) {
-
-    $dayTotal = 0
-
-
-    foreach ($i in 1..6) {
-
-        $driver = "driver$i"
-
-        $dayTotal +=
-            $daily[$day][$driver]
-    }
-
-
-    $dailyRows += [PSCustomObject]@{
-
-        Date = $day
-
-        driver1 =
-            $daily[$day]["driver1"]
-
-        driver2 =
-            $daily[$day]["driver2"]
-
-        driver3 =
-            $daily[$day]["driver3"]
-
-        driver4 =
-            $daily[$day]["driver4"]
-
-        driver5 =
-            $daily[$day]["driver5"]
-
-        driver6 =
-            $daily[$day]["driver6"]
-
-        TOTAL =
-            $dayTotal
-    }
-}
-
-
-if ($dailyRows.Count -gt 0) {
-
-    $dailyRows |
-        Format-Table -AutoSize
-}
-else {
-
-    Write-Host "Aucun PTT confirme trouve."
-}
-
-
-# ============================================================
-# CONSTRUCTION DES PLAGES DE FAIL
-#
-# Une plage commence au premier FAIL consecutif.
-#
-# Elle se termine lorsque le meme driver obtient
-# a nouveau un PASS.
-# ============================================================
-
-$failRanges =
-    New-Object System.Collections.ArrayList
-
-
-foreach ($i in 1..6) {
-
-    $driver = "driver$i"
-
-
-    $driverAttempts =
-        $attempts[$driver] |
-        Where-Object {
-            $null -ne $_.Start
-        } |
-        Sort-Object Start
-
-
-    $currentRange = $null
-
-
-    foreach (
-        $attempt in
-        $driverAttempts
-    ) {
-
-
-        # ----------------------------------------------------
-        # FAIL
-        # ----------------------------------------------------
-
-        if (
-            $attempt.Status -eq "FAIL"
-        ) {
-
-            if (
-                $null -eq $currentRange
-            ) {
-
-                $currentRange =
-                    [PSCustomObject]@{
-
-                        Driver =
-                            $driver
-
-                        Start =
-                            $attempt.Start
-
-                        LastFail =
-                            $attempt.Start
-
-                        FailCount =
-                            1
-
-                        Recovery =
-                            $null
-                    }
-            }
-            else {
-
-                $currentRange.LastFail =
-                    $attempt.Start
-
-                $currentRange.FailCount++
-            }
-        }
-
-
-        # ----------------------------------------------------
-        # RETOUR AU PASS
-        # ----------------------------------------------------
-
-        elseif (
-            $attempt.Status -eq "PASS" -and
-            $null -ne $currentRange
-        ) {
-
-            $currentRange.Recovery =
-                $attempt.Start
-
-
-            [void]$failRanges.Add(
-                $currentRange
-            )
-
-
-            $currentRange = $null
-        }
-    }
-
-
-    # --------------------------------------------------------
-    # PLAGE TOUJOURS OUVERTE A LA FIN DU XML
-    # --------------------------------------------------------
-
-    if (
-        $null -ne $currentRange
-    ) {
-
-        [void]$failRanges.Add(
-            $currentRange
-        )
-    }
-}
-
-
-# ============================================================
-# FAIL PAR TELEPHONE
-# ============================================================
-
-Write-Host ""
-Write-Host "=========================================="
-Write-Host "           FAIL PAR TELEPHONE"
-Write-Host "=========================================="
-Write-Host ""
-
-
-$failSummary = @()
-
-
-foreach ($i in 1..6) {
-
-    $driver = "driver$i"
-
-
-    $driverRanges = @(
-        $failRanges |
-        Where-Object {
-            $_.Driver -eq $driver
-        }
-    )
-
-
-    $failSummary += [PSCustomObject]@{
-
-        Driver =
-            $driver
-
-        NombreFails =
-            $failTotals[$driver]
-
-        NombrePlages =
-            $driverRanges.Count
-    }
-}
-
-
-$failSummary |
-    Format-Table -AutoSize
-
-
-# ============================================================
-# DETAIL DES PLAGES DE FAIL
-# ============================================================
-
-Write-Host ""
-Write-Host "=========================================="
-Write-Host "            PLAGES DE FAIL"
-Write-Host "=========================================="
-Write-Host ""
-
-
-$rangeRows = @()
-
-
-foreach ($range in $failRanges) {
-
-
-    if ($null -ne $range.Recovery) {
-
-        $rangeEnd =
-            $range.Recovery
-
-        $recoveryText =
-            $range.Recovery.ToString(
-                "yyyy-MM-dd HH:mm:ss"
-            )
-    }
-    elseif (
-        $null -ne $lastKnownTime
-    ) {
-
-        $rangeEnd =
-            $lastKnownTime
-
-        $recoveryText =
-            "PAS DE REPRISE AVANT FIN XML"
-    }
-    else {
-
-        $rangeEnd =
-            $range.LastFail
-
-        $recoveryText =
-            "INCONNU"
-    }
-
-
-    $durationSeconds = 0
-
-
-    if (
-        $rangeEnd -gt
-        $range.Start
-    ) {
-
-        $durationSeconds =
-            (
-                $rangeEnd -
-                $range.Start
-            ).TotalSeconds
-    }
-
-
-    $rangeRows += [PSCustomObject]@{
-
-        Driver =
-            $range.Driver
-
-        DebutFail =
-            $range.Start.ToString(
-                "yyyy-MM-dd HH:mm:ss"
-            )
-
-        DernierFail =
-            $range.LastFail.ToString(
-                "yyyy-MM-dd HH:mm:ss"
-            )
-
-        Reprise =
-            $recoveryText
-
-        NombreFails =
-            $range.FailCount
-
-        Duree =
-            Format-Duration `
-                -Seconds $durationSeconds
-    }
-}
-
-
-if ($rangeRows.Count -gt 0) {
-
-    $rangeRows |
-        Format-Table -AutoSize
-}
-else {
-
-    Write-Host "Aucune plage de FAIL trouvee."
-}
-
-
-# ============================================================
-# TEMPS EN FAIL / DISPONIBILITE ESTIMEE
-# ============================================================
-
-Write-Host ""
-Write-Host "=========================================="
-Write-Host "      TEMPS EN FAIL PAR TELEPHONE"
-Write-Host "=========================================="
-Write-Host ""
-
-
-$availabilityRows = @()
-
-
-foreach ($i in 1..6) {
-
-    $driver = "driver$i"
-
-
-    $driverRanges = @(
-        $failRanges |
-        Where-Object {
-            $_.Driver -eq $driver
-        }
-    )
-
-
-    $totalFailSeconds = 0
-
-    $longestFailSeconds = 0
-
-
-    foreach ($range in $driverRanges) {
-
-
-        if (
-            $null -ne
-            $range.Recovery
-        ) {
-
-            $rangeEnd =
-                $range.Recovery
-        }
-        elseif (
-            $null -ne
-            $lastKnownTime
-        ) {
-
-            $rangeEnd =
-                $lastKnownTime
-        }
-        else {
-
-            continue
-        }
-
-
-        if (
-            $rangeEnd -gt
-            $range.Start
-        ) {
-
-            $seconds =
-                (
-                    $rangeEnd -
-                    $range.Start
-                ).TotalSeconds
-
-
-            $totalFailSeconds +=
-                $seconds
-
-
-            if (
-                $seconds -gt
-                $longestFailSeconds
-            ) {
-
-                $longestFailSeconds =
-                    $seconds
-            }
-        }
-    }
-
-
-    if (
-        $actualSeconds -gt 0
-    ) {
-
-        $failPercent =
-            (
-                $totalFailSeconds /
-                $actualSeconds
-            ) * 100
-    }
-    else {
-
-        $failPercent = 0
-    }
-
-
-    if ($failPercent -gt 100) {
-        $failPercent = 100
-    }
-
-
-    $availabilityPercent =
-        100 - $failPercent
-
-
-    $availabilityRows +=
-        [PSCustomObject]@{
-
-            Driver =
-                $driver
-
-            Nb_Plages_FAIL =
-                $driverRanges.Count
-
-            Temps_en_FAIL =
-                Format-Duration `
-                    -Seconds $totalFailSeconds
-
-            Plus_Long_FAIL =
-                Format-Duration `
-                    -Seconds $longestFailSeconds
-
-            Indispo_Estimee =
-                "{0:N2} %" -f $failPercent
-
-            Dispo_Estimee =
-                "{0:N2} %" -f $availabilityPercent
-        }
-}
-
-
-$availabilityRows |
-    Format-Table -AutoSize
-
-
-# ============================================================
-# KPI ENDURANCE GLOBAL
-# ============================================================
-
-$expectedIterationsAtStop =
-    [math]::Floor(
-        $actualSeconds /
-        $IterationSeconds
-    )
-
-
-$targetIterations =
-    [math]::Floor(
-        $plannedSeconds /
-        $IterationSeconds
-    )
-
-
-# 6 telephones :
-# 1 PTT par telephone et par iteration
-$expectedPttAtStop =
-    $expectedIterationsAtStop * 6
-
-
-$targetPtt =
-    $targetIterations * 6
-
-
-# ------------------------------------------------------------
-# Progression temps
-# ------------------------------------------------------------
-
-if (
-    $plannedSeconds -gt 0
-) {
-
-    $timeProgress =
-        (
-            $actualSeconds /
-            $plannedSeconds
-        ) * 100
-}
-else {
-
-    $timeProgress = 0
-}
-
-
-# ------------------------------------------------------------
-# PTT reels / PTT attendus au moment de l'arret
-# ------------------------------------------------------------
-
-if (
-    $expectedPttAtStop -gt 0
-) {
-
-    $pttEfficiency =
-        (
-            $totalPtt /
-            $expectedPttAtStop
-        ) * 100
-}
-else {
-
-    $pttEfficiency = 0
-}
-
-
-# ------------------------------------------------------------
-# Progression vers objectif final
-# ------------------------------------------------------------
-
-if (
-    $targetPtt -gt 0
-) {
-
-    $finalProgress =
-        (
-            $totalPtt /
-            $targetPtt
-        ) * 100
-}
-else {
-
-    $finalProgress = 0
-}
-
-
-# ------------------------------------------------------------
-# Debit reel
-# ------------------------------------------------------------
-
-$actualHoursDecimal =
-    $actualSeconds / 3600
-
-
-if (
-    $actualHoursDecimal -gt 0
-) {
-
-    $actualPttPerHour =
-        $totalPtt /
-        $actualHoursDecimal
-}
-else {
-
-    $actualPttPerHour = 0
-}
-
-
-# ------------------------------------------------------------
-# Debit theorique
-# ------------------------------------------------------------
-
-$theoreticalPttPerHour =
-    (
-        3600 /
-        $IterationSeconds
-    ) * 6
-
-
-# ------------------------------------------------------------
-# Projection 120h avec debit reel
-# ------------------------------------------------------------
-
-$projectedPtt120h =
-    [math]::Round(
-        $actualPttPerHour *
-        $PlannedHours
-    )
-
-
-# ------------------------------------------------------------
-# PTT manquants
-# ------------------------------------------------------------
-
-$missingDuringRun =
-    $expectedPttAtStop -
-    $totalPtt
-
-
-if (
-    $missingDuringRun -lt 0
-) {
-
-    $missingDuringRun = 0
-}
-
-
-$missingDueToEarlyStop =
-    $targetPtt -
-    $expectedPttAtStop
-
-
-if (
-    $missingDueToEarlyStop -lt 0
-) {
-
-    $missingDueToEarlyStop = 0
-}
-
-
-$missingToFinalTarget =
-    $targetPtt -
-    $totalPtt
-
-
-if (
-    $missingToFinalTarget -lt 0
-) {
-
-    $missingToFinalTarget = 0
-}
-
-
-# ------------------------------------------------------------
-# Temps non execute
-# ------------------------------------------------------------
-
-$remainingSeconds =
-    $plannedSeconds -
-    $actualSeconds
-
-
-if (
-    $remainingSeconds -lt 0
-) {
-
-    $remainingSeconds = 0
-}
-
-
-# ============================================================
-# AFFICHAGE KPI GLOBAL
-# ============================================================
-
-Write-Host ""
-Write-Host "=========================================="
-Write-Host "             KPI ENDURANCE"
-Write-Host "=========================================="
-Write-Host ""
-
-Write-Host "Duree prevue                  : $PlannedHours h"
-
-Write-Host "Duree executee                : $ActualDuration"
-
-Write-Host (
-    "Temps non execute              : {0}" -f
-    (
-        Format-Duration `
-            -Seconds $remainingSeconds
-    )
-)
-
-Write-Host ""
-
-Write-Host (
-    "Progression temporelle         : {0:N2} %" -f
-    $timeProgress
-)
-
-Write-Host ""
-
-Write-Host "Duree moyenne iteration       : $IterationSeconds s"
-
-Write-Host "Iterations attendues a l'arret: $expectedIterationsAtStop"
-
-Write-Host "Iterations prevues a 120h     : $targetIterations"
-
-Write-Host ""
-
-Write-Host "PTT reels confirmes           : $totalPtt"
-
-Write-Host "PTT attendus a l'arret        : $expectedPttAtStop"
-
-Write-Host "PTT objectif a 120h           : $targetPtt"
-
-Write-Host ""
-
-Write-Host (
-    "PTT reels / attendus a l'arret: {0:N2} %" -f
-    $pttEfficiency
-)
-
-Write-Host (
-    "Progression objectif final    : {0:N2} %" -f
-    $finalProgress
-)
-
-Write-Host ""
-
-Write-Host (
-    "Debit theorique               : {0:N2} PTT/h" -f
-    $theoreticalPttPerHour
-)
-
-Write-Host (
-    "Debit reel                    : {0:N2} PTT/h" -f
-    $actualPttPerHour
-)
-
-Write-Host ""
-
-Write-Host "PTT manquants pendant le run  : $missingDuringRun"
-
-Write-Host "PTT non realises arret anticipe: $missingDueToEarlyStop"
-
-Write-Host "PTT manquants objectif 120h   : $missingToFinalTarget"
-
-Write-Host ""
-
-Write-Host "Projection PTT a 120h au debit reel : $projectedPtt120h"
-
-
-# ============================================================
-# DUREE OBSERVEE DANS LE XML
-# ============================================================
-
-if (
-    $null -ne $firstKnownTime -and
-    $null -ne $lastKnownTime
-) {
-
-    $xmlDurationSeconds =
-        (
-            $lastKnownTime -
-            $firstKnownTime
-        ).TotalSeconds
-
-
-    Write-Host ""
-
-    Write-Host (
-        "Premier PTT analyse           : {0}" -f
-        $firstKnownTime.ToString(
-            "yyyy-MM-dd HH:mm:ss"
-        )
-    )
-
-    Write-Host (
-        "Dernier PTT analyse           : {0}" -f
-        $lastKnownTime.ToString(
-            "yyyy-MM-dd HH:mm:ss"
-        )
-    )
-
-    Write-Host (
-        "Duree observee dans le XML    : {0}" -f
-        (
-            Format-Duration `
-                -Seconds $xmlDurationSeconds
-        )
-    )
-}
-
-
-# ============================================================
-# KPI COMPLET PAR TELEPHONE
-# ============================================================
-
-Write-Host ""
-Write-Host "=========================================="
-Write-Host "        KPI COMPLET PAR TELEPHONE"
-Write-Host "=========================================="
-Write-Host ""
-
-
-$phoneKpi = @()
-
-
-foreach ($i in 1..6) {
-
-    $driver = "driver$i"
-
-
-    $ptt =
-        $pttTotals[$driver]
-
-
-    $attemptCount =
-        @(
-            $attempts[$driver]
-        ).Count
-
-
-    $failCount =
-        $failTotals[$driver]
-
-
-    # --------------------------------------------------------
-    # Taux de PTT confirme par rapport aux tentatives
-    # --------------------------------------------------------
-
-    if (
-        $attemptCount -gt 0
-    ) {
-
-        $pressRate =
-            (
-                $ptt /
-                $attemptCount
-            ) * 100
-    }
-    else {
-
-        $pressRate = 0
-    }
-
-
-    # --------------------------------------------------------
-    # Plages de FAIL
-    # --------------------------------------------------------
-
-    $driverRanges = @(
-        $failRanges |
-        Where-Object {
-            $_.Driver -eq $driver
-        }
-    )
-
-
-    $totalFailSeconds = 0
-
-    $longestFailSeconds = 0
-
-
-    foreach (
-        $range in
-        $driverRanges
-    ) {
-
-
-        if (
-            $null -ne
-            $range.Recovery
-        ) {
-
-            $rangeEnd =
-                $range.Recovery
-        }
-        elseif (
-            $null -ne
-            $lastKnownTime
-        ) {
-
-            $rangeEnd =
-                $lastKnownTime
-        }
-        else {
-
-            continue
-        }
-
-
-        if (
-            $rangeEnd -gt
-            $range.Start
-        ) {
-
-            $seconds =
-                (
-                    $rangeEnd -
-                    $range.Start
-                ).TotalSeconds
-
-
-            $totalFailSeconds +=
-                $seconds
-
-
-            if (
-                $seconds -gt
-                $longestFailSeconds
-            ) {
-
-                $longestFailSeconds =
-                    $seconds
-            }
-        }
-    }
-
-
-    # --------------------------------------------------------
-    # Pourcentage du temps en FAIL
-    # --------------------------------------------------------
-
-    if (
-        $actualSeconds -gt 0
-    ) {
-
-        $failPercent =
-            (
-                $totalFailSeconds /
-                $actualSeconds
-            ) * 100
-    }
-    else {
-
-        $failPercent = 0
-    }
-
-
-    if (
-        $failPercent -gt 100
-    ) {
-
-        $failPercent = 100
-    }
-
-
-    $availabilityPercent =
-        100 - $failPercent
-
-
-    # --------------------------------------------------------
-    # Ecart a la reference theorique
-    # --------------------------------------------------------
-
-    $difference =
-        $ptt -
-        $expectedIterationsAtStop
-
-
-    $missingPtt =
-        $expectedIterationsAtStop -
-        $ptt
-
-
-    if (
-        $missingPtt -lt 0
-    ) {
-
-        $missingPtt = 0
-    }
-
-
-    # --------------------------------------------------------
-    # KPI TELEPHONE
-    # --------------------------------------------------------
-
-    $phoneKpi +=
-        [PSCustomObject]@{
-
-            Driver =
-                $driver
-
-            Tentatives =
-                $attemptCount
-
-            PTT =
-                $ptt
-
-            FAIL =
-                $failCount
-
-            Plages_FAIL =
-                $driverRanges.Count
-
-            Temps_FAIL =
-                Format-Duration `
-                    -Seconds $totalFailSeconds
-
-            Plus_Long_FAIL =
-                Format-Duration `
-                    -Seconds $longestFailSeconds
-
-            Indispo_Estimee =
-                "{0:N2} %" -f $failPercent
-
-            Dispo_Estimee =
-                "{0:N2} %" -f $availabilityPercent
-
-            Taux_PTT =
-                "{0:N2} %" -f $pressRate
-
-            PTT_Attendus =
-                $expectedIterationsAtStop
-
-            PTT_Manquants =
-                $missingPtt
-
-            Ecart =
-                $difference
-
-            Objectif_120h =
-                $targetIterations
-        }
-}
-
-
-$phoneKpi |
-    Format-Table -AutoSize
-
-
-# ============================================================
-# EXPORT CSV OPTIONNEL
-# ============================================================
-
-if ($ExportCsv) {
-
-    $folder =
-        Split-Path `
-            $OutputXml `
-            -Parent
-
-
-    $totalCsv =
-        Join-Path `
-            $folder `
-            "ptt_total.csv"
-
-
-    $dailyCsv =
-        Join-Path `
-            $folder `
-            "ptt_par_jour.csv"
-
-
-    $failCsv =
-        Join-Path `
-            $folder `
-            "ptt_fail_par_telephone.csv"
-
-
-    $rangesCsv =
-        Join-Path `
-            $folder `
-            "ptt_plages_fail.csv"
-
-
-    $availabilityCsv =
-        Join-Path `
-            $folder `
-            "ptt_disponibilite.csv"
-
-
-    $kpiCsv =
-        Join-Path `
-            $folder `
-            "ptt_kpi_complet.csv"
-
-
-    $totalRows |
-        Export-Csv `
-            -Path $totalCsv `
-            -Delimiter ";" `
-            -NoTypeInformation `
-            -Encoding UTF8
-
-
-    $dailyRows |
-        Export-Csv `
-            -Path $dailyCsv `
-            -Delimiter ";" `
-            -NoTypeInformation `
-            -Encoding UTF8
-
-
-    $failSummary |
-        Export-Csv `
-            -Path $failCsv `
-            -Delimiter ";" `
-            -NoTypeInformation `
-            -Encoding UTF8
-
-
-    $rangeRows |
-        Export-Csv `
-            -Path $rangesCsv `
-            -Delimiter ";" `
-            -NoTypeInformation `
-            -Encoding UTF8
-
-
-    $availabilityRows |
-        Export-Csv `
-            -Path $availabilityCsv `
-            -Delimiter ";" `
-            -NoTypeInformation `
-            -Encoding UTF8
-
-
-    $phoneKpi |
-        Export-Csv `
-            -Path $kpiCsv `
-            -Delimiter ";" `
-            -NoTypeInformation `
-            -Encoding UTF8
-
-
-    Write-Host ""
-    Write-Host "=========================================="
-    Write-Host "              EXPORT CSV"
-    Write-Host "=========================================="
-    Write-Host ""
-
-    Write-Host $totalCsv
-    Write-Host $dailyCsv
-    Write-Host $failCsv
-    Write-Host $rangesCsv
-    Write-Host $availabilityCsv
-    Write-Host $kpiCsv
-}
-
-
-Write-Host ""
-Write-Host "=========================================="
-Write-Host "           ANALYSE TERMINEE"
-Write-Host "=========================================="
-Write-Host ""
