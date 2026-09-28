@@ -1,1 +1,2 @@
-Pour être sûr de corriger le bug comme attendu : si un test était PASS, puis passe EXECUTING, doit-il être compté en TODO ou conserver son précédent statut PASS ? Quand tu dis N−1, parles-tu du dernier statut connu avant EXECUTING ? Et s’il n’y a aucun état précédent, je le compte en TODO ?
+Le message Message Log exceeded 80% of process memory indique que les logs générés ont occupé une part importante de la RAM utilisée par le processus. Il ne s’agit pas d’un problème d’espace disque.
+Les erreurs répétées d’Appium, dues à un élément qui n’était plus trouvé, ont généré beaucoup de messages et de traces d’erreur. Leur accumulation en mémoire a fini par dépasser le seuil de 80 % défini pour le processus.
