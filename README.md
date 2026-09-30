@@ -28,6 +28,7 @@ import sys
 import tempfile
 from collections import Counter
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 from xml.parsers import expat
@@ -526,19 +527,24 @@ def extract_ptt_events(xml_path: Path) -> ExtractionResult:
 
 def timestamp_to_minute(timestamp: str) -> str:
     """
-    Convertit un timestamp Robot Framework en minute lisible.
+    Convertit un timestamp Robot Framework au format d.m.yy hh:mm.
 
     Exemple :
-        2026-09-29T17:51:40.135684 -> 2026-09-29 17:51
+        2026-09-29T17:51:40.135684 -> 29.9.26 17:51
     """
     value = timestamp.strip()
 
-    if len(value) < 16:
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError as error:
         raise ValueError(
-            f"Timestamp trop court ou invalide : {timestamp!r}"
-        )
+            f"Timestamp invalide : {timestamp!r}"
+        ) from error
 
-    return value[:16].replace("T", " ")
+    return (
+        f"{parsed.day}.{parsed.month}.{parsed.strftime('%y')} "
+        f"{parsed.strftime('%H:%M')}"
+    )
 
 
 def write_csv_atomically(
