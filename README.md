@@ -8,7 +8,7 @@ Fonctionnement :
     1. prend un snapshot logique de la taille actuelle de output.xml ;
     2. lit uniquement ces octets en streaming ;
     3. extrait au maximum un événement par keyword "Use Ptt Release" ;
-    4. reconstruit entièrement kpi_endurance.csv ;
+    4. reconstruit entièrement kpi_endurance.csv avec les compteurs cumulés ;
     5. remplace le CSV local de manière atomique ;
     6. crée ou met à jour la pièce jointe kpi_endurance.csv sur une page
        Confluence fixe ;
@@ -524,13 +524,37 @@ def extract_ptt_events(xml_path: Path) -> ExtractionResult:
 # ===========================================================================
 
 
+def timestamp_to_minute(timestamp: str) -> str:
+    """
+    Convertit un timestamp Robot Framework en minute lisible.
+
+    Exemple :
+        2026-09-29T17:51:40.135684 -> 2026-09-29 17:51
+    """
+    value = timestamp.strip()
+
+    if len(value) < 16:
+        raise ValueError(
+            f"Timestamp trop court ou invalide : {timestamp!r}"
+        )
+
+    return value[:16].replace("T", " ")
+
+
 def write_csv_atomically(
     events: list[PttEvent],
     output_path: Path,
 ) -> None:
     """
-    Écrit le CSV complet dans un fichier temporaire situé dans le même dossier,
-    puis utilise os.replace() pour publier la nouvelle version atomiquement.
+    Reconstruit un CSV d'évolution cumulée, agrégé à la minute.
+
+    Tous les événements appartenant à la même minute sont regroupés.
+    Une seule ligne est écrite par minute, avec l'état cumulé des compteurs
+    PASS/FAIL des 6 drivers ainsi que les trois totaux globaux après traitement
+    de tous les événements de cette minute.
+
+    Le fichier est d'abord écrit dans un fichier temporaire situé dans le même
+    dossier, puis publié atomiquement avec os.replace().
     """
 
     output_path.parent.mkdir(
@@ -539,6 +563,19 @@ def write_csv_atomically(
     )
 
     temp_path: Path | None = None
+
+    # Compteurs cumulés utilisés pour construire la courbe d'évolution.
+    counters = {
+        driver: {
+            PTT_SUCCESS: 0,
+            PTT_FAIL: 0,
+        }
+        for driver in DRIVERS
+    }
+
+    total_success = 0
+    total_fail = 0
+    total_events = 0
 
     try:
         with tempfile.NamedTemporaryFile(
@@ -558,22 +595,73 @@ def write_csv_atomically(
                 lineterminator="\n",
             )
 
-            writer.writerow(
+            headers = ["timestamp"]
+
+            for driver in DRIVERS:
+                headers.extend(
+                    [
+                        f"{driver}_pass",
+                        f"{driver}_fail",
+                    ]
+                )
+
+            headers.extend(
                 [
-                    "timestamp",
-                    "driver",
-                    "event",
+                    "pass_total",
+                    "fail_total",
+                    "total_events",
                 ]
             )
 
-            for event in events:
-                writer.writerow(
+            writer.writerow(headers)
+
+            current_minute: str | None = None
+
+            def write_current_snapshot(minute: str) -> None:
+                row: list[str | int] = [minute]
+
+                for driver in DRIVERS:
+                    row.extend(
+                        [
+                            counters[driver][PTT_SUCCESS],
+                            counters[driver][PTT_FAIL],
+                        ]
+                    )
+
+                row.extend(
                     [
-                        event.timestamp,
-                        event.driver,
-                        event.event,
+                        total_success,
+                        total_fail,
+                        total_events,
                     ]
                 )
+
+                writer.writerow(row)
+
+            for event in events:
+                event_minute = timestamp_to_minute(event.timestamp)
+
+                # Quand on passe à une nouvelle minute, la minute précédente
+                # est complète : on écrit un seul snapshot cumulé pour elle.
+                if (
+                    current_minute is not None
+                    and event_minute != current_minute
+                ):
+                    write_current_snapshot(current_minute)
+
+                current_minute = event_minute
+
+                counters[event.driver][event.event] += 1
+                total_events += 1
+
+                if event.event == PTT_SUCCESS:
+                    total_success += 1
+                elif event.event == PTT_FAIL:
+                    total_fail += 1
+
+            # Dernière minute présente dans le snapshot XML.
+            if current_minute is not None:
+                write_current_snapshot(current_minute)
 
             temp_file.flush()
             os.fsync(temp_file.fileno())
