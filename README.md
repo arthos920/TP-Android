@@ -1,225 +1,102 @@
-# ============================================================
-# Android Memory Monitor - PowerShell 5.1
-# Multi-devices ADB
-# ============================================================
 
-$PackageName = "xxxx"
+import time
+from appium.webdriver.applicationstate import ApplicationState
 
-# Intervalle entre deux mesures
-$IntervalSeconds = 120
 
-# Dossier de sortie
-$StartTime = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
-$RootFolder = Join-Path $PSScriptRoot "Memory_Monitor_$StartTime"
+def is_phone_locked(self):
+    """Vérifie si le téléphone est verrouillé."""
+    return self.driver.execute_script("mobile: isLocked")
 
-New-Item -ItemType Directory -Path $RootFolder -Force | Out-Null
 
-Write-Host ""
-Write-Host "=============================================================="
-Write-Host " Android Memory Monitor"
-Write-Host "=============================================================="
-Write-Host "Package  : $PackageName"
-Write-Host "Interval : $IntervalSeconds secondes"
-Write-Host "Output   : $RootFolder"
-Write-Host ""
-Write-Host "CTRL+C pour arreter."
-Write-Host ""
+def unlock_phone(self, pin="0000"):
+    """Déverrouille uniquement si nécessaire."""
 
-# ------------------------------------------------------------
-# Récupération des téléphones connectés
-# ------------------------------------------------------------
+    if not self.is_phone_locked():
+        return True
 
-$Devices = adb devices |
-    Select-Object -Skip 1 |
-    ForEach-Object {
-        if ($_ -match "^(\S+)\s+device$") {
-            $matches[1]
+    self.driver.execute_script(
+        "mobile: unlock",
+        {
+            "type": "pin",
+            "key": pin,
+            "timeoutMs": 10000
         }
-    }
+    )
 
-if (-not $Devices) {
-    Write-Host "Aucun telephone ADB connecte."
-    exit 1
-}
+    if self.is_phone_locked():
+        raise RuntimeError("Phone unlock failed")
 
-Write-Host "$($Devices.Count) telephone(s) detecte(s)."
-Write-Host ""
+    return True
 
-# ------------------------------------------------------------
-# Création des dossiers et CSV
-# ------------------------------------------------------------
 
-$DeviceData = @{}
+def is_app_running(self, package_name):
+    """Vérifie si l'application est au premier plan."""
 
-foreach ($Device in $Devices) {
+    state = self.driver.query_app_state(package_name)
 
-    $Manufacturer = (adb -s $Device shell getprop ro.product.manufacturer).Trim()
-    $Model = (adb -s $Device shell getprop ro.product.model).Trim()
+    return state == ApplicationState.RUNNING_IN_FOREGROUND
 
-    $SafeManufacturer = $Manufacturer -replace '[\\/:*?"<>|]', '_'
-    $SafeModel = $Model -replace '[\\/:*?"<>|]', '_'
 
-    $FolderName = "${Device}_${SafeManufacturer}_${SafeModel}"
-    $DeviceFolder = Join-Path $RootFolder $FolderName
+def back_up_endurance(self, package_name):
+    """
+    Récupération conditionnelle après un PTT FAILED.
+    """
 
-    New-Item -ItemType Directory -Path $DeviceFolder -Force | Out-Null
+    # 1. Vérifier et déverrouiller si nécessaire
+    was_locked = self.is_phone_locked()
 
-    $CsvFile = Join-Path $DeviceFolder "memory.csv"
+    if was_locked:
+        self.unlock_phone()
 
-    # CSV en MB
-    "Timestamp,Serial,Status,PID,Total_PSS_MB,Total_RSS_MB,Java_Heap_MB,Native_Heap_MB" |
-        Out-File -FilePath $CsvFile -Encoding UTF8
+    # 2. Vérifier si l'application est ouverte
+    if self.is_app_running(package_name):
+        return "UNLOCKED" if was_locked else "ALREADY_RUNNING"
 
-    $DeviceData[$Device] = @{
-        Folder = $DeviceFolder
-        Csv    = $CsvFile
-    }
+    # 3. Application absente du premier plan :
+    # redémarrage
+    self.driver.terminate_app(package_name)
+    self.driver.activate_app(package_name)
 
-    Write-Host "Device : $Device | $Manufacturer $Model"
-}
+    # 4. Attendre que l'application soit au premier plan
+    deadline = time.monotonic() + 20
 
-Write-Host ""
-Write-Host "=============================================================="
-Write-Host " Monitoring lance"
-Write-Host "=============================================================="
-Write-Host ""
+    while time.monotonic() < deadline:
+        if self.is_app_running(package_name):
+            return "RESTARTED"
 
-# ------------------------------------------------------------
-# Monitoring
-# ------------------------------------------------------------
+        time.sleep(1)
 
-while ($true) {
+    raise RuntimeError("Application restart failed")
 
-    $Timestamp = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
 
-    foreach ($Device in $Devices) {
 
-        try {
 
-            # ------------------------------------------------
-            # PID application
-            # ------------------------------------------------
 
-            $PidOutput = adb -s $Device shell pidof $PackageName 2>$null
+${ptt1}=    Run Keyword And Return Status    driver1.use_ptt_release
 
-            if ($PidOutput) {
+IF    not ${ptt1}
 
-                $AppPid = $PidOutput.Trim()
-                $Status = "RUNNING"
+    Log To Console    [ENDURANCE] PTT FAILED driver1
 
-                # --------------------------------------------
-                # dumpsys meminfo
-                # --------------------------------------------
+    ${status1}    ${action1}=    Run Keyword And Ignore Error    driver1.back_up_endurance    ${APP_PACKAGE}
 
-                $MemInfo = adb -s $Device shell dumpsys meminfo $PackageName 2>$null
+    IF    '${status1}' == 'PASS'
 
-                $TotalPssKB = 0
-                $TotalRssKB = 0
-                $JavaHeapKB = 0
-                $NativeHeapKB = 0
+        Log To Console    [ENDURANCE] driver1: ${action1}
 
-                foreach ($Line in $MemInfo) {
+        IF    '${action1}' == 'RESTARTED'
+            ${nav1}=    Run Keyword And Return Status    driver1.navigate to talk group view
+            IF    ${nav1}
+                ${group1}=    Run Keyword And Return Status    driver1.connect Group    ${conversation_name}
+                IF    ${group1}
+                    ${view1}=    Run Keyword And Return Status    driver1.open ptt view
+                END
+            END
+        END
 
-                    if ($Line -match "Java Heap:\s+(\d+)") {
-                        $JavaHeapKB = [double]$matches[1]
-                    }
+    ELSE
+        Log    [ENDURANCE] Backup driver1 FAILED: ${action1}    WARN
+    END
+END
 
-                    if ($Line -match "Native Heap:\s+(\d+)") {
-                        $NativeHeapKB = [double]$matches[1]
-                    }
-
-                    if ($Line -match "TOTAL PSS:\s+(\d+)") {
-                        $TotalPssKB = [double]$matches[1]
-                    }
-
-                    if ($Line -match "TOTAL RSS:\s+(\d+)") {
-                        $TotalRssKB = [double]$matches[1]
-                    }
-                }
-
-                # --------------------------------------------
-                # Conversion KB -> MB
-                # --------------------------------------------
-
-                $TotalPssMB = [math]::Round($TotalPssKB / 1024, 1)
-                $TotalRssMB = [math]::Round($TotalRssKB / 1024, 1)
-                $JavaHeapMB = [math]::Round($JavaHeapKB / 1024, 1)
-                $NativeHeapMB = [math]::Round($NativeHeapKB / 1024, 1)
-
-                # --------------------------------------------
-                # CSV
-                # --------------------------------------------
-
-                $LineOutput = "$Timestamp,$Device,$Status,$AppPid,$TotalPssMB,$TotalRssMB,$JavaHeapMB,$NativeHeapMB"
-
-                Add-Content `
-                    -Path $DeviceData[$Device].Csv `
-                    -Value $LineOutput
-
-                # --------------------------------------------
-                # Affichage terminal
-                # --------------------------------------------
-
-                Write-Host (
-                    "{0} | {1} | PID={2} | PSS={3} MB | RSS={4} MB | Java={5} MB | Native={6} MB" -f `
-                    $Timestamp,
-                    $Device,
-                    $AppPid,
-                    $TotalPssMB,
-                    $TotalRssMB,
-                    $JavaHeapMB,
-                    $NativeHeapMB
-                )
-            }
-            else {
-
-                # ------------------------------------------------
-                # Application arrêtée
-                # ------------------------------------------------
-
-                $Status = "NOT_RUNNING"
-
-                $LineOutput = "$Timestamp,$Device,$Status,,,,,"
-
-                Add-Content `
-                    -Path $DeviceData[$Device].Csv `
-                    -Value $LineOutput
-
-                Write-Host "$Timestamp | $Device | APPLICATION NOT RUNNING"
-
-                # --------------------------------------------
-                # Sauvegarde automatique de l'ExitInfo
-                # --------------------------------------------
-
-                $ExitTimestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
-
-                $ExitInfoFile = Join-Path `
-                    $DeviceData[$Device].Folder `
-                    "exit_info_$ExitTimestamp.txt"
-
-                adb -s $Device shell dumpsys activity exit-info $PackageName |
-                    Out-File $ExitInfoFile -Encoding UTF8
-
-                # --------------------------------------------
-                # Sauvegarde d'un logcat au moment de la détection
-                # --------------------------------------------
-
-                $LogcatFile = Join-Path `
-                    $DeviceData[$Device].Folder `
-                    "logcat_after_stop_$ExitTimestamp.txt"
-
-                adb -s $Device logcat -b all -d -v threadtime |
-                    Out-File $LogcatFile -Encoding UTF8
-            }
-
-        }
-        catch {
-
-            Write-Host "$Timestamp | $Device | ERROR : $($_.Exception.Message)"
-        }
-    }
-
-    Write-Host ""
-
-    Start-Sleep -Seconds $IntervalSeconds
-}
+Sleep    2s
